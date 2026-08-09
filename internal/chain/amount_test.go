@@ -1,6 +1,9 @@
 package chain
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestSatoshisPerQOGE(t *testing.T) {
 	if SatoshisPerQOGE != 100_000_000 {
@@ -27,12 +30,30 @@ func TestAmount_String(t *testing.T) {
 	}
 }
 
+// TestAmount_String_MinInt64 confirms String() is safe at the int64 minimum
+// edge case (PR #1 review item 5): naive `v = -v` negation overflows for
+// math.MinInt64 specifically (its magnitude has no positive int64
+// counterpart), which would silently corrupt the sign/digits. This is not a
+// realistic QOGE value (see TestAmount_TotalSupplyFitsInInt64), but String()
+// must not corrupt output for it rather than silently misbehaving.
+func TestAmount_String_MinInt64(t *testing.T) {
+	a := Amount(math.MinInt64)
+	got := a.String()
+	want := "-92233720368.54775808"
+	if got != want {
+		t.Errorf("Amount(math.MinInt64).String() = %q, want %q", got, want)
+	}
+	if got[0] != '-' {
+		t.Errorf("expected a leading '-' sign, got %q", got)
+	}
+}
+
 func TestAmount_QOGEAndSatoshis(t *testing.T) {
 	a := Amount(625_013_500) // real block-2,439,284 coinbase reward incl. fee, confirmed against live RPC
 	if got := a.Satoshis(); got != 625_013_500 {
 		t.Errorf("Satoshis() = %d, want 625013500", got)
 	}
-	if got := a.QOGE(); got != 6 {
+	if got := a.WholeQOGE(); got != 6 {
 		t.Errorf("QOGE() = %d, want 6 (truncated whole QOGE)", got)
 	}
 }

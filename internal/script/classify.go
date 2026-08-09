@@ -19,18 +19,35 @@ func Classify(pkScript []byte) Result {
 		switch {
 		case wp.Version == 0 && len(wp.Program) == hash160Len:
 			return Result{Type: TypeP2WPKH, WitnessVersion: &v, WitnessProgram: wp.Program}
-		case wp.Version == 0 && len(wp.Program) == 32:
+		case wp.Version == 0 && len(wp.Program) == p2wshProgramLength:
 			return Result{Type: TypeP2WSH, WitnessVersion: &v, WitnessProgram: wp.Program}
+		case wp.Version == p2trWitnessVersion && len(wp.Program) == p2trProgramLength:
+			// Mirrors Core's Solver(): witnessversion == 1 && program.size()
+			// == 32 -> TxoutType::WITNESS_V1_TAPROOT (src/script/standard.cpp).
+			// A real QOGE Taproot output exists on-chain at height 1,284,510,
+			// which is also used as a P2QPK negative test — see classify_test.go.
+			return Result{Type: TypeP2TR, WitnessVersion: &v, WitnessProgram: wp.Program}
 		case wp.Version == P2QPKWitnessVersion && len(wp.Program) == P2QPKProgramLength:
 			// Structural P2QPK detection: witness version == 2 AND program
 			// length == 32, exactly. This is the same rule Core's own
 			// policy.cpp (AreInputsStandard) uses internally, confirmed
 			// from source — see docs/ARCHITECTURE.md §9. Every other
 			// version/length combination — including version 2 with any
-			// length other than 32 — deliberately falls through to
-			// TypeUnknownWitness below.
+			// length other than 32 — deliberately falls through below.
 			return Result{Type: TypeP2QPK, WitnessVersion: &v, WitnessProgram: wp.Program}
+		case wp.Version == 0:
+			// Confirmed from Core source (src/script/standard.cpp, Solver()):
+			// witnessversion == 0 with a length other than 20 or 32 falls
+			// through to TxoutType::NONSTANDARD, NOT WITNESS_UNKNOWN — v0 is
+			// a fully-defined BIP141 version with only those two valid
+			// lengths, so an off-length v0 program isn't "an unrecognized
+			// witness version," it's simply not a standard output at all.
+			// Mapped to TypeUnknown here, deliberately not TypeUnknownWitness.
+			return Result{Type: TypeUnknown, WitnessVersion: &v, WitnessProgram: wp.Program}
 		default:
+			// witnessversion != 0 and not one of the recognized
+			// version/length combinations above -> Core's
+			// TxoutType::WITNESS_UNKNOWN.
 			return Result{Type: TypeUnknownWitness, WitnessVersion: &v, WitnessProgram: wp.Program}
 		}
 	}

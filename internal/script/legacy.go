@@ -69,59 +69,170 @@ func matchNullData(s []byte) bool {
 	return isPushOnly(s[1:])
 }
 
+// maxPubKeysPerMultisig mirrors Qogecoin Core's MAX_PUBKEYS_PER_MULTISIG
+// (src/script/script.h).
+const maxPubKeysPerMultisig = 20
+
+// scriptToken is one decoded opcode+operand, used only for structural bare-
+// multisig parsing below — this is not a general script interpreter.
+type scriptToken struct {
+	opcode byte
+	data   []byte // pushed data for push opcodes; nil for non-push opcodes
+}
+
+// nextToken decodes the single script element starting at s[i], mirroring
+// enough of Core's CScript::GetOp to parse bare multisig scripts: OP_0,
+// direct pushes (1-75 bytes), OP_PUSHDATA1/2/4, OP_1NEGATE, OP_1-OP_16, and
+// any other single-byte opcode (e.g. OP_CHECKMULTISIG itself). Every branch
+// is bounds-checked; returns ok=false rather than panicking on truncated or
+// out-of-range input.
+func nextToken(s []byte, i int) (tok scriptToken, next int, ok bool) {
+	if i >= len(s) {
+		return scriptToken{}, i, false
+	}
+	op := s[i]
+	switch {
+	case op == opFalse:
+		return scriptToken{opcode: op, data: []byte{}}, i + 1, true
+	case op >= 0x01 && op <= 0x4b:
+		n := int(op)
+		if i+1+n > len(s) {
+			return scriptToken{}, i, false
+		}
+		return scriptToken{opcode: op, data: s[i+1 : i+1+n]}, i + 1 + n, true
+	case op == opPushData1:
+		if i+2 > len(s) {
+			return scriptToken{}, i, false
+		}
+		n := int(s[i+1])
+		if i+2+n > len(s) {
+			return scriptToken{}, i, false
+		}
+		return scriptToken{opcode: op, data: s[i+2 : i+2+n]}, i + 2 + n, true
+	case op == opPushData2:
+		if i+3 > len(s) {
+			return scriptToken{}, i, false
+		}
+		n := int(s[i+1]) | int(s[i+2])<<8
+		if i+3+n > len(s) {
+			return scriptToken{}, i, false
+		}
+		return scriptToken{opcode: op, data: s[i+3 : i+3+n]}, i + 3 + n, true
+	default:
+		// OP_1NEGATE, OP_1-OP_16, OP_CHECKMULTISIG, or anything else: a
+		// plain single-byte opcode with no operand.
+		return scriptToken{opcode: op}, i + 1, true
+	}
+}
+
+// multisigScriptNumber decodes tok as a minimally-encoded script number in
+// [min,max], mirroring Core's GetScriptNumber + CheckMinimalPush +
+// CScriptNum as used by MatchMultisig (src/script/standard.cpp), bounded to
+// the m/n domain of a bare multisig script (1..maxPubKeysPerMultisig).
+//
+// Values 1-16 must use the small-integer opcodes OP_1-OP_16. Values
+// 17-maxPubKeysPerMultisig have no dedicated opcode and must instead be a
+// minimal single-byte data push; per Core's CheckMinimalPush, a push
+// encoding a value that a small-int opcode could have represented (1-16),
+// or any non-single-byte encoding of a value in this bounded range, is
+// rejected as non-minimal — real Bitcoin/QOGE script numbers in [1,20]
+// never require more than one byte, so this narrow mirror is exact for this
+// domain without needing a general CScriptNum implementation.
+func multisigScriptNumber(tok scriptToken, min, max int) (int, bool) {
+	if tok.opcode >= op1 && tok.opcode <= op16 {
+		v := int(tok.opcode-op1) + 1
+		if v < min || v > max {
+			return 0, false
+		}
+		return v, true
+	}
+	if tok.opcode == 0x01 && len(tok.data) == 1 {
+		v := int(tok.data[0])
+		if v < 17 || v > maxPubKeysPerMultisig {
+			// 1-16 (or 0, or -1) pushed as data instead of using the
+			// dedicated opcode is non-minimal per Core's CheckMinimalPush.
+			return 0, false
+		}
+		if v < min || v > max {
+			return 0, false
+		}
+		return v, true
+	}
+	return 0, false
+}
+
+// isPubKeyPush mirrors Core's CPubKey::ValidSize (src/pubkey.h): a
+// 0x02/0x03-prefixed 33-byte compressed key, or a 0x04/0x06/0x07-prefixed
+// 65-byte uncompressed/hybrid key.
+func isPubKeyPush(data []byte) bool {
+	if len(data) == 0 {
+		return false
+	}
+	switch data[0] {
+	case 0x02, 0x03:
+		return len(data) == compressedPKLen
+	case 0x04, 0x06, 0x07:
+		return len(data) == uncompressedPKLen
+	default:
+		return false
+	}
+}
+
 // matchMultisig recognizes a bare m-of-n CHECKMULTISIG script:
 //
-//	OP_m <pubkey1> ... <pubkeyN> OP_n OP_CHECKMULTISIG
+//	<m> <pubkey1> ... <pubkeyN> <n> OP_CHECKMULTISIG
 //
-// where OP_m/OP_n are small-integer opcodes (1-16), each pubkey is a direct
-// 33- or 65-byte push, n matches the actual number of pubkey pushes found,
-// and m <= n. Returns the parsed pubkeys and the m/n threshold.
+// mirroring Core's MatchMultisig (src/script/standard.cpp) structurally:
+// m and n may each be encoded either as a small-integer opcode (1-16) or,
+// for 17-maxPubKeysPerMultisig, a minimal single-byte push; each pubkey
+// must be a validly-sized compressed/uncompressed key push
+// (isPubKeyPush); n must equal the actual number of pubkey pushes found,
+// and 1 <= m <= n <= maxPubKeysPerMultisig. Returns the parsed pubkeys and
+// the m/n threshold.
 func matchMultisig(s []byte) (pubKeys [][]byte, m, n int, ok bool) {
 	if len(s) < 3 || s[len(s)-1] != opCheckMultisig {
 		return nil, 0, 0, false
 	}
-	m, ok = smallInt(s[0])
+
+	mTok, i, tokOK := nextToken(s, 0)
+	if !tokOK {
+		return nil, 0, 0, false
+	}
+	m, ok = multisigScriptNumber(mTok, 1, maxPubKeysPerMultisig)
 	if !ok {
 		return nil, 0, 0, false
 	}
 
-	i := 1
 	var keys [][]byte
-	for i < len(s)-2 {
-		pushLen := int(s[i])
-		if pushLen != compressedPKLen && pushLen != uncompressedPKLen {
-			break // not a pubkey push — must be the "n" byte
+	var nTok scriptToken
+	for {
+		tok, next, tokOK := nextToken(s, i)
+		if !tokOK {
+			return nil, 0, 0, false
 		}
-		if i+1+pushLen > len(s)-2 {
-			return nil, 0, 0, false // truncated
+		if !isPubKeyPush(tok.data) {
+			nTok = tok
+			i = next
+			break
 		}
-		keys = append(keys, s[i+1:i+1+pushLen])
-		i += 1 + pushLen
-	}
-	if i != len(s)-2 {
-		return nil, 0, 0, false // trailing bytes before the "n" byte
+		keys = append(keys, tok.data)
+		i = next
 	}
 
-	n, ok = smallInt(s[i])
+	n, ok = multisigScriptNumber(nTok, m, maxPubKeysPerMultisig)
 	if !ok {
 		return nil, 0, 0, false
 	}
-	if m < 1 || n < m || n > 16 || len(keys) != n {
+	if len(keys) != n {
 		return nil, 0, 0, false
 	}
-	return keys, m, n, true
-}
+	// After consuming n's token, exactly the OP_CHECKMULTISIG byte already
+	// confirmed at the top of this function must remain.
+	if i != len(s)-1 {
+		return nil, 0, 0, false
+	}
 
-// smallInt decodes a Bitcoin "small integer" push opcode (OP_0, OP_1-OP_16)
-// into its numeric value.
-func smallInt(b byte) (int, bool) {
-	if b == opFalse {
-		return 0, true
-	}
-	if b >= op1 && b <= op16 {
-		return int(b-op1) + 1, true
-	}
-	return 0, false
+	return keys, m, n, true
 }
 
 // isPushOnly reports whether s consists entirely of valid, non-truncated

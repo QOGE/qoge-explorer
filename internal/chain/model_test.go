@@ -117,7 +117,7 @@ func TestTransaction_RealVector_CoinbaseP2PKH(t *testing.T) {
 	if len(tx.Outputs) != 1 {
 		t.Fatalf("expected exactly one output, got %d", len(tx.Outputs))
 	}
-	if tx.Outputs[0].Value.QOGE() != 25 {
+	if tx.Outputs[0].Value.WholeQOGE() != 25 {
 		t.Errorf("output value = %s, want 25 QOGE", tx.Outputs[0].Value)
 	}
 	if tx.Outputs[0].ScriptType != script.TypeP2PKH {

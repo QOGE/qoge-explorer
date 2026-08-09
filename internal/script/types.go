@@ -17,16 +17,37 @@ package script
 type Type string
 
 const (
-	TypeP2PK           Type = "p2pk"
-	TypeP2PKH          Type = "p2pkh"
-	TypeP2SH           Type = "p2sh"
-	TypeP2WPKH         Type = "p2wpkh"
-	TypeP2WSH          Type = "p2wsh"
-	TypeP2QPK          Type = "p2qpk"
-	TypeNullData       Type = "nulldata"
-	TypeMultisig       Type = "multisig"
-	TypeUnknownWitness Type = "unknown_witness" // a structurally valid witness program, but not one of the recognized version/length combinations above
-	TypeUnknown        Type = "unknown"         // not a witness program, and does not match any recognized legacy template
+	TypeP2PK     Type = "p2pk"
+	TypeP2PKH    Type = "p2pkh"
+	TypeP2SH     Type = "p2sh"
+	TypeP2WPKH   Type = "p2wpkh"
+	TypeP2WSH    Type = "p2wsh"
+	TypeP2TR     Type = "p2tr" // witness v1, 32-byte program (TxoutType::WITNESS_V1_TAPROOT in Core)
+	TypeP2QPK    Type = "p2qpk"
+	TypeNullData Type = "nulldata"
+	TypeMultisig Type = "multisig"
+
+	// TypeUnknownWitness is a structurally valid witness program whose
+	// version is >0 but whose version/length combination isn't one of the
+	// recognized types above. Mirrors Core's TxoutType::WITNESS_UNKNOWN
+	// (src/script/standard.cpp): reached only for witnessversion != 0.
+	TypeUnknownWitness Type = "unknown_witness"
+
+	// TypeUnknown covers everything else: not a witness program at all, OR
+	// a witness version 0 program whose length is neither 20 nor 32. Core's
+	// own Solver() falls through to TxoutType::NONSTANDARD (not
+	// WITNESS_UNKNOWN) for that specific v0 case — confirmed from source,
+	// src/script/standard.cpp — which is why it's folded into Unknown here
+	// rather than UnknownWitness.
+	TypeUnknown Type = "unknown"
+)
+
+// Witness program length constants for the non-P2QPK witness types this
+// package recognizes (BIP141/BIP341).
+const (
+	p2wshProgramLength = 32
+	p2trWitnessVersion = 1
+	p2trProgramLength  = 32
 )
 
 // P2QPK structural parameters, confirmed from Qogecoin Core source
@@ -62,8 +83,10 @@ type Result struct {
 	Type Type
 
 	// WitnessVersion and WitnessProgram are populated whenever the script is
-	// a structurally valid witness program (P2WPKH, P2WSH, P2QPK, or
-	// TypeUnknownWitness). Nil/empty for legacy (non-witness) script types.
+	// a structurally valid witness program — P2WPKH, P2WSH, P2TR, P2QPK,
+	// TypeUnknownWitness, or a witness-v0 program of an off-standard length
+	// (which classifies as TypeUnknown; see Classify). Nil/empty for legacy
+	// (non-witness) script types.
 	WitnessVersion *int
 	WitnessProgram []byte
 

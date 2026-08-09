@@ -2,6 +2,7 @@ package script
 
 import (
 	"encoding/hex"
+	"fmt"
 	"testing"
 )
 
@@ -55,9 +56,9 @@ func TestClassify_RealQOGEVectors(t *testing.T) {
 			source: "height=494289 txid=180c6aee4e8ff354868f7f44945192e1bd2941827413203f5b69c36bb3fb4a29 vout=22",
 		},
 		{
-			name:   "block 1284510 — real Taproot output (must NOT be misclassified as P2QPK)",
+			name:   "block 1284510 — real Taproot output -> P2TR",
 			hex:    "51202e44fe044d16a3b7900c179d9bb3fc005f0d5e92c89b8c7c0d340c7d6f56077c",
-			want:   TypeUnknownWitness,
+			want:   TypeP2TR,
 			source: "height=1284510 txid=8c7381260e076f781de4c0c5246c709579c80e964738a719579ae4fd5c312106 vout=0",
 		},
 	}
@@ -69,6 +70,23 @@ func TestClassify_RealQOGEVectors(t *testing.T) {
 				t.Errorf("Classify(%s) = %s, want %s\n  source: %s", tt.name, got.Type, tt.want, tt.source)
 			}
 		})
+	}
+}
+
+// TestClassify_RealTaproot_IsNeverP2QPK re-asserts, independently of the
+// table above, that the one real witness-v1 output on QOGE mainnet is never
+// misread as P2QPK — this is the exact "false positive" scenario item 1 of
+// the PR #1 review flagged: a real Taproot output must classify as its own
+// distinct type (P2TR), not fall into the P2QPK bucket just because both
+// are "some witness version >0 with a 32-byte program."
+func TestClassify_RealTaproot_IsNeverP2QPK(t *testing.T) {
+	const realTaprootHex = "51202e44fe044d16a3b7900c179d9bb3fc005f0d5e92c89b8c7c0d340c7d6f56077c"
+	got := Classify(mustHex(t, realTaprootHex))
+	if got.Type == TypeP2QPK {
+		t.Fatalf("real Taproot output misclassified as P2QPK")
+	}
+	if got.Type != TypeP2TR {
+		t.Fatalf("Type = %s, want %s", got.Type, TypeP2TR)
 	}
 }
 
@@ -103,14 +121,14 @@ func TestClassify_P2QPK(t *testing.T) {
 		}
 	})
 
-	t.Run("wrong witness version: v2 payload but v1 (Taproot) version byte -> not P2QPK", func(t *testing.T) {
+	t.Run("wrong witness version: v2 payload but v1 (Taproot) version byte -> P2TR, not P2QPK", func(t *testing.T) {
 		s := buildWitnessScript(op1, 32, commitment) // OP_1 = witness v1
 		got := Classify(s)
 		if got.Type == TypeP2QPK {
 			t.Fatalf("v1/32 must not classify as P2QPK, got %s", got.Type)
 		}
-		if got.Type != TypeUnknownWitness {
-			t.Errorf("v1/32 Type = %s, want %s", got.Type, TypeUnknownWitness)
+		if got.Type != TypeP2TR {
+			t.Errorf("v1/32 Type = %s, want %s (Core: TxoutType::WITNESS_V1_TAPROOT)", got.Type, TypeP2TR)
 		}
 	})
 
@@ -187,6 +205,45 @@ func TestClassify_P2QPK(t *testing.T) {
 	})
 }
 
+// TestClassify_WitnessV0Fallback confirms witness version 0 programs whose
+// length is neither 20 (P2WPKH) nor 32 (P2WSH) classify as TypeUnknown, not
+// TypeUnknownWitness — mirroring Core's Solver(), which falls through to
+// TxoutType::NONSTANDARD (not WITNESS_UNKNOWN) for this specific case,
+// since witness v0 is a fully BIP141-defined version with only those two
+// valid lengths (confirmed from src/script/standard.cpp). None of these
+// should classify as UNKNOWN_WITNESS if we're mirroring Core semantics, per
+// the PR #1 review.
+func TestClassify_WitnessV0Fallback(t *testing.T) {
+	for _, length := range []int{19, 21, 31, 33} {
+		t.Run(fmt.Sprintf("v0/%d", length), func(t *testing.T) {
+			s := buildWitnessScript(opFalse, byte(length), program(length))
+			got := Classify(s)
+			if got.Type == TypeUnknownWitness {
+				t.Fatalf("v0/%d classified as UNKNOWN_WITNESS; Core mirrors this to NONSTANDARD (TypeUnknown here)", length)
+			}
+			if got.Type != TypeUnknown {
+				t.Errorf("v0/%d Type = %s, want %s", length, got.Type, TypeUnknown)
+			}
+			// Still a structurally valid witness program — version/program
+			// metadata should remain available for display purposes.
+			if got.WitnessVersion == nil || *got.WitnessVersion != 0 {
+				t.Errorf("v0/%d WitnessVersion = %v, want 0", length, got.WitnessVersion)
+			}
+			if len(got.WitnessProgram) != length {
+				t.Errorf("v0/%d WitnessProgram len = %d, want %d", length, len(got.WitnessProgram), length)
+			}
+		})
+	}
+
+	// Sanity: v0/20 and v0/32 remain P2WPKH/P2WSH, not swept into Unknown.
+	if got := Classify(buildWitnessScript(opFalse, 20, program(20))); got.Type != TypeP2WPKH {
+		t.Errorf("v0/20 Type = %s, want %s", got.Type, TypeP2WPKH)
+	}
+	if got := Classify(buildWitnessScript(opFalse, 32, program(32))); got.Type != TypeP2WSH {
+		t.Errorf("v0/32 Type = %s, want %s", got.Type, TypeP2WSH)
+	}
+}
+
 func TestClassify_AllRequiredTypes(t *testing.T) {
 	pk := fill(33, 1)
 	pkh := fill(20, 2)
@@ -226,6 +283,11 @@ func TestClassify_AllRequiredTypes(t *testing.T) {
 			TypeP2WSH,
 		},
 		{
+			"P2TR",
+			buildWitnessScript(op1, 32, fill(32, 20)),
+			TypeP2TR,
+		},
+		{
 			"P2QPK",
 			buildWitnessScript(op1+1, 32, p2qpkProg),
 			TypeP2QPK,
@@ -237,7 +299,7 @@ func TestClassify_AllRequiredTypes(t *testing.T) {
 		},
 		{
 			"MULTISIG",
-			buildMultisig(2, [][]byte{fill(33, 8), fill(33, 9), fill(33, 10)}, 3),
+			buildMultisig(2, [][]byte{fillPubKey(0x02, 8), fillPubKey(0x03, 9), fillPubKey(0x02, 10)}, 3),
 			TypeMultisig,
 		},
 		{
@@ -276,7 +338,7 @@ func TestClassify_AllRequiredTypes(t *testing.T) {
 	// Confirm every required classification in the task spec is exercised
 	// by at least one case above.
 	required := []Type{
-		TypeP2PK, TypeP2PKH, TypeP2SH, TypeP2WPKH, TypeP2WSH,
+		TypeP2PK, TypeP2PKH, TypeP2SH, TypeP2WPKH, TypeP2WSH, TypeP2TR,
 		TypeP2QPK, TypeNullData, TypeMultisig, TypeUnknownWitness, TypeUnknown,
 	}
 	for _, want := range required {

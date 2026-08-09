@@ -169,16 +169,22 @@ CREATE TABLE transaction_outputs (
     spending_block_height BIGINT,
     PRIMARY KEY (txid, vout_index),
     CHECK (script_type IN (
-        'p2pk','p2pkh','p2sh','p2wpkh','p2wsh','p2qpk',
+        'p2pk','p2pkh','p2sh','p2wpkh','p2wsh','p2tr','p2qpk',
         'nulldata','multisig','unknown_witness','unknown'
     ))
 );
 CREATE INDEX transaction_outputs_unspent_idx ON transaction_outputs (txid, vout_index) WHERE NOT spent;
 CREATE INDEX transaction_outputs_spending_txid_idx ON transaction_outputs (spending_txid);
 
--- Resolved address(es) per output — a separate relation, not a column on
--- transaction_outputs, because bare multisig can resolve to more than one
--- address and unparseable/unknown scripts resolve to zero.
+-- Resolved DESTINATION address(es) per output — the addresses whose
+-- balance/received/sent accounting (the `addresses` cache below) is
+-- actually derived from this output. For every currently-supported script
+-- type this is exactly zero or one row: single-key types (P2PK, P2PKH,
+-- P2WPKH, P2QPK, etc.) resolve to one destination address; unparseable/
+-- unknown scripts resolve to zero. Bare MULTISIG is deliberately NOT
+-- represented here — see output_participants below and §13.A — because a
+-- multisig output has no single owner to credit. This table, not
+-- output_participants, is the one balance aggregation joins against.
 CREATE TABLE output_addresses (
     txid                TEXT NOT NULL,
     vout_index          INT NOT NULL,
@@ -188,10 +194,33 @@ CREATE TABLE output_addresses (
 );
 CREATE INDEX output_addresses_address_idx ON output_addresses (address);
 
+-- Pubkey-derived PARTICIPANT identities for bare MULTISIG outputs —
+-- searchable/displayable ("this address co-signs this UTXO"), but
+-- deliberately never joined into balance/received/sent aggregation. An
+-- m-of-n multisig output's value is jointly controlled by all n named
+-- participants, not individually owned by each of them; if this table were
+-- (mistakenly) joined the same way output_addresses is, a single multisig
+-- UTXO's value would be credited in full to every participant's balance —
+-- summing all address balances would then overcount total supply by
+-- (participants - 1) times the output value for every multisig UTXO in
+-- existence. See §13.A ("role model": output_addresses rows carry an
+-- implicit role=destination; this table's rows are role=participant, and
+-- only role=destination ever contributes to balance math).
+CREATE TABLE output_participants (
+    txid                TEXT NOT NULL,
+    vout_index          INT NOT NULL,
+    address             TEXT NOT NULL, -- derived from the participant pubkey, display/search only
+    pubkey_hex          TEXT NOT NULL,
+    PRIMARY KEY (txid, vout_index, address),
+    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
+);
+CREATE INDEX output_participants_address_idx ON output_participants (address);
+
 -- ── addresses (derived cache, not a source of truth) ────────────────────
--- Rebuilt by re-aggregating output_addresses + transaction_outputs for the
--- touched addresses inside the SAME block transaction. Every write is a
--- SET of a freshly computed absolute value (see §4) — never an increment.
+-- Rebuilt by re-aggregating output_addresses (destination rows ONLY —
+-- never output_participants) + transaction_outputs for the touched
+-- addresses inside the SAME block transaction. Every write is a SET of a
+-- freshly computed absolute value (see §4) — never an increment.
 CREATE TABLE addresses (
     address             TEXT PRIMARY KEY,
     total_received_satoshis BIGINT NOT NULL,
@@ -289,7 +318,8 @@ yet):
    - Mark it `orphaned = true`, `orphaned_at = now()` (kept for audit, not
      deleted).
    - For every output *created* in that block: delete its row (and its
-     `output_addresses` rows) — it never existed on the canonical chain.
+     `output_addresses`/`output_participants` rows) — it never existed on
+     the canonical chain.
    - For every output *spent* by a transaction in that block: restore it
      (`spent = false`, `spending_txid = NULL`, `spending_vin_index = NULL`,
      `spending_block_height = NULL`).
@@ -354,13 +384,16 @@ const (
     ScriptP2SH           ScriptType = "p2sh"
     ScriptP2WPKH         ScriptType = "p2wpkh"
     ScriptP2WSH          ScriptType = "p2wsh"
+    ScriptP2TR           ScriptType = "p2tr"    // witness v1, 32-byte program (Core: TxoutType::WITNESS_V1_TAPROOT)
     ScriptP2QPK          ScriptType = "p2qpk"
     ScriptNullData       ScriptType = "nulldata"
     ScriptMultisig       ScriptType = "multisig"
-    ScriptUnknownWitness ScriptType = "unknown_witness" // valid witness program, version/length not recognized
-    ScriptUnknown        ScriptType = "unknown"          // not a witness program; not one of the above
+    ScriptUnknownWitness ScriptType = "unknown_witness" // witness version >0, not one of the recognized version/length combinations above
+    ScriptUnknown        ScriptType = "unknown"          // not a witness program at all, OR a witness-v0 program whose length is neither 20 nor 32 (Core: Solver() falls through to NONSTANDARD, not WITNESS_UNKNOWN, for that specific v0 case)
 )
 ```
+
+(The Phase 2A implementation in `internal/script` names these `Type`/`TypeP2PK`/etc. — same values, `Type` instead of `ScriptType` as the prefix.)
 
 Classification rule: **never invent an address for a script we can't
 identify.** `ScriptUnknown` / `ScriptUnknownWitness` outputs get zero rows in
@@ -519,12 +552,36 @@ Phase 2, loopback-only until explicitly authorized to expose it:
 
 ## 11. Bare multisig (resolved — see §13.A)
 
-`output_addresses` supports multiple addresses per output for exactly this
-reason. Policy: store every legitimately resolved participating
-pubkey-derived address for a bare-multisig output, one row each — never
-collapse a multisig output down to a single "owner" address. An N-of-M
-multisig output is jointly controlled by all M named keys, not by any one of
-them; picking one to represent the output would misrepresent custody.
+**Corrected in PR #1 review, before Phase 2B.** The original version of
+this section said every participating pubkey-derived address for a
+bare-multisig output should be stored in `output_addresses`, one row each.
+That was an accounting hazard: `output_addresses` is exactly the table
+balance aggregation joins against (§3, `addresses`), so storing all n
+participant addresses there would credit the *entire* output value to
+*every* participant independently — an m-of-n multisig output's value would
+inflate the sum of all address balances by (n − 1) times its value, for
+every multisig UTXO that exists. A multisig output is jointly controlled by
+all n named keys; it is not owned n times over.
+
+**Corrected policy:** two separate tables, one role each (§3):
+
+- `output_addresses` — the actual destination(s) that balance accounting is
+  derived from. Zero or **one** row for every currently-supported script
+  type (P2PK, P2PKH, P2WPKH, P2QPK, etc.); **never** populated for bare
+  MULTISIG.
+- `output_participants` — every legitimately resolved participating
+  pubkey-derived address for a bare-multisig output, one row each, for
+  search/display ("this address co-signs this UTXO") — but structurally
+  excluded from ever being joined into `addresses`.
+
+Equivalently, every output-address relationship has an implicit
+`role ∈ {destination, participant}`, and only `role = destination`
+(`output_addresses`) ever participates in balance/received/sent
+calculations. This is the "Option A" design named in the PR #1 review: two
+tables rather than one `role` column, because it makes the balance-query
+join target syntactically impossible to get wrong (you'd have to
+deliberately query the wrong table) rather than merely a `WHERE role = ...`
+clause someone could forget.
 
 ## 12. Wallet cross-check (Symbiont Wallet)
 
@@ -572,8 +629,13 @@ forward as *reference*, not as corrections:
 
 ## 13. Resolved Phase-1 policy decisions
 
-**A. Bare multisig** — see §11: store all legitimately resolved
-participating addresses; never collapse to a single owner.
+**A. Bare multisig** — see §11 (revised in the PR #1 review): store every
+legitimately resolved participating address in `output_participants` for
+search/display, one row each — never collapse to a single owner — but keep
+it structurally separate from `output_addresses`, the table balance
+accounting actually joins against. A multisig output gets zero
+`output_addresses` rows; crediting its full value to every participant's
+individual balance would overcount total supply.
 
 **B. Deep reorg safety valve** — see §5: reorg depth ≤ 100 blocks rolls back
 automatically; depth > 100 blocks halts indexing and requires manual human
