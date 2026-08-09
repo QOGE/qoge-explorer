@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/QOGE/qoge-explorer/internal/config"
 	"github.com/QOGE/qoge-explorer/internal/logging"
 	"github.com/QOGE/qoge-explorer/internal/rpc"
+	"github.com/QOGE/qoge-explorer/internal/store"
 )
 
 func main() {
@@ -34,6 +36,8 @@ func main() {
 		os.Exit(runCheckRPC(cfg, log))
 	case "serve":
 		os.Exit(runServe(cfg, log))
+	case "migrate":
+		os.Exit(runMigrate(cfg, log, os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -44,20 +48,26 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 1: reconnaissance only)
+	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2B.1: schema/migrations, no indexing yet)
 
 Usage:
-  qoge-explorer check-rpc   Connect to the configured Qogecoin Core node and
-                            print non-secret status information.
-  qoge-explorer serve       Start the loopback-only health endpoint.
+  qoge-explorer check-rpc          Connect to the configured Qogecoin Core node
+                                    and print non-secret status information.
+  qoge-explorer serve               Start the loopback-only health endpoint.
+  qoge-explorer migrate up          Apply every not-yet-applied migration.
+  qoge-explorer migrate down [n]    Roll back the n most recent migrations
+                                     (default 1).
+  qoge-explorer migrate version     Print the current schema version.
 
 Configuration is read from environment variables:
-  QOGE_RPC_HOST             default 127.0.0.1
-  QOGE_RPC_PORT             default 8332
-  QOGE_RPC_USER             required
-  QOGE_RPC_PASSWORD         required
-  QOGE_RPC_TLS              default false
-  QOGE_RPC_TIMEOUT_SECONDS  default 30
+  QOGE_RPC_HOST             default 127.0.0.1 (check-rpc)
+  QOGE_RPC_PORT             default 8332      (check-rpc)
+  QOGE_RPC_USER             required for check-rpc
+  QOGE_RPC_PASSWORD         required for check-rpc
+  QOGE_RPC_TLS              default false     (check-rpc)
+  QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc)
+  QOGE_DATABASE_URL         required for migrate, e.g. postgres://user:pass@host:5432/dbname
+  QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
   QOGE_HTTP_ADDR            default 127.0.0.1:8532
   QOGE_LOG_LEVEL            default info
   QOGE_LOG_JSON             default false`)
@@ -67,6 +77,10 @@ func runCheckRPC(cfg config.Config, log interface {
 	Info(msg string, args ...any)
 	Error(msg string, args ...any)
 }) int {
+	if err := cfg.RPC.Validate(); err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
 	log.Info("connecting to qogecoin core", "rpc", cfg.RPC.Redacted())
 
 	client := rpc.New(rpc.Config{
@@ -144,4 +158,89 @@ func runServe(cfg config.Config, log interface {
 		return 1
 	}
 	return 0
+}
+
+func runMigrate(cfg config.Config, log interface {
+	Info(msg string, args ...any)
+	Error(msg string, args ...any)
+}, args []string) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: qoge-explorer migrate {up|down [n]|version}")
+		return 2
+	}
+
+	migrationsDir := os.Getenv("QOGE_MIGRATIONS_DIR")
+	if migrationsDir == "" {
+		migrationsDir = "migrations"
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	migrations, err := store.LoadMigrations(os.DirFS(migrationsDir))
+	if err != nil {
+		log.Error("loading migrations failed", "dir", migrationsDir, "error", err)
+		return 1
+	}
+
+	switch args[0] {
+	case "up":
+		applied, err := store.Up(ctx, pool, migrations)
+		if err != nil {
+			log.Error("migrate up failed", "error", err)
+			return 1
+		}
+		if len(applied) == 0 {
+			fmt.Println("already up to date")
+		} else {
+			fmt.Printf("applied %d migration(s): %v\n", len(applied), applied)
+		}
+		return 0
+
+	case "down":
+		steps := 1
+		if len(args) > 1 {
+			n, err := strconv.Atoi(args[1])
+			if err != nil || n <= 0 {
+				fmt.Fprintf(os.Stderr, "invalid step count %q: must be a positive integer\n", args[1])
+				return 2
+			}
+			steps = n
+		}
+		rolledBack, err := store.Down(ctx, pool, migrations, steps)
+		if err != nil {
+			log.Error("migrate down failed", "error", err)
+			return 1
+		}
+		if len(rolledBack) == 0 {
+			fmt.Println("nothing to roll back")
+		} else {
+			fmt.Printf("rolled back %d migration(s): %v\n", len(rolledBack), rolledBack)
+		}
+		return 0
+
+	case "version":
+		version, err := store.CurrentVersion(ctx, pool)
+		if err != nil {
+			log.Error("reading schema version failed", "error", err)
+			return 1
+		}
+		fmt.Printf("schema version: %d\n", version)
+		return 0
+
+	default:
+		fmt.Fprintf(os.Stderr, "unknown migrate subcommand: %s\n", args[0])
+		return 2
+	}
 }

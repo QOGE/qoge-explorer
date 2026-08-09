@@ -1,6 +1,11 @@
-# QOGE Go Explorer — Architecture (Phase 1)
+# QOGE Go Explorer — Architecture
 
-Status: reconnaissance + skeleton only. No indexing implemented yet.
+Status: Phase 2B.1 — canonical chain model and script classification are
+implemented (`internal/chain`, `internal/script`); the PostgreSQL schema,
+migrations, and migration tooling are implemented (`migrations/`,
+`internal/store`). No block-indexing write path, historical
+synchronization, RPC→chain translation, public API, or web UI exists yet —
+that is Phase 2B.2, built on top of the schema this phase locks down.
 Qogecoin Core is the sole authoritative source of chain truth; this document
 describes how the explorer observes and represents that truth, never how it
 decides it.
@@ -10,16 +15,18 @@ decides it.
 Single Go service, no microservices, for the foreseeable future:
 
 ```
-cmd/qoge-explorer/        entry point, subcommand dispatch (check-rpc, serve, ...)
+cmd/qoge-explorer/        entry point, subcommand dispatch (check-rpc, serve, migrate)
 internal/config/          env-var configuration loading (no credential logging)
 internal/logging/         structured slog setup
 internal/rpc/             Qogecoin Core JSON-RPC client (generic Call + typed helpers)
-internal/chain/           canonical block/tx/output domain model (Core-shape-independent)
-internal/script/          script classification (P2PK/P2PKH/.../P2QPK/UNKNOWN)
-internal/indexer/         sync loop: fetch from rpc, classify via script, write via store
-internal/store/           PostgreSQL persistence, idempotent writes, reorg handling
+internal/chain/           canonical block/tx/output domain model (Core-shape-independent) — implemented
+internal/script/          script classification (P2PK/P2PKH/.../P2QPK/UNKNOWN) — implemented
+internal/indexer/         sync loop: fetch from rpc, classify via script, write via store — Phase 2B.2
+internal/store/           PostgreSQL connection + migration runner (implemented, §15);
+                          block-indexing write API is Phase 2B.2
 internal/api/             HTTP/JSON API (not wired to a public port yet)
 internal/web/             HTML presentation layer (not built yet)
+migrations/               versioned SQL schema (§3, §15) — implemented
 ```
 
 Data flows one direction under normal operation:
@@ -75,180 +82,279 @@ below is a deliberate divergence, not an oversight:
 
 ## 3. PostgreSQL schema
 
+**Status: FINAL for Phase 2B.1, implemented in `migrations/0001_initial.up.sql`
+(and reversed in `0001_initial.down.sql`).** That migration file is the
+authoritative DDL; what follows is a guided tour of its design, not a
+duplicate copy — see the migration itself for every constraint verbatim.
+
 Integer satoshis (`BIGINT`) everywhere; no floating point for QOGE values
 anywhere in the schema or the Go model.
 
+This is a full rewrite of the Phase-1/2A schema sketch, driven by three
+corrections identified in Phase 2B.1 review before any migration was
+written (not bolted on afterward):
+
+1. **Transaction identity vs. transaction occurrence were conflated.**
+   The old sketch put `block_hash`/`block_height`/`tx_index` directly on
+   `transactions`, keyed by `txid PRIMARY KEY` — meaning a txid could only
+   ever belong to one block. That's wrong for an explorer that keeps orphan
+   blocks as an audit trail: the same transaction body can legitimately
+   appear in two different blocks across a reorg. See §3a.
+2. **Immutable output data and mutable canonical spend state were
+   conflated.** The old sketch put `spent`/`spending_txid`/
+   `creation_block_height` directly on `transaction_outputs`. That table
+   should describe an output exactly as it was created, forever; whether
+   it's currently unspent on the canonical chain is a separate, mutable
+   fact that reorgs need to rewrite without touching the immutable body.
+   See §3b.
+3. **`is_p2qpk` duplicated what `script_type = 'p2qpk'` already said.**
+   Removed entirely — see §3c.
+
+Raw binary data (scripts, witness items, coinbase data, pubkeys) is
+`BYTEA`, not hex `TEXT` — see §3d for the reasoning and the one place hex
+`TEXT` is kept anyway (hashes/txids).
+
+### 3a. Transaction identity vs. occurrence
+
 ```sql
--- ── sync checkpoint ─────────────────────────────────────────────────────
-CREATE TABLE sync_state (
-    name                TEXT PRIMARY KEY,        -- 'main' for phase 1 (room for future named indexers)
-    indexed_height      BIGINT NOT NULL,
-    indexed_block_hash  TEXT NOT NULL,
-    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
--- ── blocks ──────────────────────────────────────────────────────────────
-CREATE TABLE blocks (
-    hash                TEXT PRIMARY KEY,
-    height              BIGINT NOT NULL,
-    prev_hash           TEXT,                    -- NULL only for genesis
-    merkle_root         TEXT NOT NULL,
-    "time"              BIGINT NOT NULL,          -- block header timestamp (unix seconds)
-    bits                TEXT NOT NULL,
-    difficulty          DOUBLE PRECISION NOT NULL,-- display only; never used for consensus decisions
-    nonce               BIGINT NOT NULL,
-    size                INT NOT NULL,
-    weight              INT NOT NULL,
-    tx_count            INT NOT NULL,
-    orphaned            BOOLEAN NOT NULL DEFAULT FALSE,
-    orphaned_at         TIMESTAMPTZ,
-    indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
-);
--- Exactly one canonical block per height; orphaned blocks are kept (audit trail),
--- not deleted, so the unique constraint on height only applies to the canonical row.
-CREATE UNIQUE INDEX blocks_height_canonical_uidx ON blocks (height) WHERE NOT orphaned;
-CREATE INDEX blocks_prev_hash_idx ON blocks (prev_hash);
-
--- ── transactions ────────────────────────────────────────────────────────
+-- Immutable transaction body. Block-independent: this row's meaning never
+-- changes regardless of which block(s) reference it or whether those
+-- blocks are canonical.
 CREATE TABLE transactions (
     txid                TEXT PRIMARY KEY,
-    block_hash          TEXT NOT NULL REFERENCES blocks(hash),
-    block_height        BIGINT NOT NULL,          -- denormalized for range queries
-    tx_index            INT NOT NULL,             -- position within the block
     version             INT NOT NULL,
     locktime            BIGINT NOT NULL,
     size                INT NOT NULL,
     vsize               INT NOT NULL,
     weight              INT NOT NULL,
     is_coinbase         BOOLEAN NOT NULL,
-    fee_satoshis        BIGINT,                   -- NULL for coinbase; computed once all inputs resolved
+    fee_satoshis        BIGINT,   -- NULL for coinbase; optional/deferred otherwise (not computed in 2B.1)
     indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX transactions_block_height_idx ON transactions (block_height);
 
--- ── transaction inputs (raw, one row per vin — no aggregation) ─────────
+-- Occurrence: which block(s) contained this txid, and at what position.
+-- The SAME txid can be linked to two different block_hash rows — e.g. a
+-- transaction that appeared in an orphaned block and was later
+-- re-included in the new canonical block during a reorg — without
+-- duplicating the transaction body. Covered by
+-- TestInvariant_SameTxidTwoBlocks (internal/store).
+CREATE TABLE block_transactions (
+    block_hash          TEXT NOT NULL REFERENCES blocks (hash),
+    tx_index            INT NOT NULL,
+    txid                TEXT NOT NULL REFERENCES transactions (txid),
+    block_height        BIGINT NOT NULL,  -- auto-derived by trigger from blocks.height; never supplied by the caller
+    PRIMARY KEY (block_hash, tx_index),
+    UNIQUE (block_hash, txid)
+);
+```
+
+`block_height` is set by a `BEFORE INSERT OR UPDATE` trigger
+(`block_transactions_set_height`) that looks up `blocks.height` for the
+given `block_hash` and raises an exception if no such block exists. This
+was a deliberate choice over trusting the caller to keep a denormalized
+column in sync: the whole reason this project exists is to not repeat
+eIquidus's class of drift bug, and a trigger makes the derived column
+provably correct rather than merely documented as such.
+
+**transaction != transaction occurrence.** Every place this document (or
+the Go code) says "a transaction's block," it means "the transaction's
+occurrence in the currently-canonical block" — i.e. a `block_transactions`
+row joined to a `blocks` row where `canonical = true`. A txid without any
+`canonical = true` `block_transactions` row is fully orphaned data,
+retrievable for audit but not part of the current chain view.
+
+### 3b. Immutable output body vs. canonical UTXO state
+
+```sql
+-- Immutable output body: value, script, classification — as the output
+-- was created, forever.
+CREATE TABLE transaction_outputs (
+    txid                TEXT NOT NULL REFERENCES transactions (txid),
+    vout_index          INT NOT NULL,
+    value_satoshis      BIGINT NOT NULL,
+    script_pubkey       BYTEA NOT NULL,
+    script_type         TEXT NOT NULL,    -- see §7; CHECK constraint, not a native ENUM (see note)
+    witness_version     INT,              -- NULL for non-witness scripts
+    witness_program     BYTEA,            -- NULL for non-witness scripts
+    PRIMARY KEY (txid, vout_index)
+);
+
+-- Canonical, MUTABLE spend state — separate from the row above on purpose.
+-- One row per output that has ever existed on the canonical chain; rolled
+-- back/rebuilt during reorgs. transaction_outputs itself is never touched
+-- by a reorg.
+CREATE TABLE utxo_state (
+    txid                    TEXT NOT NULL,
+    vout_index              INT NOT NULL,
+    creation_block_hash     TEXT NOT NULL REFERENCES blocks (hash),
+    creation_block_height   BIGINT NOT NULL,
+    spent                   BOOLEAN NOT NULL DEFAULT FALSE,
+    spending_txid           TEXT,
+    spending_vin_index      INT,
+    spending_block_hash     TEXT REFERENCES blocks (hash),
+    spending_block_height   BIGINT,
+    PRIMARY KEY (txid, vout_index),
+    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
+);
+```
+
+Why split them: an output whose creating block gets orphaned during a
+reorg simply loses its `utxo_state` row (deleted — it no longer exists on
+the canonical chain at all) while its `transaction_outputs` row is
+untouched, permanently queryable for audit. If the exact same transaction
+later reappears in the new canonical chain (common in shallow reorgs), the
+indexer inserts a fresh `utxo_state` row referencing the *already-existing*
+`transaction_outputs` row — no re-parsing, no risk of the script/value
+data disagreeing with what was originally seen.
+
+Companion tables (unchanged in shape from the Phase-1 sketch, just now
+`BYTEA` for binary columns):
+
+```sql
 CREATE TABLE transaction_inputs (
-    txid                TEXT NOT NULL REFERENCES transactions(txid),
+    txid                TEXT NOT NULL REFERENCES transactions (txid),
     vin_index           INT NOT NULL,
-    prev_txid           TEXT,                     -- NULL for coinbase
-    prev_vout_index     INT,                       -- NULL for coinbase
-    coinbase_hex        TEXT,                      -- set only for coinbase input
-    script_sig_hex      TEXT,
+    prev_txid           TEXT,    -- NULL for coinbase
+    prev_vout_index     INT,     -- NULL for coinbase
+    coinbase            BYTEA,   -- set only for the coinbase input
+    script_sig          BYTEA,
     sequence            BIGINT NOT NULL,
-    has_witness         BOOLEAN NOT NULL DEFAULT FALSE,
     PRIMARY KEY (txid, vin_index)
 );
-CREATE INDEX transaction_inputs_prevout_idx ON transaction_inputs (prev_txid, prev_vout_index);
 
 -- Witness stack data lives in its own table so ordinary listing/detail
--- queries never have to pull ~17KB P2QPK signatures along for the ride.
--- See §8.
+-- queries never have to pull ~17KB P2QPK signatures along for the ride —
+-- see §8.
 CREATE TABLE transaction_input_witness (
     txid                TEXT NOT NULL,
     vin_index           INT NOT NULL,
-    item_index          INT NOT NULL,              -- position in the witness stack, 0 = bottom
+    item_index          INT NOT NULL,   -- position in the witness stack, 0 = bottom
     data                BYTEA NOT NULL,
     PRIMARY KEY (txid, vin_index, item_index),
     FOREIGN KEY (txid, vin_index) REFERENCES transaction_inputs (txid, vin_index)
 );
+```
 
--- ── transaction outputs (the canonical UTXO ledger) ─────────────────────
-CREATE TABLE transaction_outputs (
-    txid                TEXT NOT NULL REFERENCES transactions(txid),
-    vout_index          INT NOT NULL,
-    value_satoshis      BIGINT NOT NULL,
-    script_pubkey_hex   TEXT NOT NULL,
-    script_type         TEXT NOT NULL,             -- see §7; CHECK constraint, not a native ENUM (see note)
-    witness_version     INT,                        -- NULL for non-witness scripts
-    witness_program_hex TEXT,                       -- NULL for non-witness scripts
-    is_p2qpk            BOOLEAN NOT NULL DEFAULT FALSE, -- witness_version=2 AND len(program)=32; see §9
-    creation_block_height BIGINT NOT NULL,
-    spent               BOOLEAN NOT NULL DEFAULT FALSE,
-    spending_txid       TEXT,
-    spending_vin_index  INT,
-    spending_block_height BIGINT,
-    PRIMARY KEY (txid, vout_index),
-    CHECK (script_type IN (
-        'p2pk','p2pkh','p2sh','p2wpkh','p2wsh','p2tr','p2qpk',
-        'nulldata','multisig','unknown_witness','unknown'
-    ))
+### 3c. Blocks, addresses, sync state, deployments
+
+```sql
+-- canonical replaces the earlier "orphaned" boolean sketch (same idea,
+-- inverse polarity — reads better as `WHERE canonical`). A block row is
+-- never deleted, only demoted.
+CREATE TABLE blocks (
+    hash                TEXT PRIMARY KEY,
+    height              BIGINT NOT NULL,
+    prev_hash           TEXT REFERENCES blocks (hash), -- NULL only for genesis; self-FK requires the parent to already exist
+    merkle_root         TEXT NOT NULL,
+    "time"              BIGINT NOT NULL,
+    bits                TEXT NOT NULL,
+    difficulty          DOUBLE PRECISION NOT NULL, -- display only; never used for consensus decisions
+    nonce               BIGINT NOT NULL,
+    size                INT NOT NULL,
+    weight              INT NOT NULL,
+    tx_count            INT NOT NULL,
+    canonical           BOOLEAN NOT NULL DEFAULT TRUE,
+    orphaned_at         TIMESTAMPTZ,
+    indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX transaction_outputs_unspent_idx ON transaction_outputs (txid, vout_index) WHERE NOT spent;
-CREATE INDEX transaction_outputs_spending_txid_idx ON transaction_outputs (spending_txid);
+-- Exactly one canonical block per height — the core reorg invariant.
+CREATE UNIQUE INDEX blocks_height_canonical_uidx ON blocks (height) WHERE canonical;
 
--- Resolved DESTINATION address(es) per output — the addresses whose
--- balance/received/sent accounting (the `addresses` cache below) is
--- actually derived from this output. For every currently-supported script
--- type this is exactly zero or one row: single-key types (P2PK, P2PKH,
--- P2WPKH, P2QPK, etc.) resolve to one destination address; unparseable/
--- unknown scripts resolve to zero. Bare MULTISIG is deliberately NOT
--- represented here — see output_participants below and §13.A — because a
--- multisig output has no single owner to credit. This table, not
--- output_participants, is the one balance aggregation joins against.
-CREATE TABLE output_addresses (
-    txid                TEXT NOT NULL,
-    vout_index          INT NOT NULL,
-    address             TEXT NOT NULL,
-    PRIMARY KEY (txid, vout_index, address),
-    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
-);
-CREATE INDEX output_addresses_address_idx ON output_addresses (address);
-
--- Pubkey-derived PARTICIPANT identities for bare MULTISIG outputs —
--- searchable/displayable ("this address co-signs this UTXO"), but
--- deliberately never joined into balance/received/sent aggregation. An
--- m-of-n multisig output's value is jointly controlled by all n named
--- participants, not individually owned by each of them; if this table were
--- (mistakenly) joined the same way output_addresses is, a single multisig
--- UTXO's value would be credited in full to every participant's balance —
--- summing all address balances would then overcount total supply by
--- (participants - 1) times the output value for every multisig UTXO in
--- existence. See §13.A ("role model": output_addresses rows carry an
--- implicit role=destination; this table's rows are role=participant, and
--- only role=destination ever contributes to balance math).
-CREATE TABLE output_participants (
-    txid                TEXT NOT NULL,
-    vout_index          INT NOT NULL,
-    address             TEXT NOT NULL, -- derived from the participant pubkey, display/search only
-    pubkey_hex          TEXT NOT NULL,
-    PRIMARY KEY (txid, vout_index, address),
-    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
-);
-CREATE INDEX output_participants_address_idx ON output_participants (address);
-
--- ── addresses (derived cache, not a source of truth) ────────────────────
--- Rebuilt by re-aggregating output_addresses (destination rows ONLY —
--- never output_participants) + transaction_outputs for the touched
--- addresses inside the SAME block transaction. Every write is a SET of a
--- freshly computed absolute value (see §4) — never an increment.
+-- Derived balance cache — see §4 item 4 and §13.A/§7 for why
+-- output_addresses (never output_participants) is what this is built from.
 CREATE TABLE addresses (
-    address             TEXT PRIMARY KEY,
-    total_received_satoshis BIGINT NOT NULL,
-    total_sent_satoshis      BIGINT NOT NULL,
-    balance_satoshis          BIGINT NOT NULL,
-    tx_count                  INT NOT NULL,
-    first_seen_height         BIGINT NOT NULL,
-    last_seen_height           BIGINT NOT NULL,
-    updated_at                TIMESTAMPTZ NOT NULL DEFAULT now()
+    address                     TEXT PRIMARY KEY,
+    total_received_satoshis     BIGINT NOT NULL DEFAULT 0,
+    total_sent_satoshis         BIGINT NOT NULL DEFAULT 0,
+    balance_satoshis            BIGINT NOT NULL DEFAULT 0,
+    tx_count                    INT NOT NULL DEFAULT 0,
+    first_seen_height           BIGINT,
+    last_seen_height            BIGINT,
+    updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ── deployment status cache (display only; Core remains authoritative) ──
+-- Bootstrap state (an explorer that has never synced) is explicit, not a
+-- fake genesis-adjacent hash: height=-1 means "nothing indexed yet," and
+-- the CHECK constraint makes -1-with-a-hash or >=0-without-one
+-- unrepresentable. Confirmed by TestInvariant_UninitializedSyncStateValid
+-- and TestInvariant_ContradictorySyncStateRejected (internal/store).
+CREATE TABLE sync_state (
+    name                TEXT PRIMARY KEY,
+    indexed_height      BIGINT NOT NULL DEFAULT -1,
+    indexed_block_hash  TEXT,
+    updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT sync_state_bootstrap_consistency CHECK (
+        (indexed_height = -1 AND indexed_block_hash IS NULL) OR
+        (indexed_height >= 0 AND indexed_block_hash IS NOT NULL)
+    )
+);
+
+-- Deployment status cache (display only; Core remains authoritative).
 CREATE TABLE chain_deployments (
-    name                TEXT PRIMARY KEY,          -- e.g. 'p2qpk'
-    status              TEXT NOT NULL,              -- defined/started/locked_in/active/failed
+    name                TEXT PRIMARY KEY, -- e.g. 'p2qpk'
+    status              TEXT NOT NULL,    -- defined/started/locked_in/active/failed
     since_height        BIGINT,
     raw_json            JSONB NOT NULL,
     checked_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ```
 
-**Note on `script_type`:** a `TEXT` column with a `CHECK` constraint was
-chosen over a native Postgres `ENUM` deliberately. Adding a value to a native
-enum type is a schema migration with transactional caveats (`ALTER TYPE ...
-ADD VALUE` cannot run inside the same transaction as its first use, in some
-Postgres versions). New witness/script types are expected — most notably
-P2QPK activating for real — so the classification list needs to be cheap to
-extend. A `CHECK` constraint is a single, ordinary migration.
+### 3d. Output addressing: destinations vs. multisig participants
+
+```sql
+CREATE TABLE output_addresses (   -- balance-accounting destinations ONLY
+    txid                TEXT NOT NULL,
+    vout_index          INT NOT NULL,
+    address             TEXT NOT NULL,
+    PRIMARY KEY (txid, vout_index, address),
+    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
+);
+
+CREATE TABLE output_participants (   -- MULTISIG co-signer identities, display/search only
+    txid                TEXT NOT NULL,
+    vout_index          INT NOT NULL,
+    address             TEXT NOT NULL,
+    pubkey              BYTEA NOT NULL,
+    PRIMARY KEY (txid, vout_index, address),
+    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
+);
+```
+
+Both tables carry a `BEFORE INSERT OR UPDATE` trigger, not just a naming
+convention: `output_addresses_reject_multisig` raises an exception if the
+referenced output's `script_type = 'multisig'`, and
+`output_participants_require_multisig` raises one if it *isn't*. It is
+therefore a database error, not merely a code-review concern, to credit a
+multisig output's value to a participant's balance. See §7 and §13.A.
+
+### Notes
+
+**`script_type` is `TEXT` + `CHECK`, not a native `ENUM`** — deliberately.
+Adding a value to a native enum type is a schema migration with
+transactional caveats (`ALTER TYPE ... ADD VALUE` cannot run inside the
+same transaction as its first use, in some Postgres versions). New
+witness/script types are expected — most notably P2QPK activating for
+real — so the classification list needs to be cheap to extend. A `CHECK`
+constraint is a single, ordinary migration. Current allowed values: `p2pk,
+p2pkh, p2sh, p2wpkh, p2wsh, p2tr, p2qpk, nulldata, multisig,
+unknown_witness, unknown`.
+
+**`is_p2qpk` was removed, not merely deprecated.** `script_type = 'p2qpk'`
+is the sole source of truth. A structural (not consensus) `CHECK` —
+`script_type <> 'p2qpk' OR (witness_version = 2 AND
+octet_length(witness_program) = 32)` — makes a row claiming that
+classification without the matching witness shape a database error rather
+than a silently-possible contradiction. This is a byte-length/
+version-number check, never script execution or signature verification.
+
+**Format constraints, not policy constraints.** Every hash-like `TEXT`
+column (`blocks.hash`, `transactions.txid`, etc.) has a `CHECK (... ~
+'^[0-9a-f]{64}$')`. This rejects malformed data structurally — it has
+nothing to do with Bitcoin/QOGE relay-policy standardness, and never
+rejects genuine historical chain data (see §9 "Do not over-constrain").
+Similarly, `witness_version` is constrained to `0..16` because that range
+is what BIP141's version-opcode encoding can structurally represent, not a
+policy choice.
 
 ## 4. Idempotency model
 
@@ -259,19 +365,22 @@ indexing it exactly once.
 Mechanisms:
 
 1. **Natural-key uniqueness everywhere.** `blocks.hash`, `transactions.txid`,
-   `(txid, vin_index)`, `(txid, vout_index)` are all real primary/unique
-   keys. All inserts during indexing use `INSERT ... ON CONFLICT DO
-   NOTHING` (or `DO UPDATE` only where the update is itself idempotent,
-   e.g. re-setting `spent = true` on an output that's already spent by the
-   same `spending_txid` is a no-op in effect). Replaying a block's inserts
-   is always safe.
+   `(block_hash, tx_index)`/`(block_hash, txid)` on `block_transactions`,
+   `(txid, vin_index)`, `(txid, vout_index)` on both `transaction_outputs`
+   and `utxo_state` — all real primary/unique keys. All inserts during
+   indexing use `INSERT ... ON CONFLICT DO NOTHING` (or `DO UPDATE` only
+   where the update is itself idempotent, e.g. re-setting `spent = true` on
+   a `utxo_state` row that's already spent by the same `spending_txid` is a
+   no-op in effect). Replaying a block's inserts is always safe.
 2. **One SQL transaction per block.** All work for block N — inserting the
-   block row, its transactions, inputs, outputs, witness data, marking
-   spent outputs, recomputing the `addresses` rows touched by this block,
-   and finally updating `sync_state` — happens inside a single
-   `BEGIN...COMMIT`. Postgres transactions are all-or-nothing and durable
-   only on `COMMIT`; there is no way for "half of block N" to survive a
-   crash.
+   block row, its transactions (`ON CONFLICT DO NOTHING` — the same txid may
+   already exist from an earlier block), its `block_transactions` links,
+   inputs, outputs, witness data, `utxo_state` rows (new unspent outputs
+   inserted, spent outputs updated), recomputing the `addresses` rows
+   touched by this block, and finally updating `sync_state` — happens
+   inside a single `BEGIN...COMMIT`. Postgres transactions are
+   all-or-nothing and durable only on `COMMIT`; there is no way for "half of
+   block N" to survive a crash.
 3. **Checkpoint update is the last statement inside that same transaction,**
    not a separate one issued afterward. This directly closes the exact gap
    that corrupted eIquidus: there, the checkpoint (`coinstats.last`) and the
@@ -282,7 +391,7 @@ Mechanisms:
    only safe if the writes were idempotent, and they weren't. Making
    checkpoint-and-data one atomic unit removes the need to reason about that
    gap at all.
-4. **Balances are `SET`, not incremented** (see §3's `addresses` table).
+4. **Balances are `SET`, not incremented** (see §3c's `addresses` table).
    Because the value written is always "the fresh aggregate over canonical
    outputs right now," writing it twice is identical to writing it once.
 
@@ -313,25 +422,42 @@ yet):
    `blocks.prev_hash`, height by height, until the hashes agree at some
    height H. Because our local chain is exactly as long as what we've
    indexed, this terminates in at most `our_tip_height - H` steps.
-3. **Roll back, in one transaction:** for every locally canonical block
-   above H (highest height first):
-   - Mark it `orphaned = true`, `orphaned_at = now()` (kept for audit, not
-     deleted).
-   - For every output *created* in that block: delete its row (and its
-     `output_addresses`/`output_participants` rows) — it never existed on
-     the canonical chain.
-   - For every output *spent* by a transaction in that block: restore it
-     (`spent = false`, `spending_txid = NULL`, `spending_vin_index = NULL`,
-     `spending_block_height = NULL`).
-   - Delete the block's `transactions`/`transaction_inputs`/
-     `transaction_input_witness` rows (identified via `block_hash`).
-   - Recompute `addresses` rows for every address touched by the rolled-back
-     block, using the same set-based aggregate as normal indexing — this is
-     safe and correct by the same idempotency argument as §4.
+3. **Roll back, in one transaction.** This is the reorg invariant this
+   phase exists to get right: **only canonical *derived* state is rolled
+   back or rebuilt — `utxo_state`, `addresses`, `sync_state`.
+   Immutable bodies (`blocks`, `transactions`, `block_transactions`,
+   `transaction_inputs`, `transaction_input_witness`,
+   `transaction_outputs`) are never deleted.** For every locally canonical
+   block above H (highest height first):
+   - Mark it `canonical = false`, `orphaned_at = now()`. The row stays —
+     this is the audit trail.
+   - `transactions`, `transaction_inputs`, `transaction_input_witness`,
+     and `transaction_outputs` for that block's transactions are left
+     completely alone. `block_transactions` is left alone too — it's the
+     historical record of "this txid was once in this (now-orphaned)
+     block," which remains true forever.
+   - For every output *created* in that block (found via
+     `utxo_state.creation_block_hash`): **delete its `utxo_state` row** —
+     an output whose creating block isn't canonical doesn't currently exist
+     on the canonical chain, so there is no canonical spend state left to
+     describe. Its `transaction_outputs` row is untouched.
+   - For every output *spent* by a transaction in that block (found via
+     `utxo_state.spending_block_hash`): restore it (`spent = false`,
+     `spending_txid = NULL`, `spending_vin_index = NULL`,
+     `spending_block_hash = NULL`, `spending_block_height = NULL`) —
+     unless that same output's row was itself just deleted in the previous
+     step (i.e. it was also created within the orphaned range).
+   - Recompute `addresses` rows for every address touched by the
+     rolled-back block, using the same set-based aggregate (now querying
+     `utxo_state` for spent/unspent status) as normal indexing — safe and
+     correct by the same idempotency argument as §4.
    - Set `sync_state` to height H / the common-ancestor hash.
 4. **Resume** normal linear indexing from H+1 using Core's now-canonical
-   chain. The blocks that get (re-)indexed there are brand new to the
-   database (their heights were just vacated), so ordinary `INSERT` applies.
+   chain. If a block being (re-)indexed here contains a transaction whose
+   `txid` already has a `transactions` row (because it also appeared in the
+   orphaned branch), that row is reused as-is via `ON CONFLICT DO NOTHING`
+   — only a new `block_transactions` link and fresh `utxo_state` row are
+   needed, not a re-parse.
 
 **Depth safety valve (resolved — see §13.B):** reorgs of depth ≤ 100 blocks
 roll back automatically via the procedure above; a detected reorg deeper than
@@ -355,10 +481,12 @@ contaminate another:
 - **Total issued supply** — `SUM(subsidy(h) for h in 0..tip)`. Monotonic,
   height-derived, never touches indexed coinbase-output data at all.
 - **Currently unspent ("circulating") supply** *(future, optional)* —
-  `SUM(value_satoshis) FROM transaction_outputs WHERE NOT spent AND
-  script_type != 'nulldata'`. This is `total_issued_supply` minus everything
-  provably burned (`nulldata`/OP_RETURN outputs, which are consensus-
-  unspendable) minus nothing else — spent-and-respent value doesn't
+  `SELECT SUM(o.value_satoshis) FROM transaction_outputs o JOIN utxo_state u
+  USING (txid, vout_index) WHERE NOT u.spent AND o.script_type !=
+  'nulldata'` (spend state lives in `utxo_state`, not on
+  `transaction_outputs` itself — see §3b). This is `total_issued_supply`
+  minus everything provably burned (`nulldata`/OP_RETURN outputs, which are
+  consensus-unspendable) minus nothing else — spent-and-respent value doesn't
   disappear, it just moves.
 
 **Recommendation:** compute issued supply from the **height-based subsidy
@@ -493,8 +621,9 @@ the running node.
   P2QPK precisely when
   `witnessversion == 2 && witnessprogram.size() == SLHDSA_PK_LEN`. The Go
   explorer uses this identical rule — **not** the RPC `"type"` string — to
-  set `is_p2qpk = true` and `script_type = 'p2qpk'` (rather than leaving it
-  classified as `unknown_witness`).
+  set `script_type = 'p2qpk'` (rather than leaving it classified as
+  `unknown_witness`). There is no separate `is_p2qpk` flag to keep in sync
+  with that decision — see §3c.
 - **Address handling: Core already encodes a valid address; do not hand-roll
   one.** `key_io.cpp`'s `EncodeDestination` has a generic `WitnessUnknown`
   path that Bech32m-encodes *any* witness version 1–16 / length 2–40 program
@@ -582,6 +711,17 @@ tables rather than one `role` column, because it makes the balance-query
 join target syntactically impossible to get wrong (you'd have to
 deliberately query the wrong table) rather than merely a `WHERE role = ...`
 clause someone could forget.
+
+**Phase 2B.1 update: this is now database-enforced, not just an
+application convention.** `migrations/0001_initial.up.sql` adds a
+`BEFORE INSERT OR UPDATE` trigger on each table:
+`output_addresses_reject_multisig` raises an exception if the referenced
+output's `script_type = 'multisig'`; `output_participants_require_multisig`
+raises one if it isn't. Confirmed by
+`TestInvariant_MultisigParticipantsNeverCreateDestinationRows`
+(`internal/store`): inserting participant rows for a multisig output
+succeeds, and a subsequent attempt to insert a destination row for that
+same output is rejected by Postgres itself.
 
 ## 12. Wallet cross-check (Symbiont Wallet)
 
@@ -685,3 +825,57 @@ Identified as worth consulting or mirroring — **not copied into this repo**:
 - `docs/sips/SIP QOGE PQC 02a P2QPK.md` and `SIP QOGE PQC 02 P2QPK.md` — the
   design-rationale documents behind everything above; useful background if
   a question comes up later that isn't answered by the code comments alone.
+
+## 15. Migrations and Go database tooling (Phase 2B.1)
+
+**File layout:** `migrations/NNNN_name.up.sql` / `migrations/NNNN_name.down.sql`
+at the repository root — plain, numbered, reviewable SQL files, no
+templating or code generation. `0001_initial` is the schema described in
+§3.
+
+**Migration runner: a small hand-written Go package
+(`internal/store/migrate.go`), not a third-party framework.** It does
+exactly four things: load `.up.sql`/`.down.sql` pairs from a directory
+(`LoadMigrations`), track applied versions in a `schema_migrations` table
+the runner creates itself if missing, apply not-yet-applied migrations in
+order (`Up`), and roll back the N most recent in reverse order (`Down`) —
+each migration's DDL and its `schema_migrations` bookkeeping row committed
+together in one transaction, so a failure partway through never records a
+migration as applied unless it fully succeeded. `LoadMigrations` refuses to
+load a migration that has an `.up.sql` but no matching `.down.sql` — every
+migration in this repository must be reversible by construction, not by
+discipline.
+
+Why not `golang-migrate/migrate` or a similar framework: this project
+targets exactly one database engine (PostgreSQL) and needs exactly four
+operations. A general multi-database migration framework's main value —
+pluggable source/database drivers, multiple SQL dialects, CLI packaging —
+isn't needed here, and every dependency added is something a reviewer has
+to trust. ~250 lines that a reviewer can read start-to-finish in a few
+minutes is a better fit for a project whose whole premise is auditability
+than an opaque well-tested-elsewhere dependency would be. If Phase 2B.2 or
+later needs migration features this runner doesn't have (e.g. concurrent-
+safe advisory locking for multi-instance deployments), that's a reason to
+revisit this decision explicitly then, not to guess at it now.
+
+Exposed via the CLI: `qoge-explorer migrate up`, `migrate down [n]`,
+`migrate version` (`cmd/qoge-explorer/main.go`), reading `QOGE_DATABASE_URL`
+and `QOGE_MIGRATIONS_DIR` (default `./migrations`).
+
+**Go database driver: `github.com/jackc/pgx/v5`, via `pgxpool` for
+connection pooling.** Chosen over `database/sql` + `lib/pq` per task
+guidance to prefer a well-maintained PostgreSQL-native driver: pgx maps
+PostgreSQL types (including `BYTEA`, `TIMESTAMPTZ`, arrays) directly
+without `database/sql`'s generic-driver abstraction layer in the way, and
+`pgxpool` is the connection-pooling story the future write-heavy indexer
+(Phase 2B.2) will want regardless. Pinned to **v5.7.4** specifically — not
+"latest" — because v5.7.5 and later require Go ≥ 1.23 while this repository's
+toolchain is go1.22.2 (`go.mod`); v5.7.4 is the newest release still
+compatible with that toolchain and was a deliberate, checked choice, not an
+accident of dependency resolution.
+
+Only the minimal connection/migration plumbing was added in this phase
+(`store.Connect`, `store.Up`/`Down`/`LoadMigrations`/`CurrentVersion`) — no
+block-indexing write API (`INSERT ... ON CONFLICT` per block, UTXO/address
+maintenance, reorg rollback execution) exists yet. That is Phase 2B.2,
+built on top of the schema this phase locks down.
