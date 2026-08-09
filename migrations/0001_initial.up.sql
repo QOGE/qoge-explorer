@@ -78,6 +78,9 @@ CREATE TABLE blocks (
     CONSTRAINT blocks_size_nonnegative CHECK (size >= 0),
     CONSTRAINT blocks_weight_nonnegative CHECK (weight >= 0),
     CONSTRAINT blocks_tx_count_nonnegative CHECK (tx_count >= 0),
+    -- nonce is consensus-wire uint32; stored as BIGINT (Postgres has no
+    -- native unsigned type) but range-checked to match.
+    CONSTRAINT blocks_nonce_uint32_range CHECK (nonce >= 0 AND nonce <= 4294967295),
     CONSTRAINT blocks_orphaned_at_consistency CHECK (
         (canonical AND orphaned_at IS NULL) OR (NOT canonical AND orphaned_at IS NOT NULL)
     )
@@ -100,7 +103,15 @@ CREATE TABLE transactions (
     CONSTRAINT transactions_txid_format CHECK (txid ~ '^[0-9a-f]{64}$'),
     CONSTRAINT transactions_size_nonnegative CHECK (size >= 0),
     CONSTRAINT transactions_vsize_nonnegative CHECK (vsize >= 0),
-    CONSTRAINT transactions_weight_nonnegative CHECK (weight >= 0)
+    CONSTRAINT transactions_weight_nonnegative CHECK (weight >= 0),
+    -- locktime is consensus-wire uint32.
+    CONSTRAINT transactions_locktime_uint32_range CHECK (locktime >= 0 AND locktime <= 4294967295),
+    CONSTRAINT transactions_fee_nonnegative CHECK (fee_satoshis IS NULL OR fee_satoshis >= 0),
+    -- A coinbase transaction has no "fee" concept (its value comes from
+    -- subsidy + collected fees, not from spending prior outputs) — see
+    -- docs/ARCHITECTURE.md §6. NULL is required, not merely allowed, when
+    -- is_coinbase is true.
+    CONSTRAINT transactions_coinbase_has_no_fee CHECK (NOT is_coinbase OR fee_satoshis IS NULL)
 );
 
 -- ── block_transactions (occurrence: which block(s) contained this txid) ─
@@ -152,7 +163,9 @@ CREATE TABLE transaction_inputs (
     CONSTRAINT transaction_inputs_coinbase_xor_prevout CHECK (
         (prev_txid IS NULL AND prev_vout_index IS NULL AND coinbase IS NOT NULL) OR
         (prev_txid IS NOT NULL AND prev_vout_index IS NOT NULL AND coinbase IS NULL)
-    )
+    ),
+    -- sequence is consensus-wire uint32.
+    CONSTRAINT transaction_inputs_sequence_uint32_range CHECK (sequence >= 0 AND sequence <= 4294967295)
 );
 CREATE INDEX transaction_inputs_prevout_idx ON transaction_inputs (prev_txid, prev_vout_index);
 
@@ -188,31 +201,85 @@ CREATE TABLE transaction_outputs (
     CONSTRAINT transaction_outputs_witness_version_range CHECK (
         witness_version IS NULL OR (witness_version >= 0 AND witness_version <= 16)
     ),
-    CONSTRAINT transaction_outputs_witness_presence_consistency CHECK (
-        (witness_version IS NULL AND witness_program IS NULL) OR
-        (witness_version IS NOT NULL AND witness_program IS NOT NULL)
-    ),
-    -- Structural (not consensus) P2QPK consistency: script_type='p2qpk' is
-    -- the sole source of truth (no separate is_p2qpk column exists to
-    -- drift out of sync with it — see docs/ARCHITECTURE.md §6), but any
-    -- row claiming that classification must actually have the witness
-    -- shape that classification means. This is a byte-length/version-number
-    -- check, not script execution or signature verification.
-    CONSTRAINT transaction_outputs_p2qpk_structural_consistency CHECK (
-        script_type <> 'p2qpk' OR (witness_version = 2 AND octet_length(witness_program) = 32)
+    -- Structural (not consensus) witness-metadata consistency, one rule per
+    -- script_type. This replaces two earlier, narrower constraints
+    -- (presence-consistency + a P2QPK-only check) that together had a real
+    -- NULL loophole: Postgres CHECK constraints treat a NULL result as
+    -- "satisfied," and `script_type <> 'p2qpk' OR (witness_version = 2 AND
+    -- ...)` evaluates to NULL — not FALSE — when witness_version is NULL,
+    -- so a row with script_type='p2qpk' and witness_version/witness_program
+    -- both NULL previously passed. Every branch below is written so it
+    -- always evaluates to TRUE or FALSE, never NULL: every comparison on a
+    -- nullable column is preceded by an `IS NOT NULL`/`IS NULL` check
+    -- (themselves always TRUE/FALSE), and AND/OR are only ever combined
+    -- with values that are already guaranteed non-NULL by a preceding
+    -- clause — so a NULL operand can never reach the top-level AND/OR and
+    -- produce an ambiguous "pass by default" result.
+    --
+    -- This is a byte-length/version-number check only — never script
+    -- execution or signature verification.
+    CONSTRAINT transaction_outputs_witness_metadata_consistency CHECK (
+        CASE script_type
+            WHEN 'p2wpkh' THEN
+                witness_version IS NOT NULL AND witness_version = 0
+                AND witness_program IS NOT NULL AND octet_length(witness_program) = 20
+            WHEN 'p2wsh' THEN
+                witness_version IS NOT NULL AND witness_version = 0
+                AND witness_program IS NOT NULL AND octet_length(witness_program) = 32
+            WHEN 'p2tr' THEN
+                witness_version IS NOT NULL AND witness_version = 1
+                AND witness_program IS NOT NULL AND octet_length(witness_program) = 32
+            WHEN 'p2qpk' THEN
+                witness_version IS NOT NULL AND witness_version = 2
+                AND witness_program IS NOT NULL AND octet_length(witness_program) = 32
+            WHEN 'unknown_witness' THEN
+                -- A structurally valid witness program whose version/length
+                -- combination isn't one of the recognized types above — by
+                -- definition its version is >0 (version 0 is fully defined
+                -- by BIP141 with only the two lengths handled above; an
+                -- off-length v0 program classifies as 'unknown', not
+                -- 'unknown_witness' — see docs/ARCHITECTURE.md §7).
+                witness_version IS NOT NULL AND witness_version > 0
+                AND witness_program IS NOT NULL
+            WHEN 'unknown' THEN
+                -- Two legitimate shapes: a script that isn't a witness
+                -- program at all (no witness metadata), OR a witness
+                -- version-0 program whose length is neither 20 nor 32 —
+                -- version 0 is fully BIP141-defined with only those two
+                -- standard lengths, so Core's own Solver() (and this
+                -- project's classifier — see docs/ARCHITECTURE.md §7)
+                -- treats an off-length v0 program as unknown rather than
+                -- unknown_witness, but the version/program are still
+                -- present and worth keeping.
+                (witness_version IS NULL AND witness_program IS NULL)
+                OR (
+                    witness_version IS NOT NULL AND witness_version = 0
+                    AND witness_program IS NOT NULL AND octet_length(witness_program) NOT IN (20, 32)
+                )
+            ELSE
+                -- Legacy (non-witness) types — p2pk, p2pkh, p2sh, nulldata,
+                -- multisig — carry no witness metadata.
+                witness_version IS NULL AND witness_program IS NULL
+        END
     )
 );
 CREATE INDEX transaction_outputs_script_type_idx ON transaction_outputs (script_type);
 
 -- ── output_addresses: BALANCE-ACCOUNTING destinations only ──────────────
--- Zero or one row per output for every currently-supported script type
--- except MULTISIG, which is deliberately never represented here — see
--- output_participants below and docs/ARCHITECTURE.md §7/§13.A.
+-- At most ONE row per output — enforced by PRIMARY KEY (txid, vout_index),
+-- not (txid, vout_index, address). Every currently-supported script type
+-- other than MULTISIG resolves to a single owning address (or none, for
+-- unparseable/unknown scripts); MULTISIG is deliberately never represented
+-- here at all — see output_participants below and docs/ARCHITECTURE.md
+-- §7/§13.A. A second, different address for the same output would silently
+-- double-count that output's value in balance accounting even for an
+-- ordinary non-multisig output, which is exactly the class of bug this
+-- table exists to make structurally impossible.
 CREATE TABLE output_addresses (
     txid                TEXT NOT NULL,
     vout_index          INT NOT NULL,
     address             TEXT NOT NULL,
-    PRIMARY KEY (txid, vout_index, address),
+    PRIMARY KEY (txid, vout_index),
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
 );
 CREATE INDEX output_addresses_address_idx ON output_addresses (address);
@@ -273,18 +340,42 @@ CREATE TRIGGER output_participants_require_multisig_trigger
 -- ── utxo_state: CANONICAL, MUTABLE spend state (separate from the immutable output body) ──
 -- One row per output that has ever existed on the canonical chain. Rolled
 -- back/rebuilt during reorgs; transaction_outputs itself is never touched.
+--
+-- Relational integrity beyond "this hash looks like a hash": the FKs below
+-- prove the claimed creation/spending occurrences are real, not merely
+-- well-formed strings —
+--   (creation_block_hash, txid) -> block_transactions (block_hash, txid):
+--     the transaction that created this output really occurred in the
+--     claimed creation block.
+--   (spending_txid, spending_vin_index) -> transaction_inputs (txid, vin_index):
+--     the claimed spending input really exists.
+--   (spending_block_hash, spending_txid) -> block_transactions (block_hash, txid):
+--     the claimed spending transaction really occurred in the claimed
+--     spending block.
+-- All three composite FKs reference either a table's PRIMARY KEY or (for
+-- block_transactions) its UNIQUE (block_hash, txid) constraint. Postgres's
+-- default MATCH SIMPLE means a composite FK is satisfied whenever ANY of
+-- its columns is NULL — correct here because utxo_state_spent_consistency
+-- below already guarantees the three spending_* columns are NULL together
+-- or NOT NULL together, so there's no partial-NULL state for MATCH SIMPLE
+-- to paper over.
 CREATE TABLE utxo_state (
     txid                    TEXT NOT NULL,
     vout_index              INT NOT NULL,
-    creation_block_hash     TEXT NOT NULL REFERENCES blocks (hash),
+    creation_block_hash     TEXT NOT NULL,
     creation_block_height   BIGINT NOT NULL,
     spent                   BOOLEAN NOT NULL DEFAULT FALSE,
     spending_txid           TEXT,
     spending_vin_index      INT,
-    spending_block_hash     TEXT REFERENCES blocks (hash),
+    spending_block_hash     TEXT,
     spending_block_height   BIGINT,
     PRIMARY KEY (txid, vout_index),
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index),
+    FOREIGN KEY (creation_block_hash, txid) REFERENCES block_transactions (block_hash, txid),
+    FOREIGN KEY (spending_txid, spending_vin_index) REFERENCES transaction_inputs (txid, vin_index),
+    FOREIGN KEY (spending_block_hash, spending_txid) REFERENCES block_transactions (block_hash, txid),
+    CONSTRAINT utxo_state_creation_block_hash_format CHECK (creation_block_hash ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT utxo_state_spending_block_hash_format CHECK (spending_block_hash IS NULL OR spending_block_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT utxo_state_spending_txid_format CHECK (spending_txid IS NULL OR spending_txid ~ '^[0-9a-f]{64}$'),
     CONSTRAINT utxo_state_spending_vin_index_nonnegative CHECK (spending_vin_index IS NULL OR spending_vin_index >= 0),
     CONSTRAINT utxo_state_spent_consistency CHECK (
@@ -296,6 +387,36 @@ CREATE INDEX utxo_state_unspent_idx ON utxo_state (txid, vout_index) WHERE NOT s
 CREATE INDEX utxo_state_spending_txid_idx ON utxo_state (spending_txid);
 CREATE INDEX utxo_state_creation_block_hash_idx ON utxo_state (creation_block_hash);
 CREATE INDEX utxo_state_spending_block_hash_idx ON utxo_state (spending_block_hash);
+
+-- creation_block_height and spending_block_height are mechanically derived
+-- from blocks.height, never trusted from the caller — same pattern as
+-- block_transactions_set_height above. Kept as real columns (not obtained
+-- purely via JOIN) because they're useful for range queries, but a caller
+-- cannot make either one persist a value that disagrees with the
+-- corresponding block's actual height.
+CREATE OR REPLACE FUNCTION utxo_state_derive_heights() RETURNS trigger AS $$
+BEGIN
+    SELECT height INTO NEW.creation_block_height FROM blocks WHERE hash = NEW.creation_block_hash;
+    IF NEW.creation_block_height IS NULL THEN
+        RAISE EXCEPTION 'utxo_state: no block found for creation_block_hash %', NEW.creation_block_hash;
+    END IF;
+
+    IF NEW.spending_block_hash IS NOT NULL THEN
+        SELECT height INTO NEW.spending_block_height FROM blocks WHERE hash = NEW.spending_block_hash;
+        IF NEW.spending_block_height IS NULL THEN
+            RAISE EXCEPTION 'utxo_state: no block found for spending_block_hash %', NEW.spending_block_hash;
+        END IF;
+    ELSE
+        NEW.spending_block_height := NULL;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER utxo_state_derive_heights_trigger
+    BEFORE INSERT OR UPDATE ON utxo_state
+    FOR EACH ROW EXECUTE FUNCTION utxo_state_derive_heights();
 
 -- ── addresses: derived balance cache (canonical derived state, not a source of truth) ──
 -- Rebuilt by re-aggregating output_addresses (destination rows ONLY —

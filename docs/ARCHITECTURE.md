@@ -114,6 +114,41 @@ Raw binary data (scripts, witness items, coinbase data, pubkeys) is
 `BYTEA`, not hex `TEXT` — see §3d for the reasoning and the one place hex
 `TEXT` is kept anyway (hashes/txids).
 
+**PR #2 independent review found four further issues, fixed before merge,
+none requiring a schema redesign — hardening the design above rather than
+changing it:**
+
+- **A real NULL loophole in the P2QPK structural `CHECK`.** Postgres
+  treats a `CHECK` expression that evaluates to `NULL` as *satisfied*, and
+  `script_type <> 'p2qpk' OR (witness_version = 2 AND ...)` evaluates to
+  `NULL` — not `FALSE` — when `witness_version` is `NULL`. A row with
+  `script_type='p2qpk'` and `witness_version`/`witness_program` both
+  `NULL` previously passed. Replaced with a single `CASE script_type ...
+  END` constraint, one branch per script_type, every branch written so it
+  always evaluates to `TRUE`/`FALSE` and never `NULL` (every nullable
+  comparison is preceded by an `IS [NOT] NULL` check). Now covers
+  structural consistency for every known witness type
+  (P2WPKH/P2WSH/P2TR/P2QPK/unknown_witness/legacy), not just P2QPK. See
+  §3b.
+- **`output_addresses` could hold two different addresses for one
+  output.** Fixed by changing its primary key — see §3d.
+- **`utxo_state` proved nothing about whether its claimed
+  creation/spending occurrences were real.** Added composite foreign keys
+  against `block_transactions` and `transaction_inputs`, plus a
+  `BEFORE INSERT OR UPDATE` trigger (mirroring
+  `block_transactions_set_height`) that derives
+  `creation_block_height`/`spending_block_height` from `blocks.height`
+  rather than trusting the caller. See §3b.
+- **Numeric range gaps.** `blocks.nonce`, `transactions.locktime`, and
+  `transaction_inputs.sequence` are consensus-wire `uint32` fields; added
+  `CHECK`s constraining them to `[0, 4294967295]`. Added
+  `fee_satoshis >= 0` (when non-`NULL`) and a `CHECK` that a coinbase
+  transaction never carries a fee value at all.
+
+Also added: migration checksum drift detection (§15) and per-test-run
+isolated PostgreSQL schemas instead of `DROP SCHEMA public` in tests (test
+infrastructure, not part of the schema itself — see `internal/store`).
+
 ### 3a. Transaction identity vs. occurrence
 
 ```sql
@@ -183,20 +218,41 @@ CREATE TABLE transaction_outputs (
 -- One row per output that has ever existed on the canonical chain; rolled
 -- back/rebuilt during reorgs. transaction_outputs itself is never touched
 -- by a reorg.
+--
+-- PR #2 review: the FKs below don't just check that the referenced hashes
+-- look like real blocks — they prove the claimed creation/spending
+-- TRANSACTION OCCURRENCES are real, by referencing block_transactions
+-- (which links a txid to a block only when that txid genuinely occurred
+-- there) and transaction_inputs (which must contain the claimed spending
+-- vin). creation_block_height/spending_block_height are never trusted from
+-- the caller either — a BEFORE INSERT OR UPDATE trigger
+-- (utxo_state_derive_heights, mirroring block_transactions_set_height)
+-- derives both from blocks.height.
 CREATE TABLE utxo_state (
     txid                    TEXT NOT NULL,
     vout_index              INT NOT NULL,
-    creation_block_hash     TEXT NOT NULL REFERENCES blocks (hash),
-    creation_block_height   BIGINT NOT NULL,
+    creation_block_hash     TEXT NOT NULL,
+    creation_block_height   BIGINT NOT NULL,  -- trigger-derived, not caller-supplied
     spent                   BOOLEAN NOT NULL DEFAULT FALSE,
     spending_txid           TEXT,
     spending_vin_index      INT,
-    spending_block_hash     TEXT REFERENCES blocks (hash),
-    spending_block_height   BIGINT,
+    spending_block_hash     TEXT,
+    spending_block_height   BIGINT,           -- trigger-derived, not caller-supplied
     PRIMARY KEY (txid, vout_index),
-    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
+    FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index),
+    FOREIGN KEY (creation_block_hash, txid) REFERENCES block_transactions (block_hash, txid),
+    FOREIGN KEY (spending_txid, spending_vin_index) REFERENCES transaction_inputs (txid, vin_index),
+    FOREIGN KEY (spending_block_hash, spending_txid) REFERENCES block_transactions (block_hash, txid)
 );
 ```
+
+The three occurrence FKs use Postgres's default `MATCH SIMPLE`: a composite
+FK is satisfied whenever *any* of its columns is `NULL`. That's correct
+here — not a loophole — because `utxo_state_spent_consistency` (below)
+already guarantees the three `spending_*` columns are `NULL` together or
+`NOT NULL` together, so there's no partial-NULL state for `MATCH SIMPLE`
+to paper over: an unspent row's spending FKs are trivially (and correctly)
+satisfied, and a spent row's are fully checked.
 
 Why split them: an output whose creating block gets orphaned during a
 reorg simply loses its `utxo_state` row (deleted — it no longer exists on
@@ -306,7 +362,7 @@ CREATE TABLE output_addresses (   -- balance-accounting destinations ONLY
     txid                TEXT NOT NULL,
     vout_index          INT NOT NULL,
     address             TEXT NOT NULL,
-    PRIMARY KEY (txid, vout_index, address),
+    PRIMARY KEY (txid, vout_index), -- AT MOST ONE destination per output — see PR #2 review below
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
 );
 
@@ -315,10 +371,21 @@ CREATE TABLE output_participants (   -- MULTISIG co-signer identities, display/s
     vout_index          INT NOT NULL,
     address             TEXT NOT NULL,
     pubkey              BYTEA NOT NULL,
-    PRIMARY KEY (txid, vout_index, address),
+    PRIMARY KEY (txid, vout_index, address), -- MANY participants per output is correct here
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index)
 );
 ```
+
+**PR #2 review fix: `output_addresses`'s primary key was originally
+`(txid, vout_index, address)`, matching `output_participants`'s shape** —
+which permitted a second, *different* destination address for the same
+output. That would have silently double-counted an ordinary, non-multisig
+output's value across two addresses' balances — the same class of bug §7's
+multisig split exists to prevent, just not caught by that split since it
+doesn't require `script_type = 'multisig'` to happen. Changed to `PRIMARY
+KEY (txid, vout_index)`: at most one destination per output is now
+structurally guaranteed, not just conventionally expected. Confirmed by
+`TestInvariant_OneDestinationAddressPerOutput` (`internal/store`).
 
 Both tables carry a `BEFORE INSERT OR UPDATE` trigger, not just a naming
 convention: `output_addresses_reject_multisig` raises an exception if the
@@ -340,12 +407,16 @@ p2pkh, p2sh, p2wpkh, p2wsh, p2tr, p2qpk, nulldata, multisig,
 unknown_witness, unknown`.
 
 **`is_p2qpk` was removed, not merely deprecated.** `script_type = 'p2qpk'`
-is the sole source of truth. A structural (not consensus) `CHECK` —
-`script_type <> 'p2qpk' OR (witness_version = 2 AND
-octet_length(witness_program) = 32)` — makes a row claiming that
-classification without the matching witness shape a database error rather
-than a silently-possible contradiction. This is a byte-length/
-version-number check, never script execution or signature verification.
+is the sole source of truth. A structural (not consensus)
+`transaction_outputs_witness_metadata_consistency` `CHECK` — a
+`CASE script_type ... END` covering every witness type, not just P2QPK,
+written so every branch always evaluates to `TRUE`/`FALSE` and never the
+`NULL` a naive `script_type <> 'p2qpk' OR (witness_version = 2 AND ...)`
+expression would (Postgres treats a `NULL` `CHECK` result as satisfied —
+see the PR #2 note above) — makes a row claiming the P2QPK classification
+without the matching witness shape a database error rather than a
+silently-possible contradiction. This is a byte-length/version-number
+check, never script execution or signature verification.
 
 **Format constraints, not policy constraints.** Every hash-like `TEXT`
 column (`blocks.hash`, `transactions.txid`, etc.) has a `CHECK (... ~

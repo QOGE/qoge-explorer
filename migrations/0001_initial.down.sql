@@ -2,7 +2,10 @@
 
 DROP TABLE IF EXISTS chain_deployments;
 DROP TABLE IF EXISTS addresses;
+
+DROP TRIGGER IF EXISTS utxo_state_derive_heights_trigger ON utxo_state;
 DROP TABLE IF EXISTS utxo_state;
+DROP FUNCTION IF EXISTS utxo_state_derive_heights();
 
 DROP TRIGGER IF EXISTS output_participants_require_multisig_trigger ON output_participants;
 DROP TABLE IF EXISTS output_participants;

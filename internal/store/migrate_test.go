@@ -20,11 +20,15 @@ func loadTestMigrations(t *testing.T) []Migration {
 	return migrations
 }
 
+// tableExists checks for a table in whatever schema pool's connections
+// currently resolve unqualified names against (current_schema()) — i.e.
+// each test's own isolated schema (see newTestSchema), never a hardcoded
+// 'public'.
 func tableExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name string) bool {
 	t.Helper()
 	var exists bool
 	err := pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema='public' AND table_name=$1)`,
+		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name=$1)`,
 		name,
 	).Scan(&exists)
 	if err != nil {
@@ -37,13 +41,7 @@ func tableExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, name str
 // cleanly to an empty database.
 func TestMigrations_ApplyToEmptyDB(t *testing.T) {
 	ctx := context.Background()
-	pool, err := Connect(ctx, testDatabaseURL(t))
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-
-	resetSchema(t, pool)
+	pool := newTestSchema(t)
 	migrations := loadTestMigrations(t)
 
 	applied, err := Up(ctx, pool, migrations)
@@ -78,13 +76,7 @@ func TestMigrations_ApplyToEmptyDB(t *testing.T) {
 // cleanly where supported.
 func TestMigrations_RollbackCleanly(t *testing.T) {
 	ctx := context.Background()
-	pool, err := Connect(ctx, testDatabaseURL(t))
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-
-	resetSchema(t, pool)
+	pool := newTestSchema(t)
 	migrations := loadTestMigrations(t)
 
 	if _, err := Up(ctx, pool, migrations); err != nil {
@@ -118,13 +110,7 @@ func TestMigrations_RollbackCleanly(t *testing.T) {
 // be reapplied after rollback.
 func TestMigrations_ReapplyAfterRollback(t *testing.T) {
 	ctx := context.Background()
-	pool, err := Connect(ctx, testDatabaseURL(t))
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	defer pool.Close()
-
-	resetSchema(t, pool)
+	pool := newTestSchema(t)
 	migrations := loadTestMigrations(t)
 
 	if _, err := Up(ctx, pool, migrations); err != nil {
@@ -169,5 +155,64 @@ func TestLoadMigrations_RequiresBothDirections(t *testing.T) {
 	_, err := LoadMigrations(os.DirFS(dir))
 	if err == nil {
 		t.Fatal("expected an error for a migration missing its .down.sql, got nil")
+	}
+}
+
+// TestMigrations_ChecksumDriftDetected proves the task-5 scenario directly:
+// apply a migration, then simulate someone editing the already-applied
+// .up.sql file afterward (by mutating the in-memory UpSQL of an otherwise
+// identically-versioned/named Migration), and confirm both VerifyChecksums
+// and Up itself reject it loudly rather than silently treating the
+// (already-recorded) version as still up to date.
+func TestMigrations_ChecksumDriftDetected(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestSchema(t)
+	migrations := loadTestMigrations(t)
+
+	if _, err := Up(ctx, pool, migrations); err != nil {
+		t.Fatalf("initial Up: %v", err)
+	}
+
+	drifted := make([]Migration, len(migrations))
+	copy(drifted, migrations)
+	drifted[0].UpSQL = drifted[0].UpSQL + "\n-- edited after being applied\n"
+
+	if err := VerifyChecksums(ctx, pool, drifted); err == nil {
+		t.Fatal("expected VerifyChecksums to reject a migration whose UpSQL changed after being applied, got nil")
+	} else {
+		t.Logf("VerifyChecksums correctly rejected drift: %v", err)
+	}
+
+	// Up() itself must refuse to proceed too — not just the standalone
+	// checker — even though every migration is already applied and Up
+	// would otherwise have nothing to do.
+	if _, err := Up(ctx, pool, drifted); err == nil {
+		t.Fatal("expected Up to reject checksum drift before doing anything, got nil")
+	}
+
+	// Down() must refuse for the same reason: its DownSQL might no longer
+	// be the correct inverse of whatever is actually applied.
+	if _, err := Down(ctx, pool, drifted, 1); err == nil {
+		t.Fatal("expected Down to reject checksum drift before rolling anything back, got nil")
+	}
+}
+
+// TestMigrations_NameDriftDetected covers the same-version/different-name
+// case explicitly.
+func TestMigrations_NameDriftDetected(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestSchema(t)
+	migrations := loadTestMigrations(t)
+
+	if _, err := Up(ctx, pool, migrations); err != nil {
+		t.Fatalf("initial Up: %v", err)
+	}
+
+	renamed := make([]Migration, len(migrations))
+	copy(renamed, migrations)
+	renamed[0].Name = renamed[0].Name + "_renamed"
+
+	if err := VerifyChecksums(ctx, pool, renamed); err == nil {
+		t.Fatal("expected VerifyChecksums to reject a migration renamed after being applied, got nil")
 	}
 }
