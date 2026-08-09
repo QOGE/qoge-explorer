@@ -29,6 +29,15 @@
 --      classification — there is no separate is_p2qpk boolean to drift out
 --      of sync with it. A structural CHECK (not a consensus check) ties
 --      script_type = 'p2qpk' to witness_version = 2 AND a 32-byte program.
+--   7. txid != wtxid. `transactions` (keyed by txid = Core GetHash(), the
+--      non-witness serialization) is separate from `transaction_variants`
+--      (keyed by wtxid = Core GetWitnessHash(), RPC field "hash" — the
+--      full serialization INCLUDING witness). The same txid can have more
+--      than one valid wtxid across competing blocks/reorgs; witness data
+--      (transaction_input_witness) and per-block occurrence
+--      (block_transactions) are both keyed by wtxid, not just txid, so two
+--      variants of the same transaction never overwrite each other's
+--      witness data or size/vsize/weight. See docs/ARCHITECTURE.md §3a.
 
 -- ── sync checkpoint ─────────────────────────────────────────────────────
 -- Bootstrap state (an explorer that has never synced) is represented
@@ -89,21 +98,21 @@ CREATE TABLE blocks (
 CREATE UNIQUE INDEX blocks_height_canonical_uidx ON blocks (height) WHERE canonical;
 CREATE INDEX blocks_prev_hash_idx ON blocks (prev_hash);
 
--- ── transactions (immutable body; block-independent) ────────────────────
+-- ── transactions (immutable, NON-WITNESS body; block-independent) ───────
+-- Keyed by txid = Core's GetHash() = serialization WITHOUT witness data.
+-- Inputs and outputs live here (keyed by txid) because scriptSig/prevouts/
+-- scriptPubKeys/values are part of the txid-determining serialization.
+-- Witness data is NOT part of that serialization — see transaction_variants
+-- below for wtxid (Core's GetWitnessHash(), RPC field "hash") and why a
+-- single txid can have more than one valid wtxid across competing blocks.
 CREATE TABLE transactions (
     txid                TEXT PRIMARY KEY,
     version             INT NOT NULL,
     locktime            BIGINT NOT NULL,
-    size                INT NOT NULL,
-    vsize               INT NOT NULL,
-    weight              INT NOT NULL,
     is_coinbase         BOOLEAN NOT NULL,
     fee_satoshis        BIGINT, -- NULL for coinbase; deferred/optional otherwise (not computed in Phase 2B.1)
     indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT transactions_txid_format CHECK (txid ~ '^[0-9a-f]{64}$'),
-    CONSTRAINT transactions_size_nonnegative CHECK (size >= 0),
-    CONSTRAINT transactions_vsize_nonnegative CHECK (vsize >= 0),
-    CONSTRAINT transactions_weight_nonnegative CHECK (weight >= 0),
     -- locktime is consensus-wire uint32.
     CONSTRAINT transactions_locktime_uint32_range CHECK (locktime >= 0 AND locktime <= 4294967295),
     CONSTRAINT transactions_fee_nonnegative CHECK (fee_satoshis IS NULL OR fee_satoshis >= 0),
@@ -114,23 +123,58 @@ CREATE TABLE transactions (
     CONSTRAINT transactions_coinbase_has_no_fee CHECK (NOT is_coinbase OR fee_satoshis IS NULL)
 );
 
--- ── block_transactions (occurrence: which block(s) contained this txid) ─
--- The same txid can be linked to more than one block_hash — e.g. a
--- transaction that appears in an orphaned block and is later re-included
--- in the new canonical block during a reorg — without duplicating the
--- transaction body. block_height is derived automatically by trigger
--- (below) from blocks.height for the given block_hash, so it can never
--- drift out of sync with the blocks table.
+-- ── transaction_variants: one row per concrete witness serialization ────
+-- wtxid = Core's GetWitnessHash() = full serialization INCLUDING witness
+-- (RPC field "hash", NOT "txid" — see TxToUniv in Core source). Because
+-- txid deliberately excludes witness data, two different witness stacks
+-- satisfying the exact same non-witness txid produce two different wtxids
+-- — both legitimately observable across competing blocks/reorgs. A
+-- transaction with no witness data at all still gets exactly one variant
+-- row, with wtxid == txid. size/vsize/weight depend on the witness
+-- serialization actually observed, so they live here, not on `transactions`.
+CREATE TABLE transaction_variants (
+    wtxid               TEXT PRIMARY KEY,
+    txid                TEXT NOT NULL REFERENCES transactions (txid),
+    size                INT NOT NULL,
+    vsize               INT NOT NULL,
+    weight              INT NOT NULL,
+    indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (wtxid, txid), -- FK target for block_transactions/transaction_input_witness below
+    CONSTRAINT transaction_variants_wtxid_format CHECK (wtxid ~ '^[0-9a-f]{64}$'),
+    CONSTRAINT transaction_variants_size_nonnegative CHECK (size >= 0),
+    CONSTRAINT transaction_variants_vsize_nonnegative CHECK (vsize >= 0),
+    CONSTRAINT transaction_variants_weight_nonnegative CHECK (weight >= 0)
+);
+CREATE INDEX transaction_variants_txid_idx ON transaction_variants (txid);
+
+-- ── block_transactions (occurrence: which block(s) contained which variant) ─
+-- The same txid — and even the same (txid, wtxid) variant — can be linked
+-- to more than one block_hash — e.g. a transaction that appears in an
+-- orphaned block and is later re-included in the new canonical block
+-- during a reorg — without duplicating the transaction body. Storing wtxid
+-- here (not just txid) records EXACTLY which witness serialization
+-- appeared in this specific block, which matters because two competing
+-- blocks can legitimately carry the same txid with different witnesses.
+-- block_height is derived automatically by trigger (below) from
+-- blocks.height for the given block_hash, so it can never drift out of
+-- sync with the blocks table.
 CREATE TABLE block_transactions (
     block_hash          TEXT NOT NULL REFERENCES blocks (hash),
     tx_index            INT NOT NULL,
     txid                TEXT NOT NULL REFERENCES transactions (txid),
+    wtxid               TEXT NOT NULL,
     block_height        BIGINT NOT NULL,
     PRIMARY KEY (block_hash, tx_index),
+    -- A valid block never contains the same txid twice, regardless of
+    -- which witness variant — duplicate transactions within one block are
+    -- a consensus violation, not something this schema needs to represent.
     UNIQUE (block_hash, txid),
+    FOREIGN KEY (wtxid, txid) REFERENCES transaction_variants (wtxid, txid),
+    CONSTRAINT block_transactions_wtxid_format CHECK (wtxid ~ '^[0-9a-f]{64}$'),
     CONSTRAINT block_transactions_tx_index_nonnegative CHECK (tx_index >= 0)
 );
 CREATE INDEX block_transactions_txid_idx ON block_transactions (txid);
+CREATE INDEX block_transactions_wtxid_idx ON block_transactions (wtxid);
 CREATE INDEX block_transactions_block_height_idx ON block_transactions (block_height);
 
 CREATE OR REPLACE FUNCTION block_transactions_set_height() RETURNS trigger AS $$
@@ -165,22 +209,35 @@ CREATE TABLE transaction_inputs (
         (prev_txid IS NOT NULL AND prev_vout_index IS NOT NULL AND coinbase IS NULL)
     ),
     -- sequence is consensus-wire uint32.
-    CONSTRAINT transaction_inputs_sequence_uint32_range CHECK (sequence >= 0 AND sequence <= 4294967295)
+    CONSTRAINT transaction_inputs_sequence_uint32_range CHECK (sequence >= 0 AND sequence <= 4294967295),
+    -- FK target for utxo_state's "exact prevout" spend relationship below —
+    -- trivially true given (txid, vin_index) is already the PK, but Postgres
+    -- requires a unique constraint matching the exact referenced column set.
+    UNIQUE (txid, vin_index, prev_txid, prev_vout_index)
 );
 CREATE INDEX transaction_inputs_prevout_idx ON transaction_inputs (prev_txid, prev_vout_index);
 
 -- Witness stack data lives in its own table so ordinary listing/detail
 -- queries never have to pull ~17KB P2QPK signatures along for the ride —
--- see docs/ARCHITECTURE.md §8.
+-- see docs/ARCHITECTURE.md §8. Keyed by wtxid (not just txid): witness data
+-- is variant-specific — two different witness stacks can share the same
+-- txid (see transaction_variants above), so keying this table by txid
+-- alone would let one variant's witness silently overwrite another's.
 CREATE TABLE transaction_input_witness (
+    wtxid               TEXT NOT NULL,
     txid                TEXT NOT NULL,
     vin_index           INT NOT NULL,
     item_index          INT NOT NULL, -- position in the witness stack, 0 = bottom
     data                BYTEA NOT NULL,
-    PRIMARY KEY (txid, vin_index, item_index),
+    PRIMARY KEY (wtxid, vin_index, item_index),
+    -- Proves wtxid belongs to this txid's transaction_variants row...
+    FOREIGN KEY (wtxid, txid) REFERENCES transaction_variants (wtxid, txid),
+    -- ...and that (txid, vin_index) is a real input of that txid's body.
     FOREIGN KEY (txid, vin_index) REFERENCES transaction_inputs (txid, vin_index),
+    CONSTRAINT transaction_input_witness_wtxid_format CHECK (wtxid ~ '^[0-9a-f]{64}$'),
     CONSTRAINT transaction_input_witness_item_index_nonnegative CHECK (item_index >= 0)
 );
+CREATE INDEX transaction_input_witness_txid_vin_idx ON transaction_input_witness (txid, vin_index);
 
 -- ── transaction outputs (immutable body; the canonical script/value record) ──
 CREATE TABLE transaction_outputs (
@@ -233,28 +290,40 @@ CREATE TABLE transaction_outputs (
                 witness_version IS NOT NULL AND witness_version = 2
                 AND witness_program IS NOT NULL AND octet_length(witness_program) = 32
             WHEN 'unknown_witness' THEN
-                -- A structurally valid witness program whose version/length
-                -- combination isn't one of the recognized types above — by
-                -- definition its version is >0 (version 0 is fully defined
-                -- by BIP141 with only the two lengths handled above; an
-                -- off-length v0 program classifies as 'unknown', not
-                -- 'unknown_witness' — see docs/ARCHITECTURE.md §7).
+                -- A structurally valid witness program (per BIP141/Core's
+                -- CScript::IsWitnessProgram and this project's
+                -- ParseWitnessProgram: program length 2..40 bytes) whose
+                -- version/length combination isn't one of the recognized
+                -- types above. By definition its version is >0 (version 0
+                -- is fully defined by BIP141 with only the two lengths
+                -- handled above; an off-length v0 program classifies as
+                -- 'unknown', not 'unknown_witness' — see
+                -- docs/ARCHITECTURE.md §7) AND it must not coincide with a
+                -- named type's exact version+length (v1/32 is P2TR, v2/32
+                -- is P2QPK — those must be classified as such, never left
+                -- as unknown_witness).
                 witness_version IS NOT NULL AND witness_version > 0
                 AND witness_program IS NOT NULL
+                AND octet_length(witness_program) BETWEEN 2 AND 40
+                AND NOT (witness_version = 1 AND octet_length(witness_program) = 32)
+                AND NOT (witness_version = 2 AND octet_length(witness_program) = 32)
             WHEN 'unknown' THEN
                 -- Two legitimate shapes: a script that isn't a witness
-                -- program at all (no witness metadata), OR a witness
-                -- version-0 program whose length is neither 20 nor 32 —
-                -- version 0 is fully BIP141-defined with only those two
-                -- standard lengths, so Core's own Solver() (and this
-                -- project's classifier — see docs/ARCHITECTURE.md §7)
+                -- program at all (no witness metadata), OR a structurally
+                -- valid witness version-0 program (length 2..40, per
+                -- BIP141/ParseWitnessProgram) whose length is neither 20
+                -- nor 32 — version 0 is fully BIP141-defined with only
+                -- those two standard lengths, so Core's own Solver() (and
+                -- this project's classifier — see docs/ARCHITECTURE.md §7)
                 -- treats an off-length v0 program as unknown rather than
                 -- unknown_witness, but the version/program are still
                 -- present and worth keeping.
                 (witness_version IS NULL AND witness_program IS NULL)
                 OR (
                     witness_version IS NOT NULL AND witness_version = 0
-                    AND witness_program IS NOT NULL AND octet_length(witness_program) NOT IN (20, 32)
+                    AND witness_program IS NOT NULL
+                    AND octet_length(witness_program) BETWEEN 2 AND 40
+                    AND octet_length(witness_program) NOT IN (20, 32)
                 )
             ELSE
                 -- Legacy (non-witness) types — p2pk, p2pkh, p2sh, nulldata,
@@ -347,18 +416,27 @@ CREATE TRIGGER output_participants_require_multisig_trigger
 --   (creation_block_hash, txid) -> block_transactions (block_hash, txid):
 --     the transaction that created this output really occurred in the
 --     claimed creation block.
---   (spending_txid, spending_vin_index) -> transaction_inputs (txid, vin_index):
---     the claimed spending input really exists.
+--   (spending_txid, spending_vin_index, txid, vout_index) ->
+--     transaction_inputs (txid, vin_index, prev_txid, prev_vout_index):
+--     the claimed spending input really exists AND really spends THIS
+--     exact output (not just any output of some other txid/vout). A plain
+--     (spending_txid, spending_vin_index) -> (txid, vin_index) FK — the
+--     original Phase 2B.1 design — only proves the input row exists; it
+--     does not stop an input that actually spends output A from being
+--     used to mark unrelated output B "spent." The four-column FK closes
+--     that gap by making prev_txid/prev_vout_index (this row's own txid/
+--     vout_index) part of the referenced tuple.
 --   (spending_block_hash, spending_txid) -> block_transactions (block_hash, txid):
 --     the claimed spending transaction really occurred in the claimed
 --     spending block.
--- All three composite FKs reference either a table's PRIMARY KEY or (for
--- block_transactions) its UNIQUE (block_hash, txid) constraint. Postgres's
--- default MATCH SIMPLE means a composite FK is satisfied whenever ANY of
--- its columns is NULL — correct here because utxo_state_spent_consistency
+-- All three composite FKs reference either a table's PRIMARY KEY or a
+-- UNIQUE constraint with exactly matching columns. Postgres's default
+-- MATCH SIMPLE means a composite FK is satisfied whenever ANY of its
+-- columns is NULL — correct here because utxo_state_spent_consistency
 -- below already guarantees the three spending_* columns are NULL together
 -- or NOT NULL together, so there's no partial-NULL state for MATCH SIMPLE
--- to paper over.
+-- to paper over (txid/vout_index themselves are always NOT NULL, being
+-- part of this table's own PRIMARY KEY).
 CREATE TABLE utxo_state (
     txid                    TEXT NOT NULL,
     vout_index              INT NOT NULL,
@@ -372,7 +450,8 @@ CREATE TABLE utxo_state (
     PRIMARY KEY (txid, vout_index),
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index),
     FOREIGN KEY (creation_block_hash, txid) REFERENCES block_transactions (block_hash, txid),
-    FOREIGN KEY (spending_txid, spending_vin_index) REFERENCES transaction_inputs (txid, vin_index),
+    FOREIGN KEY (spending_txid, spending_vin_index, txid, vout_index)
+        REFERENCES transaction_inputs (txid, vin_index, prev_txid, prev_vout_index),
     FOREIGN KEY (spending_block_hash, spending_txid) REFERENCES block_transactions (block_hash, txid),
     CONSTRAINT utxo_state_creation_block_hash_format CHECK (creation_block_hash ~ '^[0-9a-f]{64}$'),
     CONSTRAINT utxo_state_spending_block_hash_format CHECK (spending_block_hash IS NULL OR spending_block_hash ~ '^[0-9a-f]{64}$'),

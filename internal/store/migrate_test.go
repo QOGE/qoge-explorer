@@ -216,3 +216,63 @@ func TestMigrations_NameDriftDetected(t *testing.T) {
 		t.Fatal("expected VerifyChecksums to reject a migration renamed after being applied, got nil")
 	}
 }
+
+// TestMigrations_DownSQLDriftDetected covers the DownSQL half of checksum
+// drift protection explicitly: UpSQL unchanged, only DownSQL edited after
+// the migration was applied. A future rollback would otherwise silently
+// run something that's no longer the correct inverse of what was actually
+// applied.
+func TestMigrations_DownSQLDriftDetected(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestSchema(t)
+	migrations := loadTestMigrations(t)
+
+	if _, err := Up(ctx, pool, migrations); err != nil {
+		t.Fatalf("initial Up: %v", err)
+	}
+
+	drifted := make([]Migration, len(migrations))
+	copy(drifted, migrations)
+	drifted[0].DownSQL = drifted[0].DownSQL + "\n-- edited after being applied\n"
+
+	if err := VerifyChecksums(ctx, pool, drifted); err == nil {
+		t.Fatal("expected VerifyChecksums to reject a migration whose DownSQL changed after being applied, got nil")
+	} else {
+		t.Logf("VerifyChecksums correctly rejected DownSQL drift: %v", err)
+	}
+
+	if _, err := Down(ctx, pool, drifted, 1); err == nil {
+		t.Fatal("expected Down to reject DownSQL checksum drift before rolling anything back, got nil")
+	}
+	if _, err := Up(ctx, pool, drifted); err == nil {
+		t.Fatal("expected Up to reject DownSQL checksum drift too (it verifies both directions), got nil")
+	}
+}
+
+// TestMigrations_AppliedMigrationMissingLocalDefinitionRejected covers the
+// "migration history is append-only" requirement: a version recorded as
+// applied in the database, but with no corresponding entry in the loaded
+// migrations slice (as if its .sql files had been deleted from the
+// repository), must be rejected rather than silently ignored.
+func TestMigrations_AppliedMigrationMissingLocalDefinitionRejected(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestSchema(t)
+	migrations := loadTestMigrations(t)
+
+	if _, err := Up(ctx, pool, migrations); err != nil {
+		t.Fatalf("initial Up: %v", err)
+	}
+
+	// Simulate deleting migration 0001's .sql files from the repository:
+	// load an empty migrations slice against a database that still has it
+	// recorded as applied.
+	if err := VerifyChecksums(ctx, pool, nil); err == nil {
+		t.Fatal("expected VerifyChecksums to reject an applied migration with no local definition, got nil")
+	}
+	if _, err := Up(ctx, pool, nil); err == nil {
+		t.Fatal("expected Up to reject an applied migration with no local definition, got nil")
+	}
+	if _, err := Down(ctx, pool, nil, 1); err == nil {
+		t.Fatal("expected Down to reject an applied migration with no local definition, got nil")
+	}
+}

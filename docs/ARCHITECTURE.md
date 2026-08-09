@@ -90,7 +90,7 @@ duplicate copy — see the migration itself for every constraint verbatim.
 Integer satoshis (`BIGINT`) everywhere; no floating point for QOGE values
 anywhere in the schema or the Go model.
 
-This is a full rewrite of the Phase-1/2A schema sketch, driven by three
+This is a full rewrite of the Phase-1/2A schema sketch, driven by four
 corrections identified in Phase 2B.1 review before any migration was
 written (not bolted on afterward):
 
@@ -109,6 +109,13 @@ written (not bolted on afterward):
    See §3b.
 3. **`is_p2qpk` duplicated what `script_type = 'p2qpk'` already said.**
    Removed entirely — see §3c.
+4. **txid vs. wtxid were conflated.** `transactions` was keyed by txid
+   alone, with `size`/`vsize`/`weight` and witness data (`block_transactions`,
+   `transaction_input_witness`) also keyed only by txid. Because txid
+   deliberately excludes witness data (Core's `GetHash()`), two different,
+   equally valid witness serializations of the same txid can exist —
+   observably, across two competing blocks — and a txid-only key cannot
+   represent both without one silently overwriting the other. See §3a.
 
 Raw binary data (scripts, witness items, coinbase data, pubkeys) is
 `BYTEA`, not hex `TEXT` — see §3d for the reasoning and the one place hex
@@ -149,37 +156,119 @@ Also added: migration checksum drift detection (§15) and per-test-run
 isolated PostgreSQL schemas instead of `DROP SCHEMA public` in tests (test
 infrastructure, not part of the schema itself — see `internal/store`).
 
-### 3a. Transaction identity vs. occurrence
+**A third review pass found one blocking issue and three smaller
+relational-integrity gaps, all fixed before merge:**
+
+- **The txid/wtxid split (blocking — see item 4 above and §3a).** Two
+  different witness serializations of the same txid — legitimately
+  observable across competing blocks — could not both be represented; the
+  second would silently overwrite the first's witness data and
+  size/vsize/weight. `transactions` now holds only the non-witness body;
+  a new `transaction_variants` table (keyed by `wtxid`) holds one row per
+  concrete witness serialization; `block_transactions` and
+  `transaction_input_witness` are keyed by `(txid, wtxid)`/`wtxid`
+  respectively, not txid alone.
+- **`utxo_state`'s spend FK proved an input existed, not that it spent
+  *this* output.** `(spending_txid, spending_vin_index) →
+  transaction_inputs(txid, vin_index)` only proved the input row was real;
+  an input that actually spends output A could still be used to mark
+  unrelated output B "spent." Widened to a four-column FK — see §3b.
+- **`unknown`/`unknown_witness` metadata was more permissive than
+  `ParseWitnessProgram` allows.** Neither branch enforced the structural
+  2–40 byte witness-program length range, and `unknown_witness` didn't
+  exclude version/length combinations that actually belong to a named type
+  (v1/32 is P2TR, v2/32 is P2QPK). Tightened — see §3b's `CASE` note.
+- **Migration checksums only covered `UpSQL`.** An edited `DownSQL` on an
+  already-applied migration went undetected. Now both directions are
+  checksummed and verified before `Up` or `Down` proceeds, and an applied
+  migration with no corresponding local `.sql` files is also an error —
+  see §15.
+
+### 3a. Transaction identity, occurrence, and witness variants
+
+**Terminology, precisely — five distinct concepts this section's tables
+each represent exactly one of:**
+
+| Term | Meaning | Core RPC field | Table |
+|---|---|---|---|
+| **txid** | Non-witness transaction identity | `"txid"` (Core's `GetHash()`) | `transactions.txid` |
+| **wtxid** | Complete serialized transaction, including witness | `"hash"` — **not** `"txid"` (Core's `GetWitnessHash()`) | `transaction_variants.wtxid` |
+| **transaction** | The non-witness body: inputs' prevouts/scriptSigs, outputs | — | `transactions` |
+| **transaction variant** | One concrete witness serialization of a transaction | — | `transaction_variants` |
+| **block occurrence** | The exact (txid, wtxid) variant appearing at a specific position in a specific block | — | `block_transactions` |
+
+Confirmed from Core's `TxToUniv` (`src/core_write.cpp`): `entry.pushKV("txid",
+tx.GetHash().GetHex())` and `entry.pushKV("hash", tx.GetWitnessHash().GetHex())`
+— two different hashes, two different meanings, both present in every
+verbose transaction RPC response. It is a real and easy mistake to read
+Core's `"hash"` field as "the txid" — this project's Go model spells both
+out explicitly (`chain.Transaction.TxID` / `.WTxID`) specifically to make
+that mistake harder.
+
+**Why this matters for orphan/reorg audit.** Because txid excludes witness
+data, two different witness stacks can satisfy the exact same non-witness
+txid — same inputs' prevouts, same outputs, same locktime — while producing
+two different wtxids. This isn't a hypothetical: it's the same "transaction
+malleability" property SegWit itself was deployed to make irrelevant to
+consensus, but it is very relevant to an *explorer* that promises to keep
+every block — canonical or orphaned — queryable as an audit trail. If block
+A (now orphaned) contained txid T with witness W1, and the new canonical
+block B recombined the same txid T with a different, equally valid witness
+W2, a schema keyed by txid alone could only ever store one of W1/W2 — the
+second write would silently destroy the first, which is exactly the kind
+of silent data loss this project's audit-trail guarantee (§2, §5) exists to
+prevent.
 
 ```sql
--- Immutable transaction body. Block-independent: this row's meaning never
--- changes regardless of which block(s) reference it or whether those
--- blocks are canonical.
+-- Immutable, NON-WITNESS transaction body. Block-independent: this row's
+-- meaning never changes regardless of which block(s) reference it, which
+-- witness variant(s) exist for it, or whether those blocks are canonical.
+-- Inputs and outputs are keyed by txid (not wtxid) because scriptSig/
+-- prevouts/scriptPubKeys/values are part of the txid-determining
+-- serialization — witness data is the one thing that ISN'T.
 CREATE TABLE transactions (
     txid                TEXT PRIMARY KEY,
     version             INT NOT NULL,
     locktime            BIGINT NOT NULL,
-    size                INT NOT NULL,
-    vsize               INT NOT NULL,
-    weight              INT NOT NULL,
     is_coinbase         BOOLEAN NOT NULL,
     fee_satoshis        BIGINT,   -- NULL for coinbase; optional/deferred otherwise (not computed in 2B.1)
     indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Occurrence: which block(s) contained this txid, and at what position.
--- The SAME txid can be linked to two different block_hash rows — e.g. a
--- transaction that appeared in an orphaned block and was later
--- re-included in the new canonical block during a reorg — without
--- duplicating the transaction body. Covered by
--- TestInvariant_SameTxidTwoBlocks (internal/store).
+-- One row per concrete witness serialization. A transaction with no
+-- witness data at all still gets exactly one variant row, with
+-- wtxid == txid. size/vsize/weight depend on the witness serialization
+-- actually observed, so they live here, not on `transactions`.
+CREATE TABLE transaction_variants (
+    wtxid               TEXT PRIMARY KEY,
+    txid                TEXT NOT NULL REFERENCES transactions (txid),
+    size                INT NOT NULL,
+    vsize               INT NOT NULL,
+    weight              INT NOT NULL,
+    indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (wtxid, txid) -- FK target for block_transactions/transaction_input_witness below
+);
+
+-- Occurrence: which block(s) contained which (txid, wtxid) variant, and at
+-- what position. The SAME txid — and even the SAME variant — can be linked
+-- to two different block_hash rows — e.g. a transaction that appeared in
+-- an orphaned block and was later re-included in the new canonical block
+-- during a reorg — without duplicating the transaction body. Storing wtxid
+-- here (not just txid) records EXACTLY which witness serialization
+-- appeared in this specific block. Covered by TestInvariant_SameTxidTwoBlocks
+-- and TestInvariant_WitnessVariantsDoNotOverwriteEachOther (internal/store).
 CREATE TABLE block_transactions (
     block_hash          TEXT NOT NULL REFERENCES blocks (hash),
     tx_index            INT NOT NULL,
     txid                TEXT NOT NULL REFERENCES transactions (txid),
+    wtxid               TEXT NOT NULL,
     block_height        BIGINT NOT NULL,  -- auto-derived by trigger from blocks.height; never supplied by the caller
     PRIMARY KEY (block_hash, tx_index),
-    UNIQUE (block_hash, txid)
+    -- A valid block never contains the same txid twice, regardless of
+    -- witness variant — duplicate transactions within one block are a
+    -- consensus violation, not something this schema needs to represent.
+    UNIQUE (block_hash, txid),
+    FOREIGN KEY (wtxid, txid) REFERENCES transaction_variants (wtxid, txid)
 );
 ```
 
@@ -197,6 +286,15 @@ occurrence in the currently-canonical block" — i.e. a `block_transactions`
 row joined to a `blocks` row where `canonical = true`. A txid without any
 `canonical = true` `block_transactions` row is fully orphaned data,
 retrievable for audit but not part of the current chain view.
+
+**The Go domain model does not split the way the SQL schema does.**
+`chain.Transaction` (`internal/chain/transaction.go`) carries both `TxID`
+and `WTxID`, plus `Size`/`VSize`/`Weight` — it represents one *observed*
+serialization/variant, which is the natural unit to work with in memory
+(matching exactly what one `getrawtransaction`/`decoderawtransaction`
+verbose RPC response describes). Only the persistence layer needs the
+txid/wtxid split, to keep two variants of the same txid from overwriting
+each other in storage.
 
 ### 3b. Immutable output body vs. canonical UTXO state
 
@@ -223,11 +321,20 @@ CREATE TABLE transaction_outputs (
 -- look like real blocks — they prove the claimed creation/spending
 -- TRANSACTION OCCURRENCES are real, by referencing block_transactions
 -- (which links a txid to a block only when that txid genuinely occurred
--- there) and transaction_inputs (which must contain the claimed spending
--- vin). creation_block_height/spending_block_height are never trusted from
--- the caller either — a BEFORE INSERT OR UPDATE trigger
--- (utxo_state_derive_heights, mirroring block_transactions_set_height)
+-- there) and transaction_inputs. creation_block_height/spending_block_height
+-- are never trusted from the caller either — a BEFORE INSERT OR UPDATE
+-- trigger (utxo_state_derive_heights, mirroring block_transactions_set_height)
 -- derives both from blocks.height.
+--
+-- Third-round fix: the spending-input FK originally only proved
+-- (spending_txid, spending_vin_index) exists as a real transaction_inputs
+-- row — NOT that it actually spends THIS output. An input that really
+-- spends output A could have been used to mark unrelated output B "spent."
+-- Widened to a four-column FK against a matching UNIQUE constraint on
+-- transaction_inputs (txid, vin_index, prev_txid, prev_vout_index): this
+-- output's own (txid, vout_index) is now part of the referenced tuple, via
+-- prev_txid/prev_vout_index, so the claimed spending input must genuinely
+-- point back at this exact output.
 CREATE TABLE utxo_state (
     txid                    TEXT NOT NULL,
     vout_index              INT NOT NULL,
@@ -241,18 +348,23 @@ CREATE TABLE utxo_state (
     PRIMARY KEY (txid, vout_index),
     FOREIGN KEY (txid, vout_index) REFERENCES transaction_outputs (txid, vout_index),
     FOREIGN KEY (creation_block_hash, txid) REFERENCES block_transactions (block_hash, txid),
-    FOREIGN KEY (spending_txid, spending_vin_index) REFERENCES transaction_inputs (txid, vin_index),
+    FOREIGN KEY (spending_txid, spending_vin_index, txid, vout_index)
+        REFERENCES transaction_inputs (txid, vin_index, prev_txid, prev_vout_index),
     FOREIGN KEY (spending_block_hash, spending_txid) REFERENCES block_transactions (block_hash, txid)
 );
 ```
 
-The three occurrence FKs use Postgres's default `MATCH SIMPLE`: a composite
-FK is satisfied whenever *any* of its columns is `NULL`. That's correct
-here — not a loophole — because `utxo_state_spent_consistency` (below)
-already guarantees the three `spending_*` columns are `NULL` together or
-`NOT NULL` together, so there's no partial-NULL state for `MATCH SIMPLE`
-to paper over: an unspent row's spending FKs are trivially (and correctly)
-satisfied, and a spent row's are fully checked.
+The occurrence FKs use Postgres's default `MATCH SIMPLE`: a composite FK is
+satisfied whenever *any* of its columns is `NULL`. That's correct here —
+not a loophole — because `utxo_state_spent_consistency` (below) already
+guarantees the three `spending_*` columns are `NULL` together or `NOT
+NULL` together, and `txid`/`vout_index` are always `NOT NULL` (part of
+this table's own primary key); so an unspent row's spending FKs are
+trivially (and correctly) satisfied via the `NULL` `spending_*` columns,
+and a spent row's are fully checked against all four columns. Confirmed by
+`TestInvariant_UTXOSpendMustMatchExactPrevout` (`internal/store`): an input
+that exists but points at a different txid, or the right txid but a
+different vout, is rejected either way.
 
 Why split them: an output whose creating block gets orphaned during a
 reorg simply loses its `utxo_state` row (deleted — it no longer exists on
@@ -263,8 +375,17 @@ indexer inserts a fresh `utxo_state` row referencing the *already-existing*
 `transaction_outputs` row — no re-parsing, no risk of the script/value
 data disagreeing with what was originally seen.
 
-Companion tables (unchanged in shape from the Phase-1 sketch, just now
-`BYTEA` for binary columns):
+Companion tables. `transaction_inputs` is still keyed by txid, not wtxid —
+inputs' prevouts/scriptSigs are part of the txid-determining serialization
+(§3a). It carries one more constraint than the Phase-1 sketch: a `UNIQUE
+(txid, vin_index, prev_txid, prev_vout_index)`, purely to serve as the
+target for `utxo_state`'s four-column exact-prevout FK above — trivially
+true given `(txid, vin_index)` is already the primary key, but Postgres
+requires a unique constraint matching the exact referenced column set.
+`transaction_input_witness`, by contrast, **is** keyed by wtxid — witness
+data is exactly the thing that differs between two variants of the same
+txid, so keying it by txid alone would let one variant's witness silently
+overwrite another's (the bug item 4/§3a exists to prevent):
 
 ```sql
 CREATE TABLE transaction_inputs (
@@ -275,18 +396,23 @@ CREATE TABLE transaction_inputs (
     coinbase            BYTEA,   -- set only for the coinbase input
     script_sig          BYTEA,
     sequence            BIGINT NOT NULL,
-    PRIMARY KEY (txid, vin_index)
+    PRIMARY KEY (txid, vin_index),
+    UNIQUE (txid, vin_index, prev_txid, prev_vout_index) -- FK target for utxo_state above
 );
 
 -- Witness stack data lives in its own table so ordinary listing/detail
 -- queries never have to pull ~17KB P2QPK signatures along for the ride —
--- see §8.
+-- see §8. Keyed by wtxid (variant-specific), not txid.
 CREATE TABLE transaction_input_witness (
+    wtxid               TEXT NOT NULL,
     txid                TEXT NOT NULL,
     vin_index           INT NOT NULL,
     item_index          INT NOT NULL,   -- position in the witness stack, 0 = bottom
     data                BYTEA NOT NULL,
-    PRIMARY KEY (txid, vin_index, item_index),
+    PRIMARY KEY (wtxid, vin_index, item_index),
+    -- Proves wtxid belongs to this txid's transaction_variants row, and
+    -- that (txid, vin_index) is a real input of that txid's body.
+    FOREIGN KEY (wtxid, txid) REFERENCES transaction_variants (wtxid, txid),
     FOREIGN KEY (txid, vin_index) REFERENCES transaction_inputs (txid, vin_index)
 );
 ```
@@ -417,6 +543,17 @@ see the PR #2 note above) — makes a row claiming the P2QPK classification
 without the matching witness shape a database error rather than a
 silently-possible contradiction. This is a byte-length/version-number
 check, never script execution or signature verification.
+
+**`unknown_witness`/`unknown` were tightened in the third review round to
+match `ParseWitnessProgram` exactly, not just "roughly."** Both branches
+now enforce the structural 2–40 byte witness-program length range (BIP141/
+Core's `CScript::IsWitnessProgram`), and `unknown_witness` explicitly
+excludes any version/length combination that actually belongs to a named
+type (`v1/32` is P2TR, `v2/32` is P2QPK — those must never be left
+classified as generic `unknown_witness`). 25-case table-driven test
+(`TestInvariant_WitnessMetadataConsistency`, `internal/store`) covers every
+boundary named in review, including the exact program-length-1 and
+program-length-41 edge cases.
 
 **Format constraints, not policy constraints.** Every hash-like `TEXT`
 column (`blocks.hash`, `transactions.txid`, etc.) has a `CHECK (... ~
@@ -945,8 +1082,30 @@ toolchain is go1.22.2 (`go.mod`); v5.7.4 is the newest release still
 compatible with that toolchain and was a deliberate, checked choice, not an
 accident of dependency resolution.
 
+**Migration checksum drift detection.** `schema_migrations` records
+`up_checksum`/`down_checksum` (SHA-256 of `UpSQL`/`DownSQL`) alongside each
+applied migration's version and name. `VerifyChecksums` runs at the start
+of both `Up` and `Down`, before anything else, and fails loudly — naming
+the exact version — if:
+
+- an applied version has no corresponding entry in the loaded migrations
+  at all (its `.sql` files were deleted from the repository — migration
+  history is append-only, so this must never silently become acceptable
+  just because other migrations still exist);
+- the applied name no longer matches the loaded name (a rename);
+- the applied `UpSQL` checksum no longer matches (the file was edited
+  after being applied — the live schema may no longer match it); or
+- the applied `DownSQL` checksum no longer matches (a future rollback
+  would run something that's no longer the correct inverse of what was
+  actually applied).
+
+Only `UpSQL` was checksummed in the second review round; a third-round
+finding pointed out that a silently-edited `DownSQL` was just as dangerous
+(a future `Down()` would run the wrong rollback) and went completely
+undetected. Both directions are covered now.
+
 Only the minimal connection/migration plumbing was added in this phase
-(`store.Connect`, `store.Up`/`Down`/`LoadMigrations`/`CurrentVersion`) — no
-block-indexing write API (`INSERT ... ON CONFLICT` per block, UTXO/address
-maintenance, reorg rollback execution) exists yet. That is Phase 2B.2,
-built on top of the schema this phase locks down.
+(`store.Connect`, `store.Up`/`Down`/`LoadMigrations`/`CurrentVersion`/
+`VerifyChecksums`) — no block-indexing write API (`INSERT ... ON CONFLICT`
+per block, UTXO/address maintenance, reorg rollback execution) exists yet.
+That is Phase 2B.2, built on top of the schema this phase locks down.

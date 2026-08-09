@@ -23,6 +23,8 @@ DROP TRIGGER IF EXISTS block_transactions_set_height_trigger ON block_transactio
 DROP TABLE IF EXISTS block_transactions;
 DROP FUNCTION IF EXISTS block_transactions_set_height();
 
+DROP TABLE IF EXISTS transaction_variants;
+
 DROP TABLE IF EXISTS transactions;
 DROP TABLE IF EXISTS blocks;
 DROP TABLE IF EXISTS sync_state;

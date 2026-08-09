@@ -45,31 +45,76 @@ func fixtureBlock(t *testing.T, ctx context.Context, tx pgx.Tx, hash string, hei
 	`, hash, height, prevHash)
 }
 
+// fixtureTransaction inserts the immutable, NON-WITNESS transaction body
+// (task item 1: txid = Core GetHash(), excludes witness data — size/vsize/
+// weight now live on transaction_variants, not here, because they depend
+// on which witness serialization was actually observed).
 func fixtureTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, txid string, isCoinbase bool) {
 	t.Helper()
 	mustExec(t, ctx, tx, `
-		INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase)
-		VALUES ($1, 2, 0, 100, 100, 400, $2)
+		INSERT INTO transactions (txid, version, locktime, is_coinbase)
+		VALUES ($1, 2, 0, $2)
 	`, txid, isCoinbase)
 }
 
-// fixtureBlockTransaction records that txid occurred in blockHash at
-// tx_index — the occurrence link the utxo_state relational-integrity FKs
-// (task item 3) validate against.
-func fixtureBlockTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, blockHash, txid string, txIndex int) {
+// fixtureTransactionVariant inserts one concrete witness serialization
+// (wtxid = Core GetWitnessHash()) of an already-inserted txid. A
+// transaction with no witness data at all still gets exactly one variant
+// row, with wtxid == txid.
+func fixtureTransactionVariant(t *testing.T, ctx context.Context, tx pgx.Tx, wtxid, txid string) {
 	t.Helper()
-	mustExec(t, ctx, tx, `INSERT INTO block_transactions (block_hash, tx_index, txid) VALUES ($1, $2, $3)`,
-		blockHash, txIndex, txid)
+	mustExec(t, ctx, tx, `
+		INSERT INTO transaction_variants (wtxid, txid, size, vsize, weight)
+		VALUES ($1, $2, 100, 100, 400)
+	`, wtxid, txid)
+}
+
+// fixtureSimpleTransaction is the common-case convenience most invariant
+// tests below actually want: a transaction body plus its single witness
+// variant, with wtxid == txid. Tests that aren't specifically exercising
+// wtxid/txid variance (see TestInvariant_WitnessVariantsDoNotOverwriteEachOther
+// for the one that is) use this rather than calling fixtureTransaction and
+// fixtureTransactionVariant separately.
+func fixtureSimpleTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, txid string, isCoinbase bool) {
+	t.Helper()
+	fixtureTransaction(t, ctx, tx, txid, isCoinbase)
+	fixtureTransactionVariant(t, ctx, tx, txid, txid)
+}
+
+// fixtureBlockTransaction records that the (txid, wtxid) variant occurred
+// in blockHash at tx_index — the occurrence link both the utxo_state
+// relational-integrity FKs (task item 3, PR #2 second round) and the
+// wtxid/txid variant model (task item 1, PR #2 third round) validate
+// against.
+func fixtureBlockTransaction(t *testing.T, ctx context.Context, tx pgx.Tx, blockHash, txid, wtxid string, txIndex int) {
+	t.Helper()
+	mustExec(t, ctx, tx, `INSERT INTO block_transactions (block_hash, tx_index, txid, wtxid) VALUES ($1, $2, $3, $4)`,
+		blockHash, txIndex, txid, wtxid)
 }
 
 // fixtureTransactionInput inserts a minimal non-coinbase input, so
-// utxo_state's spending-input FK has something real to reference.
+// utxo_state's spending-input FK has something real to reference. Inputs
+// remain txid-scoped (not per-variant): scriptSig/prevout are part of the
+// txid-determining serialization, shared by every witness variant of that
+// txid.
 func fixtureTransactionInput(t *testing.T, ctx context.Context, tx pgx.Tx, txid string, vinIndex int, prevTxid string, prevVout int) {
 	t.Helper()
 	mustExec(t, ctx, tx, `
 		INSERT INTO transaction_inputs (txid, vin_index, prev_txid, prev_vout_index, script_sig, sequence)
 		VALUES ($1, $2, $3, $4, ''::bytea, 4294967295)
 	`, txid, vinIndex, prevTxid, prevVout)
+}
+
+// fixtureTransactionInputWitness inserts one witness stack item for a
+// specific (wtxid, txid, vin_index, item_index) — variant-scoped per task
+// item 1, so two different witness variants of the same txid never
+// overwrite each other's witness data.
+func fixtureTransactionInputWitness(t *testing.T, ctx context.Context, tx pgx.Tx, wtxid, txid string, vinIndex, itemIndex int, data []byte) {
+	t.Helper()
+	mustExec(t, ctx, tx, `
+		INSERT INTO transaction_input_witness (wtxid, txid, vin_index, item_index, data)
+		VALUES ($1, $2, $3, $4, $5)
+	`, wtxid, txid, vinIndex, itemIndex, data)
 }
 
 // fixtureTransactionOutput inserts a minimal, legacy (non-witness) output —
@@ -116,18 +161,18 @@ func TestInvariant_DuplicateCanonicalHeightRejected(t *testing.T) {
 // TestInvariant_SameTxidTwoBlocks is invariant test E: the same txid can be
 // associated with two different block hashes through block_transactions —
 // the whole point of separating transaction identity from transaction
-// occurrence (docs/ARCHITECTURE.md).
+// occurrence (docs/ARCHITECTURE.md). This test uses wtxid == txid
+// throughout (it isn't specifically about witness variance — see
+// TestInvariant_WitnessVariantsDoNotOverwriteEachOther for that).
 func TestInvariant_SameTxidTwoBlocks(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
 	fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil) // independent height; competing-fork detail is irrelevant to this invariant
-	fixtureTransaction(t, ctx, tx, hash64("txshared"), false)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txshared"), false)
 
-	mustExec(t, ctx, tx, `INSERT INTO block_transactions (block_hash, tx_index, txid) VALUES ($1, 0, $2)`,
-		hash64("blocka"), hash64("txshared"))
-	mustExec(t, ctx, tx, `INSERT INTO block_transactions (block_hash, tx_index, txid) VALUES ($1, 0, $2)`,
-		hash64("blockb"), hash64("txshared"))
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txshared"), hash64("txshared"), 0)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txshared"), hash64("txshared"), 0)
 
 	var count int
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM block_transactions WHERE txid = $1`, hash64("txshared")).Scan(&count); err != nil {
@@ -156,7 +201,7 @@ func TestInvariant_WitnessBYTEAPreservesLargeSignature(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txqpk"), false)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txqpk"), false)
 	mustExec(t, ctx, tx, `
 		INSERT INTO transaction_inputs (txid, vin_index, prev_txid, prev_vout_index, script_sig, sequence)
 		VALUES ($1, 0, $2, 0, ''::bytea, 4294967295)
@@ -171,16 +216,14 @@ func TestInvariant_WitnessBYTEAPreservesLargeSignature(t *testing.T) {
 		pubkey[i] = byte(200 + i)
 	}
 
-	mustExec(t, ctx, tx, `INSERT INTO transaction_input_witness (txid, vin_index, item_index, data) VALUES ($1, 0, 0, $2)`,
-		hash64("txqpk"), sig)
-	mustExec(t, ctx, tx, `INSERT INTO transaction_input_witness (txid, vin_index, item_index, data) VALUES ($1, 0, 1, $2)`,
-		hash64("txqpk"), pubkey)
+	fixtureTransactionInputWitness(t, ctx, tx, hash64("txqpk"), hash64("txqpk"), 0, 0, sig)
+	fixtureTransactionInputWitness(t, ctx, tx, hash64("txqpk"), hash64("txqpk"), 0, 1, pubkey)
 
 	var gotSig, gotPubkey []byte
-	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE txid=$1 AND vin_index=0 AND item_index=0`, hash64("txqpk")).Scan(&gotSig); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE wtxid=$1 AND vin_index=0 AND item_index=0`, hash64("txqpk")).Scan(&gotSig); err != nil {
 		t.Fatalf("read back signature: %v", err)
 	}
-	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE txid=$1 AND vin_index=0 AND item_index=1`, hash64("txqpk")).Scan(&gotPubkey); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE wtxid=$1 AND vin_index=0 AND item_index=1`, hash64("txqpk")).Scan(&gotPubkey); err != nil {
 		t.Fatalf("read back pubkey: %v", err)
 	}
 
@@ -337,13 +380,17 @@ func TestInvariant_ContradictorySyncStateRejected(t *testing.T) {
 	})
 }
 
-// ─── PR #2 review fixes ─────────────────────────────────────────────────
+// ─── PR #2 review round 2 fixes ─────────────────────────────────────────
 
-// TestInvariant_WitnessMetadataConsistency is item 1: the P2QPK CHECK NULL
-// loophole (script_type='p2qpk' with witness_version/witness_program both
-// NULL previously passed, because a CHECK expression that evaluates to
-// NULL is treated as satisfied by Postgres) plus structural
-// version/length consistency for every known witness script_type.
+// TestInvariant_WitnessMetadataConsistency is item 1 (round 2): the P2QPK
+// CHECK NULL loophole (script_type='p2qpk' with witness_version/
+// witness_program both NULL previously passed, because a CHECK expression
+// that evaluates to NULL is treated as satisfied by Postgres) plus
+// structural version/length consistency for every known witness
+// script_type. Extended in round 3 (item 3) with tighter unknown/
+// unknown_witness boundary cases: the 2..40 structural witness-program
+// length range, and explicit exclusion of unknown_witness from any
+// version/length combination that actually belongs to a named type.
 func TestInvariant_WitnessMetadataConsistency(t *testing.T) {
 	pool := migratedPool(t)
 
@@ -371,9 +418,19 @@ func TestInvariant_WitnessMetadataConsistency(t *testing.T) {
 		{"p2wsh + v0/20 rejected (wrong length)", "p2wsh", intPtr(0), make([]byte, 20), true},
 		{"p2tr + v1/32 accepted", "p2tr", intPtr(1), make([]byte, 32), false},
 		{"p2tr + v0/32 rejected (wrong version)", "p2tr", intPtr(0), make([]byte, 32), true},
+
+		// unknown_witness: round-2 cases plus round-3's tighter boundary
+		// requirements (2..40 length range, explicit exclusion of v1/32
+		// and v2/32 — those belong to P2TR/P2QPK, never unknown_witness).
 		{"unknown_witness + v3/25 accepted", "unknown_witness", intPtr(3), make([]byte, 25), false},
 		{"unknown_witness + NULL/NULL rejected (must carry nonzero version)", "unknown_witness", nil, nil, true},
 		{"unknown_witness + v0/25 rejected (version must be >0)", "unknown_witness", intPtr(0), make([]byte, 25), true},
+		{"unknown_witness + v1/32 rejected (that's P2TR)", "unknown_witness", intPtr(1), make([]byte, 32), true},
+		{"unknown_witness + v2/32 rejected (that's P2QPK)", "unknown_witness", intPtr(2), make([]byte, 32), true},
+		{"unknown_witness + v2/31 accepted", "unknown_witness", intPtr(2), make([]byte, 31), false},
+		{"unknown_witness + v3/32 accepted", "unknown_witness", intPtr(3), make([]byte, 32), false},
+		{"unknown_witness + program length 1 rejected (below structural minimum 2)", "unknown_witness", intPtr(5), make([]byte, 1), true},
+		{"unknown_witness + program length 41 rejected (above structural maximum 40)", "unknown_witness", intPtr(5), make([]byte, 41), true},
 
 		// Legacy (non-witness) types must carry no witness metadata at all.
 		{"p2pkh + NULL/NULL accepted", "p2pkh", nil, nil, false},
@@ -383,13 +440,17 @@ func TestInvariant_WitnessMetadataConsistency(t *testing.T) {
 		{"multisig + NULL/NULL accepted", "multisig", nil, nil, false},
 
 		// unknown: exactly two legitimate shapes (no witness program at
-		// all, or an off-length witness-v0 program) — anything else,
-		// including a length/version combo that actually belongs to a
-		// named type, is rejected.
+		// all, or a structurally valid off-length witness-v0 program) —
+		// anything else, including a length/version combo that actually
+		// belongs to a named type, or a length outside the 2..40
+		// structural range, is rejected.
 		{"unknown + NULL/NULL accepted", "unknown", nil, nil, false},
+		{"unknown + v0/19 accepted", "unknown", intPtr(0), make([]byte, 19), false},
 		{"unknown + v0/25 accepted (off-length v0)", "unknown", intPtr(0), make([]byte, 25), false},
 		{"unknown + v0/20 rejected (that length is always p2wpkh)", "unknown", intPtr(0), make([]byte, 20), true},
 		{"unknown + v0/32 rejected (that length is always p2wsh)", "unknown", intPtr(0), make([]byte, 32), true},
+		{"unknown + v0/1 rejected (below structural minimum 2)", "unknown", intPtr(0), make([]byte, 1), true},
+		{"unknown + v0/41 rejected (above structural maximum 40)", "unknown", intPtr(0), make([]byte, 41), true},
 		{"unknown + v1/32 rejected (nonzero version belongs to p2tr/unknown_witness)", "unknown", intPtr(1), make([]byte, 32), true},
 	}
 
@@ -422,11 +483,11 @@ func TestInvariant_WitnessMetadataConsistency(t *testing.T) {
 	}
 }
 
-// TestInvariant_OneDestinationAddressPerOutput is item 2: output_addresses
-// permits at most one row per (txid, vout_index) — PRIMARY KEY (txid,
-// vout_index), not (txid, vout_index, address) — so even an ordinary,
-// non-multisig output can't have its value multiply-credited across two
-// different addresses.
+// TestInvariant_OneDestinationAddressPerOutput is item 2 (round 2):
+// output_addresses permits at most one row per (txid, vout_index) —
+// PRIMARY KEY (txid, vout_index), not (txid, vout_index, address) — so
+// even an ordinary, non-multisig output can't have its value
+// multiply-credited across two different addresses.
 func TestInvariant_OneDestinationAddressPerOutput(t *testing.T) {
 	ctx, tx := txPool(t)
 
@@ -444,17 +505,18 @@ func TestInvariant_OneDestinationAddressPerOutput(t *testing.T) {
 	}
 }
 
-// TestInvariant_UTXOCreationOccurrenceFKRejectsWrongBlock is item 3, case
-// "wrong creation block for txid -> rejected": the output's transaction
-// really occurred in blocka (via block_transactions), but the utxo_state
-// row claims it was created in blockb, which never contained that txid.
+// TestInvariant_UTXOCreationOccurrenceFKRejectsWrongBlock is item 3
+// (round 2), case "wrong creation block for txid -> rejected": the
+// output's transaction really occurred in blocka (via block_transactions),
+// but the utxo_state row claims it was created in blockb, which never
+// contained that txid.
 func TestInvariant_UTXOCreationOccurrenceFKRejectsWrongBlock(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
 	fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txcreate"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
 	fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
 
 	_, err := tx.Exec(ctx, `
@@ -466,20 +528,21 @@ func TestInvariant_UTXOCreationOccurrenceFKRejectsWrongBlock(t *testing.T) {
 	}
 }
 
-// TestInvariant_UTXOSpendingInputFKRejectsNonexistentInput is item 3, case
-// "nonexistent spending input -> rejected": spending_txid/spending_vin_index
-// claim a transaction_inputs row that was never inserted.
+// TestInvariant_UTXOSpendingInputFKRejectsNonexistentInput is item 3
+// (round 2), case "nonexistent spending input -> rejected":
+// spending_txid/spending_vin_index claim a transaction_inputs row that was
+// never inserted.
 func TestInvariant_UTXOSpendingInputFKRejectsNonexistentInput(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txcreate"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
 	fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
 
 	fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txspend"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txspend"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), hash64("txspend"), 0)
 	// Deliberately no transaction_inputs row for (txspend, vin_index=0).
 
 	_, err := tx.Exec(ctx, `
@@ -492,22 +555,23 @@ func TestInvariant_UTXOSpendingInputFKRejectsNonexistentInput(t *testing.T) {
 	}
 }
 
-// TestInvariant_UTXOSpendingBlockOccurrenceFKRejectsWrongBlock is item 3,
-// case "spending tx not contained by claimed spending block -> rejected":
-// txspend really occurred in blockb, but utxo_state claims blockc.
+// TestInvariant_UTXOSpendingBlockOccurrenceFKRejectsWrongBlock is item 3
+// (round 2), case "spending tx not contained by claimed spending block ->
+// rejected": txspend really occurred in blockb, but utxo_state claims
+// blockc.
 func TestInvariant_UTXOSpendingBlockOccurrenceFKRejectsWrongBlock(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txcreate"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
 	fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
 
 	fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
 	fixtureBlock(t, ctx, tx, hash64("blockc"), 102, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txspend"), false)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txspend"), false)
 	fixtureTransactionInput(t, ctx, tx, hash64("txspend"), 0, hash64("txcreate"), 0)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), 0) // really in blockb
+	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), hash64("txspend"), 0) // really in blockb
 
 	_, err := tx.Exec(ctx, `
 		INSERT INTO utxo_state (txid, vout_index, creation_block_hash, creation_block_height,
@@ -519,15 +583,16 @@ func TestInvariant_UTXOSpendingBlockOccurrenceFKRejectsWrongBlock(t *testing.T) 
 	}
 }
 
-// TestInvariant_UTXOHeightsCannotPersistWrong is item 3, case "supplied
-// wrong heights cannot persist": creation_block_height is trigger-derived
-// from blocks.height, overwriting whatever the caller supplied.
+// TestInvariant_UTXOHeightsCannotPersistWrong is item 3 (round 2), case
+// "supplied wrong heights cannot persist": creation_block_height is
+// trigger-derived from blocks.height, overwriting whatever the caller
+// supplied.
 func TestInvariant_UTXOHeightsCannotPersistWrong(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txcreate"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
 	fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
 
 	mustExec(t, ctx, tx, `
@@ -544,23 +609,25 @@ func TestInvariant_UTXOHeightsCannotPersistWrong(t *testing.T) {
 	}
 }
 
-// TestInvariant_UTXOValidSpendSucceeds is item 3, case "valid spend
-// relationship succeeds" — the full happy path, also confirming both
+// TestInvariant_UTXOValidSpendSucceeds is item 3 (round 2), case "valid
+// spend relationship succeeds" — the full happy path, also confirming both
 // creation_block_height and spending_block_height are correctly
 // trigger-derived even when (deliberately, here) wrong values are supplied
-// for both.
+// for both. Also doubles as item 2 (round 3)'s "spending input exists and
+// points to this exact output -> PASS" case, now that the spend FK
+// requires the exact prevout match.
 func TestInvariant_UTXOValidSpendSucceeds(t *testing.T) {
 	ctx, tx := txPool(t)
 
 	fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txcreate"), false)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), 0)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
 	fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
 
 	fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
-	fixtureTransaction(t, ctx, tx, hash64("txspend"), false)
+	fixtureSimpleTransaction(t, ctx, tx, hash64("txspend"), false)
 	fixtureTransactionInput(t, ctx, tx, hash64("txspend"), 0, hash64("txcreate"), 0)
-	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), 0)
+	fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), hash64("txspend"), 0)
 
 	mustExec(t, ctx, tx, `
 		INSERT INTO utxo_state (txid, vout_index, creation_block_hash, creation_block_height,
@@ -581,7 +648,7 @@ func TestInvariant_UTXOValidSpendSucceeds(t *testing.T) {
 	}
 }
 
-// TestInvariant_Uint32RangeRejected is item 6: blocks.nonce,
+// TestInvariant_Uint32RangeRejected is item 6 (round 2): blocks.nonce,
 // transactions.locktime, and transaction_inputs.sequence are all
 // consensus-wire uint32 fields and must be rejected outside [0,4294967295].
 func TestInvariant_Uint32RangeRejected(t *testing.T) {
@@ -610,8 +677,8 @@ func TestInvariant_Uint32RangeRejected(t *testing.T) {
 	t.Run("locktime negative", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		_, err := tx.Exec(ctx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase)
-			VALUES ($1, 2, -1, 100, 100, 400, false)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase)
+			VALUES ($1, 2, -1, false)
 		`, hash64("badlocktimeneg"))
 		if err == nil {
 			t.Fatal("expected negative locktime to be rejected, got nil error")
@@ -621,8 +688,8 @@ func TestInvariant_Uint32RangeRejected(t *testing.T) {
 	t.Run("locktime above uint32 max", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		_, err := tx.Exec(ctx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase)
-			VALUES ($1, 2, 4294967296, 100, 100, 400, false)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase)
+			VALUES ($1, 2, 4294967296, false)
 		`, hash64("badlocktimehi"))
 		if err == nil {
 			t.Fatal("expected locktime above uint32 max to be rejected, got nil error")
@@ -648,8 +715,8 @@ func TestInvariant_Uint32RangeRejected(t *testing.T) {
 			VALUES ($1, 500, NULL, $1, 1700000000, '1d00ffff', 1.0, 4294967295, 100, 400, 1)
 		`, hash64("maxnonce"))
 		mustExec(t, ctx, tx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase)
-			VALUES ($1, 2, 4294967295, 100, 100, 400, false)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase)
+			VALUES ($1, 2, 4294967295, false)
 		`, hash64("maxlocktimetx"))
 		mustExec(t, ctx, tx, `
 			INSERT INTO transaction_inputs (txid, vin_index, prev_txid, prev_vout_index, script_sig, sequence)
@@ -658,16 +725,16 @@ func TestInvariant_Uint32RangeRejected(t *testing.T) {
 	})
 }
 
-// TestInvariant_FeeConstraints is item 6: fee_satoshis must be NULL or
-// non-negative, and a coinbase transaction must not carry a fee value at
-// all (see docs/ARCHITECTURE.md §6 — coinbase value is subsidy + fees, not
-// itself "a fee").
+// TestInvariant_FeeConstraints is item 6 (round 2): fee_satoshis must be
+// NULL or non-negative, and a coinbase transaction must not carry a fee
+// value at all (see docs/ARCHITECTURE.md §6 — coinbase value is subsidy +
+// fees, not itself "a fee").
 func TestInvariant_FeeConstraints(t *testing.T) {
 	t.Run("negative fee rejected", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		_, err := tx.Exec(ctx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase, fee_satoshis)
-			VALUES ($1, 2, 0, 100, 100, 400, false, -1)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase, fee_satoshis)
+			VALUES ($1, 2, 0, false, -1)
 		`, hash64("negfee"))
 		if err == nil {
 			t.Fatal("expected negative fee_satoshis to be rejected, got nil error")
@@ -677,8 +744,8 @@ func TestInvariant_FeeConstraints(t *testing.T) {
 	t.Run("coinbase with a fee rejected", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		_, err := tx.Exec(ctx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase, fee_satoshis)
-			VALUES ($1, 2, 0, 100, 100, 400, true, 100)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase, fee_satoshis)
+			VALUES ($1, 2, 0, true, 100)
 		`, hash64("coinbasefee"))
 		if err == nil {
 			t.Fatal("expected a coinbase transaction with a non-NULL fee to be rejected, got nil error")
@@ -688,8 +755,200 @@ func TestInvariant_FeeConstraints(t *testing.T) {
 	t.Run("non-coinbase with a nonnegative fee accepted", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		mustExec(t, ctx, tx, `
-			INSERT INTO transactions (txid, version, locktime, size, vsize, weight, is_coinbase, fee_satoshis)
-			VALUES ($1, 2, 0, 100, 100, 400, false, 0)
+			INSERT INTO transactions (txid, version, locktime, is_coinbase, fee_satoshis)
+			VALUES ($1, 2, 0, false, 0)
 		`, hash64("zerofee"))
+	})
+}
+
+// ─── PR #2 review round 3 fixes ─────────────────────────────────────────
+
+// TestInvariant_WitnessVariantsDoNotOverwriteEachOther is the decisive test
+// for item 1 (round 3, the wtxid/txid split): one txid T, two witness
+// variants W1 and W2 with distinct witness bytes and distinct
+// size/vsize/weight, each occurring in a different block. Proves both
+// block occurrences exist, both share txid T, the wtxids differ, each
+// variant's witness stack is preserved exactly and independently, and
+// neither variant's witness data or metrics overwrite the other's — the
+// exact scenario a txid-only-keyed schema could not represent. W2's
+// witness includes a real 17,088-byte P2QPK-sized item. This is a database
+// fixture only; no transaction was broadcast or manufactured on any
+// network.
+func TestInvariant_WitnessVariantsDoNotOverwriteEachOther(t *testing.T) {
+	ctx, tx := txPool(t)
+
+	txidT := hash64("sharedtxid")
+	wtxid1 := hash64("variantw1")
+	wtxid2 := hash64("variantw2")
+	if wtxid1 == wtxid2 {
+		t.Fatal("test bug: wtxid1 and wtxid2 must differ")
+	}
+
+	fixtureTransaction(t, ctx, tx, txidT, false)
+	fixtureTransactionInput(t, ctx, tx, txidT, 0, hash64("someprevtx"), 0)
+
+	// Two variants of the SAME txid, with distinct size/vsize/weight.
+	mustExec(t, ctx, tx, `INSERT INTO transaction_variants (wtxid, txid, size, vsize, weight) VALUES ($1, $2, 500, 300, 1200)`, wtxid1, txidT)
+	mustExec(t, ctx, tx, `INSERT INTO transaction_variants (wtxid, txid, size, vsize, weight) VALUES ($1, $2, 17600, 500, 2000)`, wtxid2, txidT)
+
+	// Distinct witness content per variant — W2's item is a real
+	// 17,088-byte P2QPK-sized signature.
+	witnessW1 := []byte{0xde, 0xad, 0xbe, 0xef}
+	witnessW2Sig := make([]byte, script.P2QPKSignatureLength)
+	for i := range witnessW2Sig {
+		witnessW2Sig[i] = byte(i % 233)
+	}
+
+	fixtureTransactionInputWitness(t, ctx, tx, wtxid1, txidT, 0, 0, witnessW1)
+	fixtureTransactionInputWitness(t, ctx, tx, wtxid2, txidT, 0, 0, witnessW2Sig)
+
+	fixtureBlock(t, ctx, tx, hash64("varblocka"), 200, nil)
+	fixtureBlock(t, ctx, tx, hash64("varblockb"), 201, nil)
+	fixtureBlockTransaction(t, ctx, tx, hash64("varblocka"), txidT, wtxid1, 0) // block A -> T/W1
+	fixtureBlockTransaction(t, ctx, tx, hash64("varblockb"), txidT, wtxid2, 0) // block B -> T/W2
+
+	// Both block occurrences exist, both share txid T, wtxids differ.
+	rows, err := tx.Query(ctx, `SELECT block_hash, txid, wtxid FROM block_transactions WHERE txid = $1 ORDER BY block_hash`, txidT)
+	if err != nil {
+		t.Fatalf("query block_transactions: %v", err)
+	}
+	type occurrence struct{ blockHash, txid, wtxid string }
+	var occurrences []occurrence
+	for rows.Next() {
+		var o occurrence
+		if err := rows.Scan(&o.blockHash, &o.txid, &o.wtxid); err != nil {
+			rows.Close()
+			t.Fatalf("scan occurrence: %v", err)
+		}
+		occurrences = append(occurrences, o)
+	}
+	closeErr := rows.Err()
+	rows.Close()
+	if closeErr != nil {
+		t.Fatalf("iterate occurrences: %v", closeErr)
+	}
+	if len(occurrences) != 2 {
+		t.Fatalf("expected 2 block occurrences for txid %s, got %d", txidT, len(occurrences))
+	}
+	seenWtxids := map[string]bool{}
+	for _, o := range occurrences {
+		if o.txid != txidT {
+			t.Errorf("occurrence txid = %s, want %s", o.txid, txidT)
+		}
+		seenWtxids[o.wtxid] = true
+	}
+	if !seenWtxids[wtxid1] || !seenWtxids[wtxid2] {
+		t.Fatalf("expected both wtxids %s and %s among occurrences, got %v", wtxid1, wtxid2, seenWtxids)
+	}
+
+	// Each variant's witness stack is preserved exactly and independently
+	// — neither overwrites the other.
+	var gotW1, gotW2 []byte
+	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE wtxid=$1 AND vin_index=0 AND item_index=0`, wtxid1).Scan(&gotW1); err != nil {
+		t.Fatalf("read back W1 witness: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT data FROM transaction_input_witness WHERE wtxid=$1 AND vin_index=0 AND item_index=0`, wtxid2).Scan(&gotW2); err != nil {
+		t.Fatalf("read back W2 witness: %v", err)
+	}
+	if !bytes.Equal(gotW1, witnessW1) {
+		t.Errorf("W1 witness = %x, want %x (must not have been overwritten by W2)", gotW1, witnessW1)
+	}
+	if len(gotW2) != script.P2QPKSignatureLength || !bytes.Equal(gotW2, witnessW2Sig) {
+		t.Errorf("W2 witness mismatch or wrong length (got %d bytes, want %d)", len(gotW2), script.P2QPKSignatureLength)
+	}
+
+	// Variant-specific size/vsize/weight are preserved independently too —
+	// neither variant's metrics overwrite the other's.
+	var size1, vsize1, weight1, size2, vsize2, weight2 int
+	if err := tx.QueryRow(ctx, `SELECT size, vsize, weight FROM transaction_variants WHERE wtxid=$1`, wtxid1).Scan(&size1, &vsize1, &weight1); err != nil {
+		t.Fatalf("read back W1 metrics: %v", err)
+	}
+	if err := tx.QueryRow(ctx, `SELECT size, vsize, weight FROM transaction_variants WHERE wtxid=$1`, wtxid2).Scan(&size2, &vsize2, &weight2); err != nil {
+		t.Fatalf("read back W2 metrics: %v", err)
+	}
+	if size1 != 500 || vsize1 != 300 || weight1 != 1200 {
+		t.Errorf("W1 metrics = (%d,%d,%d), want (500,300,1200)", size1, vsize1, weight1)
+	}
+	if size2 != 17600 || vsize2 != 500 || weight2 != 2000 {
+		t.Errorf("W2 metrics = (%d,%d,%d), want (17600,500,2000) — must not have been overwritten by W1", size2, vsize2, weight2)
+	}
+}
+
+// TestInvariant_UTXOSpendMustMatchExactPrevout is item 2 (round 3): an
+// input that really exists (and really occurred in the claimed spending
+// block) but spends a DIFFERENT output — wrong txid, or the right txid but
+// the wrong vout — must not be usable to mark some other output "spent".
+func TestInvariant_UTXOSpendMustMatchExactPrevout(t *testing.T) {
+	t.Run("input exists but points to a different txid", func(t *testing.T) {
+		ctx, tx := txPool(t)
+
+		fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
+		fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+		fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
+		fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
+
+		fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
+		fixtureSimpleTransaction(t, ctx, tx, hash64("txspend"), false)
+		// txspend's real input spends a DIFFERENT txid's output (txother:0), not txcreate:0.
+		fixtureTransactionInput(t, ctx, tx, hash64("txspend"), 0, hash64("txother"), 0)
+		fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), hash64("txspend"), 0)
+
+		// Claim txspend's vin 0 spends txcreate:0 anyway — it doesn't.
+		_, err := tx.Exec(ctx, `
+			INSERT INTO utxo_state (txid, vout_index, creation_block_hash, creation_block_height,
+				spent, spending_txid, spending_vin_index, spending_block_hash, spending_block_height)
+			VALUES ($1, 0, $2, 100, true, $3, 0, $4, 101)
+		`, hash64("txcreate"), hash64("blocka"), hash64("txspend"), hash64("blockb"))
+		if err == nil {
+			t.Fatal("expected utxo_state to reject a spending input that actually points to a different txid, got nil error")
+		}
+	})
+
+	t.Run("input exists but points to a different vout", func(t *testing.T) {
+		ctx, tx := txPool(t)
+
+		fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
+		fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+		fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
+		fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
+		fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 1, "p2pkh", 2000)
+
+		fixtureBlock(t, ctx, tx, hash64("blockb"), 101, nil)
+		fixtureSimpleTransaction(t, ctx, tx, hash64("txspend"), false)
+		// txspend's real input spends txcreate:1, not txcreate:0.
+		fixtureTransactionInput(t, ctx, tx, hash64("txspend"), 0, hash64("txcreate"), 1)
+		fixtureBlockTransaction(t, ctx, tx, hash64("blockb"), hash64("txspend"), hash64("txspend"), 0)
+
+		// Claim txspend's vin 0 spends txcreate:0 anyway — it actually spends txcreate:1.
+		_, err := tx.Exec(ctx, `
+			INSERT INTO utxo_state (txid, vout_index, creation_block_hash, creation_block_height,
+				spent, spending_txid, spending_vin_index, spending_block_hash, spending_block_height)
+			VALUES ($1, 0, $2, 100, true, $3, 0, $4, 101)
+		`, hash64("txcreate"), hash64("blocka"), hash64("txspend"), hash64("blockb"))
+		if err == nil {
+			t.Fatal("expected utxo_state to reject a spending input that actually points to a different vout, got nil error")
+		}
+	})
+
+	t.Run("unspent row still works", func(t *testing.T) {
+		ctx, tx := txPool(t)
+
+		fixtureBlock(t, ctx, tx, hash64("blocka"), 100, nil)
+		fixtureSimpleTransaction(t, ctx, tx, hash64("txcreate"), false)
+		fixtureBlockTransaction(t, ctx, tx, hash64("blocka"), hash64("txcreate"), hash64("txcreate"), 0)
+		fixtureTransactionOutput(t, ctx, tx, hash64("txcreate"), 0, "p2pkh", 1000)
+
+		mustExec(t, ctx, tx, `
+			INSERT INTO utxo_state (txid, vout_index, creation_block_hash, creation_block_height)
+			VALUES ($1, 0, $2, 100)
+		`, hash64("txcreate"), hash64("blocka"))
+
+		var spent bool
+		if err := tx.QueryRow(ctx, `SELECT spent FROM utxo_state WHERE txid=$1 AND vout_index=0`, hash64("txcreate")).Scan(&spent); err != nil {
+			t.Fatalf("read back unspent row: %v", err)
+		}
+		if spent {
+			t.Error("expected spent=false for a freshly created, never-spent output")
+		}
 	})
 }

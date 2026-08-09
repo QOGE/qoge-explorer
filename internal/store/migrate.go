@@ -96,20 +96,22 @@ func LoadMigrations(fsys fs.FS) ([]Migration, error) {
 
 const ensureSchemaMigrationsSQL = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
-    version    BIGINT PRIMARY KEY,
-    name       TEXT NOT NULL,
-    checksum   TEXT NOT NULL,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    version      BIGINT PRIMARY KEY,
+    name         TEXT NOT NULL,
+    up_checksum  TEXT NOT NULL,
+    down_checksum TEXT NOT NULL,
+    applied_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 )`
 
-// checksum returns the hex-encoded SHA-256 of a migration's UpSQL, used to
-// detect a migration file being edited after it was already applied (task
-// item 5: "checksum drift detection"). Only UpSQL is checksummed — DownSQL
-// changing after the fact doesn't affect what's already been applied to the
-// database, only what a future rollback would run, so it isn't part of the
-// "does the applied schema still match this file" question this guards.
-func checksum(upSQL string) string {
-	sum := sha256.Sum256([]byte(upSQL))
+// checksum returns the hex-encoded SHA-256 of sql, used to detect a
+// migration file being edited after it was already applied. Both
+// directions are checksummed and verified: an edited UpSQL means the
+// applied schema may no longer match what this file claims to have done;
+// an edited DownSQL means a future Down() would run something that's no
+// longer the correct inverse of what was actually applied — either is
+// dangerous to silently ignore.
+func checksum(sql string) string {
+	sum := sha256.Sum256([]byte(sql))
 	return hex.EncodeToString(sum[:])
 }
 
@@ -141,8 +143,9 @@ func AppliedVersions(ctx context.Context, pool *pgxpool.Pool) (map[int64]bool, e
 // appliedRecord is what schema_migrations actually recorded for one applied
 // migration.
 type appliedRecord struct {
-	name     string
-	checksum string
+	name         string
+	upChecksum   string
+	downChecksum string
 }
 
 // appliedRecords returns every row currently in schema_migrations, keyed by
@@ -151,7 +154,7 @@ func appliedRecords(ctx context.Context, pool *pgxpool.Pool) (map[int64]appliedR
 	if err := ensureSchemaMigrationsTable(ctx, pool); err != nil {
 		return nil, err
 	}
-	rows, err := pool.Query(ctx, "SELECT version, name, checksum FROM schema_migrations")
+	rows, err := pool.Query(ctx, "SELECT version, name, up_checksum, down_checksum FROM schema_migrations")
 	if err != nil {
 		return nil, fmt.Errorf("store: query applied migrations: %w", err)
 	}
@@ -161,7 +164,7 @@ func appliedRecords(ctx context.Context, pool *pgxpool.Pool) (map[int64]appliedR
 	for rows.Next() {
 		var v int64
 		var rec appliedRecord
-		if err := rows.Scan(&v, &rec.name, &rec.checksum); err != nil {
+		if err := rows.Scan(&v, &rec.name, &rec.upChecksum, &rec.downChecksum); err != nil {
 			return nil, fmt.Errorf("store: scan applied migration record: %w", err)
 		}
 		records[v] = rec
@@ -172,33 +175,52 @@ func appliedRecords(ctx context.Context, pool *pgxpool.Pool) (map[int64]appliedR
 	return records, nil
 }
 
-// VerifyChecksums compares every already-applied migration for which a
-// local definition exists (in migrations) against its recorded name and
-// UpSQL checksum. It returns an error describing the exact version/name if
-// either has changed since the migration was applied — i.e. if
-// NNNN_name.up.sql was edited (or renamed) after being applied to this
-// database. Migrations that exist locally but haven't been applied yet, or
-// that were applied by a version of the migrations directory that no
-// longer has a local file for them, are not an error here (LoadMigrations
-// already refuses to load a migration missing its .down.sql, which is the
-// only case that would silently orphan an applied version).
+// VerifyChecksums compares every already-applied migration against its
+// locally loaded definition and returns an error describing the exact
+// version/name for the first problem found:
+//
+//   - an applied version has NO corresponding entry in migrations at all —
+//     migration history is append-only; deleting an applied migration's
+//     .sql files from the repository must never silently become
+//     acceptable just because other migrations still exist.
+//   - the applied name no longer matches the loaded name (a rename).
+//   - the applied UpSQL checksum no longer matches (the file was edited
+//     after being applied — the live schema may not match it anymore).
+//   - the applied DownSQL checksum no longer matches (a future Down()
+//     would run something that's no longer the correct inverse of what
+//     was actually applied).
+//
+// Local migrations that haven't been applied yet are not an error here —
+// only the direction "applied but the record and the file disagree, or the
+// file is gone" is checked.
 func VerifyChecksums(ctx context.Context, pool *pgxpool.Pool, migrations []Migration) error {
 	applied, err := appliedRecords(ctx, pool)
 	if err != nil {
 		return err
 	}
 
+	byVersion := make(map[int64]Migration, len(migrations))
 	for _, mig := range migrations {
-		rec, ok := applied[mig.Version]
+		byVersion[mig.Version] = mig
+	}
+
+	// Iterate the DB-recorded set, not the loaded set: a version applied to
+	// the database but absent from the loaded migrations (its .sql files
+	// were deleted from the repository) must be caught, which iterating
+	// only `migrations` could never detect.
+	for version, rec := range applied {
+		mig, ok := byVersion[version]
 		if !ok {
-			continue // not yet applied; nothing recorded to drift from
+			return fmt.Errorf("store: migration %d (%q) is recorded as applied but has no corresponding local migration file — migration history is append-only; restore %04d_%s.up.sql/.down.sql rather than deleting them", version, rec.name, version, rec.name)
 		}
 		if rec.name != mig.Name {
-			return fmt.Errorf("store: migration %d was applied as %q but is now loaded as %q — a migration's name must not change after it has been applied", mig.Version, rec.name, mig.Name)
+			return fmt.Errorf("store: migration %d was applied as %q but is now loaded as %q — a migration's name must not change after it has been applied", version, rec.name, mig.Name)
 		}
-		want := checksum(mig.UpSQL)
-		if rec.checksum != want {
-			return fmt.Errorf("store: migration %04d_%s was modified after being applied (recorded checksum %s, current file checksum %s) — the applied database schema may no longer match this migration file; do not edit an applied migration, add a new one instead", mig.Version, mig.Name, rec.checksum, want)
+		if wantUp := checksum(mig.UpSQL); rec.upChecksum != wantUp {
+			return fmt.Errorf("store: migration %04d_%s.up.sql was modified after being applied (recorded checksum %s, current file checksum %s) — the applied database schema may no longer match this migration file; do not edit an applied migration, add a new one instead", version, mig.Name, rec.upChecksum, wantUp)
+		}
+		if wantDown := checksum(mig.DownSQL); rec.downChecksum != wantDown {
+			return fmt.Errorf("store: migration %04d_%s.down.sql was modified after being applied (recorded checksum %s, current file checksum %s) — a future rollback would no longer run the correct inverse of what was actually applied; do not edit an applied migration, add a new one instead", version, mig.Name, rec.downChecksum, wantDown)
 		}
 	}
 	return nil
@@ -256,8 +278,8 @@ func Up(ctx context.Context, pool *pgxpool.Pool, migrations []Migration) ([]int6
 			_ = tx.Rollback(ctx)
 			return didApply, fmt.Errorf("store: apply migration %04d_%s: %w", mig.Version, mig.Name, err)
 		}
-		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name, checksum) VALUES ($1, $2, $3)",
-			mig.Version, mig.Name, checksum(mig.UpSQL)); err != nil {
+		if _, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name, up_checksum, down_checksum) VALUES ($1, $2, $3, $4)",
+			mig.Version, mig.Name, checksum(mig.UpSQL), checksum(mig.DownSQL)); err != nil {
 			_ = tx.Rollback(ctx)
 			return didApply, fmt.Errorf("store: record migration %04d_%s: %w", mig.Version, mig.Name, err)
 		}
