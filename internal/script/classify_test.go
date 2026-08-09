@@ -245,7 +245,7 @@ func TestClassify_WitnessV0Fallback(t *testing.T) {
 }
 
 func TestClassify_AllRequiredTypes(t *testing.T) {
-	pk := fill(33, 1)
+	pk := fillPubKey(0x02, 1)
 	pkh := fill(20, 2)
 	sh := fill(20, 3)
 	p2wpkhProg := fill(20, 4)

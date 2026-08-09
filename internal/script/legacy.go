@@ -49,12 +49,26 @@ func matchP2SH(s []byte) (scriptHash []byte, ok bool) {
 // QOGE genuinely used for coinbase outputs in blocks 1-7,985 before
 // switching to P2PKH (confirmed against the live chain — see
 // docs/ARCHITECTURE.md §7).
+//
+// Mirrors Core's MatchPayToPubkey (src/script/standard.cpp), which requires
+// not just the right push length but CPubKey::ValidSize on the pushed
+// bytes — a correctly-prefixed key (0x02/0x03 for 33 bytes, 0x04/0x06/0x07
+// for 65 bytes). isPubKeyPush already implements that check (shared with
+// matchMultisig's pubkey validation); reused here rather than duplicated.
 func matchP2PK(s []byte) (pubKey []byte, ok bool) {
 	if len(s) == 1+compressedPKLen+1 && s[0] == compressedPKLen && s[len(s)-1] == opCheckSig {
-		return s[1 : 1+compressedPKLen], true
+		key := s[1 : 1+compressedPKLen]
+		if !isPubKeyPush(key) {
+			return nil, false
+		}
+		return key, true
 	}
 	if len(s) == 1+uncompressedPKLen+1 && s[0] == uncompressedPKLen && s[len(s)-1] == opCheckSig {
-		return s[1 : 1+uncompressedPKLen], true
+		key := s[1 : 1+uncompressedPKLen]
+		if !isPubKeyPush(key) {
+			return nil, false
+		}
+		return key, true
 	}
 	return nil, false
 }
@@ -118,6 +132,15 @@ func nextToken(s []byte, i int) (tok scriptToken, next int, ok bool) {
 			return scriptToken{}, i, false
 		}
 		return scriptToken{opcode: op, data: s[i+3 : i+3+n]}, i + 3 + n, true
+	case op == opPushData4:
+		if i+5 > len(s) {
+			return scriptToken{}, i, false
+		}
+		n := int(s[i+1]) | int(s[i+2])<<8 | int(s[i+3])<<16 | int(s[i+4])<<24
+		if n < 0 || i+5+n > len(s) {
+			return scriptToken{}, i, false
+		}
+		return scriptToken{opcode: op, data: s[i+5 : i+5+n]}, i + 5 + n, true
 	default:
 		// OP_1NEGATE, OP_1-OP_16, OP_CHECKMULTISIG, or anything else: a
 		// plain single-byte opcode with no operand.
