@@ -38,6 +38,13 @@
 --      (block_transactions) are both keyed by wtxid, not just txid, so two
 --      variants of the same transaction never overwrite each other's
 --      witness data or size/vsize/weight. See docs/ARCHITECTURE.md §3a.
+--   8. transactions.version has uint32 semantics (RPC/consensus-facing),
+--      not int32 (Core's in-memory nVersion type) — same BIGINT-with-range-
+--      CHECK pattern already used for locktime/sequence/nonce.
+--   9. sync_state's initialized checkpoint is trigger-enforced to actually
+--      agree with `blocks`: the referenced hash must exist and be
+--      canonical, and indexed_height is mechanically derived from
+--      blocks.height rather than trusted from the caller.
 
 -- ── sync checkpoint ─────────────────────────────────────────────────────
 -- Bootstrap state (an explorer that has never synced) is represented
@@ -98,6 +105,49 @@ CREATE TABLE blocks (
 CREATE UNIQUE INDEX blocks_height_canonical_uidx ON blocks (height) WHERE canonical;
 CREATE INDEX blocks_prev_hash_idx ON blocks (prev_hash);
 
+-- sync_state's initialized checkpoint must actually agree with `blocks` —
+-- installed here (not alongside sync_state's own CREATE TABLE above)
+-- because it depends on `blocks` existing. The bootstrap row inserted
+-- above (before this trigger existed) is unaffected; the trigger only
+-- governs INSERT/UPDATE statements issued from this point on, which is
+-- exactly what Phase 2B.2's per-block indexing writes will be.
+CREATE OR REPLACE FUNCTION sync_state_validate_checkpoint() RETURNS trigger AS $$
+DECLARE
+    blk_height    BIGINT;
+    blk_canonical BOOLEAN;
+BEGIN
+    IF NEW.indexed_block_hash IS NULL THEN
+        -- sync_state_bootstrap_consistency already forbids height <> -1
+        -- here; this is a defense-in-depth restatement so the invariant
+        -- is enforced by more than one mechanism.
+        IF NEW.indexed_height <> -1 THEN
+            RAISE EXCEPTION 'sync_state: indexed_block_hash is NULL but indexed_height=% (must be -1 for the uninitialized/bootstrap checkpoint)', NEW.indexed_height;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    SELECT height, canonical INTO blk_height, blk_canonical
+    FROM blocks WHERE hash = NEW.indexed_block_hash;
+
+    IF blk_height IS NULL THEN
+        RAISE EXCEPTION 'sync_state: no block found for indexed_block_hash %', NEW.indexed_block_hash;
+    END IF;
+    IF NOT blk_canonical THEN
+        RAISE EXCEPTION 'sync_state: block % is not canonical; the durable checkpoint must reference the canonical chain', NEW.indexed_block_hash;
+    END IF;
+
+    -- Mechanically derived from blocks.height, never trusted from the
+    -- caller — same pattern as block_transactions_set_height and
+    -- utxo_state_derive_heights below.
+    NEW.indexed_height := blk_height;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER sync_state_validate_checkpoint_trigger
+    BEFORE INSERT OR UPDATE ON sync_state
+    FOR EACH ROW EXECUTE FUNCTION sync_state_validate_checkpoint();
+
 -- ── transactions (immutable, NON-WITNESS body; block-independent) ───────
 -- Keyed by txid = Core's GetHash() = serialization WITHOUT witness data.
 -- Inputs and outputs live here (keyed by txid) because scriptSig/prevouts/
@@ -107,12 +157,18 @@ CREATE INDEX blocks_prev_hash_idx ON blocks (prev_hash);
 -- single txid can have more than one valid wtxid across competing blocks.
 CREATE TABLE transactions (
     txid                TEXT PRIMARY KEY,
-    version             INT NOT NULL,
+    version             BIGINT NOT NULL,
     locktime            BIGINT NOT NULL,
     is_coinbase         BOOLEAN NOT NULL,
     fee_satoshis        BIGINT, -- NULL for coinbase; deferred/optional otherwise (not computed in Phase 2B.1)
     indexed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT transactions_txid_format CHECK (txid ~ '^[0-9a-f]{64}$'),
+    -- version is RPC/consensus-facing uint32 (Core's TxToUniv exposes
+    -- static_cast<uint32_t>(tx.nVersion) despite the in-memory type being
+    -- int32_t — see docs/ARCHITECTURE.md §3), stored as BIGINT (Postgres
+    -- has no native unsigned type) but range-checked to match, same pattern
+    -- as locktime/sequence/nonce below.
+    CONSTRAINT transactions_version_uint32_range CHECK (version >= 0 AND version <= 4294967295),
     -- locktime is consensus-wire uint32.
     CONSTRAINT transactions_locktime_uint32_range CHECK (locktime >= 0 AND locktime <= 4294967295),
     CONSTRAINT transactions_fee_nonnegative CHECK (fee_satoshis IS NULL OR fee_satoshis >= 0),

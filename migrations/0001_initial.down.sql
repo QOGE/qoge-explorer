@@ -27,4 +27,7 @@ DROP TABLE IF EXISTS transaction_variants;
 
 DROP TABLE IF EXISTS transactions;
 DROP TABLE IF EXISTS blocks;
+
+DROP TRIGGER IF EXISTS sync_state_validate_checkpoint_trigger ON sync_state;
 DROP TABLE IF EXISTS sync_state;
+DROP FUNCTION IF EXISTS sync_state_validate_checkpoint();

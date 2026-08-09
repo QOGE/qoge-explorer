@@ -184,6 +184,30 @@ relational-integrity gaps, all fixed before merge:**
   migration with no corresponding local `.sql` files is also an error —
   see §15.
 
+**A fourth review pass found two representation invariants, both fixed
+before merge:**
+
+- **`transactions.version` couldn't represent Core's full RPC range.**
+  Core's in-memory `CTransaction::nVersion` is `int32_t`, but `TxToUniv`
+  exposes it to RPC (and treats it in consensus checks) as
+  `static_cast<uint32_t>(tx.nVersion)` — the same uint32-not-int32
+  distinction this project already applied to `locktime`/`sequence`/
+  `nonce`. `chain.Transaction.Version` changed from `int32` to `uint32`;
+  `transactions.version` changed from `INT` to `BIGINT` with a
+  `CHECK (version >= 0 AND version <= 4294967295)`. See §3a.
+- **`sync_state`'s initialized checkpoint could disagree with `blocks`.**
+  The bootstrap-vs-initialized `CHECK` (below) never verified that an
+  initialized `indexed_height`/`indexed_block_hash` pair actually matched a
+  real, canonical block — a caller could persist a checkpoint pointing at a
+  nonexistent hash, an orphaned block, or the wrong height for a real hash.
+  A `BEFORE INSERT OR UPDATE` trigger now requires `indexed_block_hash` (when
+  non-`NULL`) to reference an existing, `canonical = true` row in `blocks`,
+  and mechanically derives `indexed_height` from `blocks.height` rather than
+  trusting the caller — same pattern as `block_transactions_set_height` and
+  `utxo_state_derive_heights`. This protects the durable checkpoint that
+  Phase 2B.2 will update as the final statement of each block-indexing
+  transaction. See §3c.
+
 ### 3a. Transaction identity, occurrence, and witness variants
 
 **Terminology, precisely — five distinct concepts this section's tables
@@ -228,7 +252,11 @@ prevent.
 -- serialization — witness data is the one thing that ISN'T.
 CREATE TABLE transactions (
     txid                TEXT PRIMARY KEY,
-    version             INT NOT NULL,
+    -- version is RPC/consensus-facing uint32 — Core's TxToUniv exposes
+    -- static_cast<uint32_t>(tx.nVersion) despite the C++ in-memory type
+    -- being int32_t. BIGINT (no native unsigned type), range-checked to
+    -- [0, 4294967295] — same pattern as locktime/sequence/nonce.
+    version             BIGINT NOT NULL,
     locktime            BIGINT NOT NULL,
     is_coinbase         BOOLEAN NOT NULL,
     fee_satoshis        BIGINT,   -- NULL for coinbase; optional/deferred otherwise (not computed in 2B.1)
@@ -470,6 +498,45 @@ CREATE TABLE sync_state (
         (indexed_height >= 0 AND indexed_block_hash IS NOT NULL)
     )
 );
+
+-- PR #2 review round 4: the CHECK above only proved internal
+-- self-consistency, never that an initialized checkpoint actually agreed
+-- with `blocks`. This trigger (installed once `blocks` exists) requires
+-- indexed_block_hash to reference a real, canonical block, and mechanically
+-- derives indexed_height from blocks.height rather than trusting the
+-- caller — same pattern as block_transactions_set_height/
+-- utxo_state_derive_heights. Confirmed by
+-- TestInvariant_SyncStateCheckpointMustMatchCanonicalBlock (internal/store).
+CREATE OR REPLACE FUNCTION sync_state_validate_checkpoint() RETURNS trigger AS $$
+DECLARE
+    blk_height    BIGINT;
+    blk_canonical BOOLEAN;
+BEGIN
+    IF NEW.indexed_block_hash IS NULL THEN
+        IF NEW.indexed_height <> -1 THEN
+            RAISE EXCEPTION 'sync_state: indexed_block_hash is NULL but indexed_height=%', NEW.indexed_height;
+        END IF;
+        RETURN NEW;
+    END IF;
+
+    SELECT height, canonical INTO blk_height, blk_canonical
+    FROM blocks WHERE hash = NEW.indexed_block_hash;
+
+    IF blk_height IS NULL THEN
+        RAISE EXCEPTION 'sync_state: no block found for indexed_block_hash %', NEW.indexed_block_hash;
+    END IF;
+    IF NOT blk_canonical THEN
+        RAISE EXCEPTION 'sync_state: block % is not canonical', NEW.indexed_block_hash;
+    END IF;
+
+    NEW.indexed_height := blk_height;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER sync_state_validate_checkpoint_trigger
+    BEFORE INSERT OR UPDATE ON sync_state
+    FOR EACH ROW EXECUTE FUNCTION sync_state_validate_checkpoint();
 
 -- Deployment status cache (display only; Core remains authoritative).
 CREATE TABLE chain_deployments (

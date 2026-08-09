@@ -22,7 +22,14 @@ type Transaction struct {
 	// table is keyed by.
 	WTxID string
 
-	Version  int32
+	// Version has uint32 semantics, not int32. Core's in-memory
+	// CTransaction stores nVersion as int32_t, but TxToUniv exposes it to
+	// RPC as static_cast<uint32_t>(tx.nVersion) and treats it as unsigned
+	// in consensus checks — the same RPC-facing representation this project
+	// already follows for LockTime, sequence, and nonce. See
+	// docs/ARCHITECTURE.md §3 for the C++-type-vs-RPC-representation
+	// distinction.
+	Version  uint32
 	LockTime uint32
 
 	// Size, VSize, and Weight mirror the fields Core's verbose RPC output

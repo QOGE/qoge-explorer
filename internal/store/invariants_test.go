@@ -708,6 +708,43 @@ func TestInvariant_Uint32RangeRejected(t *testing.T) {
 		}
 	})
 
+	t.Run("version negative", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO transactions (txid, version, locktime, is_coinbase)
+			VALUES ($1, -1, 0, false)
+		`, hash64("badversionneg"))
+		if err == nil {
+			t.Fatal("expected negative version to be rejected, got nil error")
+		}
+	})
+
+	t.Run("version above uint32 max", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		_, err := tx.Exec(ctx, `
+			INSERT INTO transactions (txid, version, locktime, is_coinbase)
+			VALUES ($1, 4294967296, 0, false)
+		`, hash64("badversionhi"))
+		if err == nil {
+			t.Fatal("expected version above uint32 max to be rejected, got nil error")
+		}
+	})
+
+	t.Run("version boundary and int32-crossing values accepted", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		// Confirms transactions.version isn't silently clamped to Core's
+		// in-memory int32_t range — 2147483648 (2^31, the smallest value
+		// that overflows a signed 32-bit int) and 4294967295 (uint32 max)
+		// must both be representable, per docs/ARCHITECTURE.md §3's
+		// RPC-uint32-not-C++-int32 distinction.
+		for i, v := range []int64{0, 2147483647, 2147483648, 4294967295} {
+			mustExec(t, ctx, tx, `
+				INSERT INTO transactions (txid, version, locktime, is_coinbase)
+				VALUES ($1, $2, 0, false)
+			`, hash64(fmt.Sprintf("versionok%d", i)), v)
+		}
+	})
+
 	t.Run("boundary values (0 and 4294967295) accepted", func(t *testing.T) {
 		ctx, tx := txPool(t)
 		mustExec(t, ctx, tx, `
@@ -949,6 +986,69 @@ func TestInvariant_UTXOSpendMustMatchExactPrevout(t *testing.T) {
 		}
 		if spent {
 			t.Error("expected spent=false for a freshly created, never-spent output")
+		}
+	})
+}
+
+// ─── PR #2 review round 4 fixes ────────────────────────────────────────
+
+// TestInvariant_SyncStateCheckpointMustMatchCanonicalBlock is the decisive
+// test for round 4 item 2: sync_state_validate_checkpoint_trigger must
+// prove an initialized checkpoint's indexed_block_hash is a real, canonical
+// block, and must derive indexed_height from blocks.height itself rather
+// than trust whatever the caller supplied.
+func TestInvariant_SyncStateCheckpointMustMatchCanonicalBlock(t *testing.T) {
+	t.Run("bootstrap -1/NULL remains valid", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		mustExec(t, ctx, tx, `INSERT INTO sync_state (name, indexed_height, indexed_block_hash) VALUES ('checkpoint_bootstrap', -1, NULL)`)
+	})
+
+	t.Run("initialized checkpoint referencing a canonical block succeeds", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		fixtureBlock(t, ctx, tx, hash64("syncblockvalid"), 42, nil)
+		mustExec(t, ctx, tx, `INSERT INTO sync_state (name, indexed_height, indexed_block_hash) VALUES ('checkpoint_valid', 42, $1)`, hash64("syncblockvalid"))
+
+		var height int64
+		if err := tx.QueryRow(ctx, `SELECT indexed_height FROM sync_state WHERE name='checkpoint_valid'`).Scan(&height); err != nil {
+			t.Fatalf("read back checkpoint: %v", err)
+		}
+		if height != 42 {
+			t.Errorf("indexed_height = %d, want 42", height)
+		}
+	})
+
+	t.Run("caller-supplied wrong height is mechanically corrected to blocks.height", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		fixtureBlock(t, ctx, tx, hash64("syncblockcorrect"), 99, nil)
+		// Deliberately claim height=1 for a block that's actually height 99
+		// — the trigger must overwrite this, not trust it.
+		mustExec(t, ctx, tx, `INSERT INTO sync_state (name, indexed_height, indexed_block_hash) VALUES ('checkpoint_corrected', 1, $1)`, hash64("syncblockcorrect"))
+
+		var height int64
+		if err := tx.QueryRow(ctx, `SELECT indexed_height FROM sync_state WHERE name='checkpoint_corrected'`).Scan(&height); err != nil {
+			t.Fatalf("read back checkpoint: %v", err)
+		}
+		if height != 99 {
+			t.Errorf("indexed_height = %d, want 99 (caller-supplied 1 should have been overridden by blocks.height)", height)
+		}
+	})
+
+	t.Run("nonexistent block hash rejected", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		_, err := tx.Exec(ctx, `INSERT INTO sync_state (name, indexed_height, indexed_block_hash) VALUES ('checkpoint_missing', 5, $1)`, hash64("nosuchsyncblock"))
+		if err == nil {
+			t.Fatal("expected a checkpoint referencing a nonexistent block hash to be rejected, got nil error")
+		}
+	})
+
+	t.Run("orphaned (non-canonical) block hash rejected", func(t *testing.T) {
+		ctx, tx := txPool(t)
+		fixtureBlock(t, ctx, tx, hash64("syncblockorphan"), 7, nil)
+		mustExec(t, ctx, tx, `UPDATE blocks SET canonical = false, orphaned_at = now() WHERE hash = $1`, hash64("syncblockorphan"))
+
+		_, err := tx.Exec(ctx, `INSERT INTO sync_state (name, indexed_height, indexed_block_hash) VALUES ('checkpoint_orphan', 7, $1)`, hash64("syncblockorphan"))
+		if err == nil {
+			t.Fatal("expected a checkpoint referencing an orphaned (canonical=false) block to be rejected, got nil error")
 		}
 	})
 }
