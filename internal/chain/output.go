@@ -45,6 +45,16 @@ type Output struct {
 	// where Core deliberately omits the address field — see
 	// docs/ARCHITECTURE.md §7 "P2PK handling").
 	Address string
+
+	// ParticipantAddresses holds one address per entry in PubKeys, for
+	// TypeMultisig outputs only — the per-signer display/search identities
+	// internal/store persists into output_participants (never used for
+	// balance accounting; see docs/ARCHITECTURE.md §7/§13.A). Nil for every
+	// other script type, and nil until a caller populates it — like
+	// Address, this is taken as-is from whatever Core/a future RPC
+	// translator reports, never derived or invented by this package (see
+	// docs/ARCHITECTURE.md §9, "RPC decoding will be the next phase").
+	ParticipantAddresses []string
 }
 
 // ScriptPubKeyHex returns the output script as a lowercase hex string.
