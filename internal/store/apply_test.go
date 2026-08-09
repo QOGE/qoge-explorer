@@ -253,8 +253,12 @@ func TestApplyBlock_ImmutableConflicts(t *testing.T) {
 		)
 		mustApply(t, ctx, s, block)
 
+		// Same hash/height/prevHash as an exact tip replay (so this isolates
+		// header-content immutability from canonical-tip continuity, which
+		// is checked separately — see TestApplyBlock_CanonicalTipContinuity)
+		// but a different merkle_root.
 		conflicting := block
-		conflicting.Height = 101 // same hash, different height
+		conflicting.MerkleRoot = hash64("blockDwrongmerkle")
 		err := s.ApplyBlock(ctx, conflicting)
 		if err == nil {
 			t.Fatal("expected a contradictory block header to be rejected, got nil")
@@ -264,8 +268,12 @@ func TestApplyBlock_ImmutableConflicts(t *testing.T) {
 		}
 
 		var height int64
-		if err := pool.QueryRow(ctx, `SELECT height FROM blocks WHERE hash = $1`, hash64("blockD")).Scan(&height); err != nil {
+		var merkleRoot string
+		if err := pool.QueryRow(ctx, `SELECT height, merkle_root FROM blocks WHERE hash = $1`, hash64("blockD")).Scan(&height, &merkleRoot); err != nil {
 			t.Fatalf("read back block height: %v", err)
+		}
+		if merkleRoot != hash64("blockD") {
+			t.Errorf("original block merkle_root was overwritten: got %s, want %s", merkleRoot, hash64("blockD"))
 		}
 		if height != 100 {
 			t.Errorf("original block height was overwritten: got %d, want 100", height)

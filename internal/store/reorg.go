@@ -43,6 +43,16 @@ func (s *Store) RollbackTo(ctx context.Context, ancestorHash string) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
+	// Acquire the same canonical-mutation lock ApplyBlock acquires first —
+	// see lockCheckpoint (store.go). This serializes RollbackTo against
+	// every concurrent ApplyBlock/RollbackTo call, in this process or any
+	// other one sharing the database, for the lifetime of this
+	// transaction. The checkpoint value itself isn't needed here (the
+	// ancestor's height is re-derived from `blocks` below), only the lock.
+	if _, err := lockCheckpoint(ctx, tx); err != nil {
+		return fmt.Errorf("store: rollback to %s: %w", ancestorHash, err)
+	}
+
 	var ancestorHeight int64
 	err = tx.QueryRow(ctx, `SELECT height FROM blocks WHERE hash = $1 AND canonical`, ancestorHash).Scan(&ancestorHeight)
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -63,6 +63,28 @@ var (
 	// (task item 4: wtxid == txid if and only if the transaction has no
 	// witness data at all).
 	ErrWitnessIdentityMismatch = errors.New("store: wtxid/txid does not match witness presence")
+
+	// ErrNonSequentialBlock means block does not have an explicit,
+	// acceptable relationship to the current canonical tip: it is neither
+	// an exact replay of the tip (same hash and height) nor its immediate
+	// child (height = tip height + 1, PreviousHash = tip hash). A lower
+	// historical block — canonical or orphaned — can never mutate
+	// canonical UTXO/address state merely because ApplyBlock was called on
+	// it; see the "Canonical tip continuity" doc comment on ApplyBlock.
+	ErrNonSequentialBlock = errors.New("store: block does not extend or replay the current canonical tip")
+
+	// ErrIncompleteBlock means len(block.Transactions) != block.TxCount.
+	// ApplyBlock represents a fully indexed canonical block, not a header-
+	// only/lightweight one (chain.Block deliberately permits TxCount > 0
+	// with Transactions == nil for that lightweight case — see
+	// chain.Block's doc comment — but ApplyBlock refuses it).
+	ErrIncompleteBlock = errors.New("store: block.Transactions does not match block.TxCount")
+
+	// ErrAmountOverflow means summing input or output values while
+	// computing a transaction's fee would overflow int64. Real QOGE
+	// mainnet values are far below this, but silent wraparound is kept
+	// structurally impossible rather than merely improbable.
+	ErrAmountOverflow = errors.New("store: satoshi amount accumulator overflow")
 )
 
 // Checkpoint is the durable sync_state('main') row: the block the store
@@ -82,6 +104,30 @@ func (s *Store) Tip(ctx context.Context) (Checkpoint, error) {
 	).Scan(&cp.Height, &hash)
 	if err != nil {
 		return Checkpoint{}, fmt.Errorf("store: read tip: %w", err)
+	}
+	if hash != nil {
+		cp.Hash = *hash
+	}
+	return cp, nil
+}
+
+// lockCheckpoint reads sync_state('main') with FOR UPDATE, acquiring the
+// canonical-mutation row lock: the serialization point every transaction
+// that mutates canonical state (ApplyBlock, RollbackTo) acquires first and
+// holds until COMMIT. Because sync_state has exactly one row per store
+// ('main'), this is a single-row lock, not a table lock, but it still
+// fully serializes every canonical mutation — across goroutines in one
+// process AND across separate Store instances/processes sharing the same
+// database, since it is an ordinary Postgres row lock, not an in-process
+// mutex.
+func lockCheckpoint(ctx context.Context, tx pgx.Tx) (Checkpoint, error) {
+	var cp Checkpoint
+	var hash *string
+	err := tx.QueryRow(ctx,
+		`SELECT indexed_height, indexed_block_hash FROM sync_state WHERE name = 'main' FOR UPDATE`,
+	).Scan(&cp.Height, &hash)
+	if err != nil {
+		return Checkpoint{}, fmt.Errorf("store: lock checkpoint: %w", err)
 	}
 	if hash != nil {
 		cp.Hash = *hash
@@ -141,28 +187,57 @@ func (s *Store) GetUTXO(ctx context.Context, txid string, voutIndex int) (*UTXO,
 
 // insertOrVerifyIdempotent runs insertSQL — an
 // "INSERT ... ON CONFLICT (<natural key>) DO NOTHING" statement — and
-// returns nil if the row was freshly inserted. If the row already existed
-// (0 rows affected), it runs verifySQL with the SAME args: a SELECT
-// returning one boolean column that is true iff the existing row's
+// returns fresh=true if the row was freshly inserted. If the row already
+// existed (0 rows affected), it runs verifySQL with the SAME args: a
+// SELECT returning one boolean column that is true iff the existing row's
 // non-key columns match what this call intended to insert. A false result
 // means the same natural key was claimed with contradictory data, which is
 // reported as ErrImmutableConflict rather than silently overwritten — see
 // docs/ARCHITECTURE.md §16 "Idempotent replay" and "Immutable conflict
 // semantics."
-func insertOrVerifyIdempotent(ctx context.Context, tx pgx.Tx, what string, insertSQL string, verifySQL string, args ...any) error {
+//
+// The fresh/existing distinction lets callers decide whether a child-set
+// completeness check (verifyExactCount) is even necessary: if the parent
+// identity (e.g. a txid or wtxid) was JUST freshly inserted, nothing could
+// possibly have written child rows for it before this call, so there is
+// nothing to verify completeness against yet.
+func insertOrVerifyIdempotent(ctx context.Context, tx pgx.Tx, what string, insertSQL string, verifySQL string, args ...any) (fresh bool, err error) {
 	tag, err := tx.Exec(ctx, insertSQL, args...)
 	if err != nil {
-		return fmt.Errorf("store: insert %s: %w", what, err)
+		return false, fmt.Errorf("store: insert %s: %w", what, err)
 	}
 	if tag.RowsAffected() > 0 {
-		return nil
+		return true, nil
 	}
 	var matches bool
 	if err := tx.QueryRow(ctx, verifySQL, args...).Scan(&matches); err != nil {
-		return fmt.Errorf("store: verify idempotent %s: %w", what, err)
+		return false, fmt.Errorf("store: verify idempotent %s: %w", what, err)
 	}
 	if !matches {
-		return fmt.Errorf("%w: %s", ErrImmutableConflict, what)
+		return false, fmt.Errorf("%w: %s", ErrImmutableConflict, what)
+	}
+	return false, nil
+}
+
+// verifyExactCount runs sql (a "SELECT count(*) FROM <child table> WHERE
+// <parent key> = ...") and requires the result to exactly equal wantCount.
+// Used to prove a supposedly-immutable child row set (transaction_inputs
+// per txid, transaction_outputs per txid, transaction_input_witness per
+// (wtxid, vin_index), block_transactions per block_hash,
+// output_participants per output) hasn't grown, shrunk, or otherwise
+// changed shape between two observations of the same parent identity — a
+// per-row insertOrVerifyIdempotent check alone cannot catch this, since an
+// added row at a previously-unused natural key inserts cleanly on its own.
+// Callers only need to call this when the parent identity was NOT freshly
+// inserted this call (see insertOrVerifyIdempotent) — a fresh parent
+// guarantees an empty, and therefore trivially "complete," child set.
+func verifyExactCount(ctx context.Context, tx pgx.Tx, what, sql string, args []any, wantCount int) error {
+	var existingCount int
+	if err := tx.QueryRow(ctx, sql, args...).Scan(&existingCount); err != nil {
+		return fmt.Errorf("store: count %s: %w", what, err)
+	}
+	if existingCount != wantCount {
+		return fmt.Errorf("%w: %s: persisted count %d != supplied count %d", ErrImmutableConflict, what, existingCount, wantCount)
 	}
 	return nil
 }

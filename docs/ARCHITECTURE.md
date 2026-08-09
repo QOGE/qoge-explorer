@@ -1251,13 +1251,108 @@ or historical synchronization: it consumes canonical `chain.*` values only,
 never a raw `map[string]any` RPC object. RPC decoding (translating Core's
 JSON into `chain.Block`/`chain.Transaction`) and the continuous block-fetch
 loop are the next phase, built on top of this one. Proven by
-`internal/store/apply_test.go` against a real, per-test-isolated PostgreSQL
-database (same infrastructure as §3's invariant tests) — 24 required
-behaviors (single-block atomicity, idempotent replay, every immutable-
-conflict shape, UTXO spend/double-spend/missing-prevout, fee computation,
-multisig non-aggregation, and reorg down to multi-block depth), plus a
+`internal/store/apply_test.go` and `internal/store/continuity_test.go`
+against a real, per-test-isolated PostgreSQL database (same infrastructure
+as §3's invariant tests) — single-block atomicity, idempotent replay, every
+immutable-conflict shape (including child-set completeness, below), UTXO
+spend/double-spend/missing-prevout, fee computation, multisig
+non-aggregation, reorg down to multi-block depth, canonical tip continuity,
+safe orphan re-promotion, and canonical-mutation concurrency — plus a
 real-mainnet-vector exercise reusing the P2PK/P2PKH/OP_RETURN/P2WPKH/P2TR
 scriptPubKeys already documented in `internal/script/classify_test.go`.
+
+### Canonical tip continuity, and safe orphan re-promotion
+
+**Added in an independent review round, after the behavior above was first
+implemented.** `ApplyBlock`'s first statement is `lockCheckpoint`: a
+`SELECT ... FOR UPDATE` against `sync_state('main')`, held for the whole
+transaction. This is the canonical-mutation lock — it fully serializes
+every `ApplyBlock`/`RollbackTo` call against every other one, across
+goroutines and across separate `Store` instances/processes sharing the
+database (`TestApplyBlock_ConcurrentCompetingChildrenSerialize`,
+`TestRollbackTo_SerializesAgainstApplyBlock`).
+
+Once locked, `block` must have an explicit, provable relationship to the
+checkpoint just read (`checkCanonicalContinuity`) — for an initialized
+store, exactly one of **exact tip replay** (same hash and height as the
+checkpoint) or **immediate canonical append** (height = checkpoint height +
+1, `PreviousHash` = checkpoint hash). Anything else — a height jump, a
+mismatched `PreviousHash`, or any block (canonical or orphaned) below the
+current tip — is `ErrNonSequentialBlock`, rejected before any write. A
+lower historical block can never mutate canonical UTXO/address state
+merely because `ApplyBlock` was called on it. For an *uninitialized* store
+(`sync_state` still at its bootstrap `-1`/`NULL` row), any block is
+accepted as this store's bootstrap point — there is no existing tip to
+compare against yet; production historical sync always starts from genesis,
+and this codebase's own tests use arbitrary synthetic "genesis" blocks at
+arbitrary heights, both of which this policy keeps working.
+
+If `block.Hash` refers to an already-persisted block that is currently
+orphaned (`canonical = false`, from an earlier `RollbackTo`) and it passes
+continuity as the immediate child of the current tip, `applyBlockHeader`
+promotes it (`canonical = true`, `orphaned_at = NULL`) instead of treating
+the pre-existing, header-matching row as a plain no-op. Its canonical
+UTXO/address state is then rebuilt by the ordinary per-transaction path —
+`RollbackTo` only ever deleted its `utxo_state` rows, never its
+transactions/inputs/outputs/witness rows, so "rebuild" is just those rows'
+normal idempotent-insert path recreating what was removed
+(`TestApplyBlock_OrphanRePromotion`). An orphan that is *not* the immediate
+child of the current tip is never promoted — it's rejected by the
+continuity check first, before `ApplyBlock` even looks at its `canonical`
+flag.
+
+### Immutable child-set completeness
+
+**Also added in that review round.** `insertOrVerifyIdempotent` alone
+proves an individual row's *content* is immutable, but not that a whole
+child-row *set* is complete: a second observation of an already-known txid
+that supplies an extra output at a previously-unused `vout_index`, or an
+extra witness item at a previously-unused `item_index`, would insert
+cleanly on its own natural key, silently growing what was supposed to be
+an immutable transaction body. `insertOrVerifyIdempotent` now returns
+whether the parent identity (block hash, txid, wtxid, or a specific
+output's `(txid, vout_index)`) was freshly inserted or already existed. A
+freshly-inserted parent guarantees its children are freshly inserted too —
+nothing could have written them before the parent existed — so no further
+check is needed. An *already-existing* parent triggers `verifyExactCount`
+(`store.go`): a `SELECT count(*)` against the child table, which must
+exactly equal the newly-supplied child count, run *before* any child rows
+for this call are touched. Applied to: `transaction_inputs`/
+`transaction_outputs` per txid, `transaction_input_witness` per
+`(wtxid, vin_index)` — checked per-input, not aggregated across the whole
+wtxid, so a witness stack "moved" between two inputs (same total count,
+different distribution) is still caught — `block_transactions` per
+`block_hash`, and `output_participants` per output.
+
+This relies on one more structural rule, checked up front by
+`validateBlockShape` before continuity or any database access at all:
+`chain.Input.Index`/`chain.Output.Index` must equal the element's position
+in its array (Core's own vin/vout array semantics — see
+`internal/chain/input.go`/`output.go`), which makes an "index moved to
+another slot" attempt structurally inexpressible, and reduces the
+completeness check for indexed children to a simple, cheap count
+comparison rather than a full index-set comparison. `applyOutput` closes
+two related shape gaps the same way: a replay that supplies no `Address`
+for an output that previously had one is a conflict, not a silent skip
+(`out.Address == ""` no longer means "say nothing"); and a multisig
+output's `ParticipantAddresses` must have exactly one entry per `PubKeys`
+entry, none empty — never silently tolerating a partial/missing mapping.
+
+None of this computes or validates txid/wtxid cryptographically — that
+remains explicitly out of scope (representation-integrity checking, not
+consensus validation).
+
+`markSpent`'s `UPDATE ... WHERE spent = false` no longer assumes success
+just because `checkPrevout` earlier observed `spent = false`:
+`RowsAffected` is inspected directly, and a zero-row result triggers a
+re-read that distinguishes "already spent by exactly this input"
+(idempotent replay — safe) from any other spender (`ErrDoubleSpend`),
+rather than silently treating zero affected rows as success
+(`TestMarkSpent_ZeroRowUpdateDetectsConflict`). Fee accumulation
+(`addChecked`) uses checked `int64` addition, returning
+`ErrAmountOverflow` rather than silently wrapping — real QOGE values never
+approach this range, but the possibility is kept structurally impossible
+rather than merely improbable.
 
 ### Block transaction ordering
 

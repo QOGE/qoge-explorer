@@ -18,13 +18,66 @@ import (
 // block as the FINAL logical write. If anything fails before commit,
 // NOTHING from this block persists. See docs/ARCHITECTURE.md §16.
 //
+// # Canonical tip continuity
+//
+// The very first statement ApplyBlock issues is lockCheckpoint: a
+// "SELECT ... FOR UPDATE" against sync_state('main'). This is the
+// canonical-mutation lock — it serializes every ApplyBlock/RollbackTo call
+// against every other one, across goroutines AND across separate Store
+// instances/processes sharing the database, for as long as this
+// transaction is open.
+//
+// Once locked, block must have an explicit, provable relationship to the
+// checkpoint it just read — for an INITIALIZED store, exactly one of:
+//
+//   - exact tip replay: block.Hash == checkpoint.Hash AND
+//     block.Height == checkpoint.Height, or
+//   - immediate canonical append: block.Height == checkpoint.Height + 1
+//     AND block.PreviousHash == checkpoint.Hash.
+//
+// Anything else — a height jump, a mismatched PreviousHash, or any block
+// (canonical or orphaned) below the current tip — is ErrNonSequentialBlock
+// and leaves the database completely unchanged: a lower historical block
+// can never mutate canonical UTXO/address state merely because ApplyBlock
+// was called on it.
+//
+// For an UNINITIALIZED store (sync_state still at its bootstrap -1/NULL
+// row), ApplyBlock accepts any block unconditionally as this store's
+// bootstrap point — there is no existing tip to compare against yet.
+// Production historical sync always starts from genesis (height 0, no
+// PreviousHash); this codebase's own tests use arbitrary synthetic
+// "genesis" blocks at arbitrary heights, which this policy deliberately
+// keeps working. Every block ApplyBlock accepts AFTER that first one is
+// still bound by the continuity rule above, relative to whatever became
+// the checkpoint.
+//
+// # Safe orphan re-promotion
+//
+// If block.Hash refers to an ALREADY-PERSISTED block that is currently
+// orphaned (canonical = false, from an earlier RollbackTo) and it passes
+// the continuity check above as the immediate child of the current tip,
+// ApplyBlock promotes it: canonical = true, orphaned_at = NULL, and its
+// canonical UTXO/address state is rebuilt exactly as it would be for any
+// other immediate-append block (its transactions/inputs/outputs/witness
+// rows were never deleted by RollbackTo in the first place — only its
+// utxo_state rows were — so this "rebuild" is just the ordinary
+// applyTransaction path re-creating what RollbackTo removed). An orphan
+// that is NOT the immediate child of the current tip is never promoted;
+// it is rejected by the continuity check like any other non-sequential
+// block, before ApplyBlock even looks at whether it's orphaned.
+//
+// # Idempotency and immutable conflicts
+//
 // ApplyBlock is idempotent: reapplying the exact same already-indexed
 // block succeeds as a no-op beyond re-verifying already-correct state and
 // recomputing (to the same values) any touched address caches. Applying a
 // block whose data contradicts already-persisted immutable records for the
-// same identity (same block hash/txid/wtxid/input/output, different body)
-// returns an error wrapping ErrImmutableConflict rather than silently
-// overwriting it.
+// same identity (same block hash/txid/wtxid/input/output/witness item,
+// different body, or a different-shaped set of children for the same
+// parent identity — an added, omitted, or moved input/output/witness
+// item) returns an error wrapping ErrImmutableConflict rather than
+// silently overwriting it. See insertOrVerifyIdempotent and
+// verifyExactCount (store.go).
 //
 // ApplyBlock assumes block.Transactions is already in a valid order — each
 // transaction's inputs may only reference outputs created earlier in this
@@ -37,13 +90,30 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op once committed
 
-	var currentCheckpointHeight int64
-	if err := tx.QueryRow(ctx, `SELECT indexed_height FROM sync_state WHERE name = 'main'`).Scan(&currentCheckpointHeight); err != nil {
-		return fmt.Errorf("store: apply block %s: read current checkpoint: %w", block.Hash, err)
+	checkpoint, err := lockCheckpoint(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
 	}
 
-	if err := applyBlockHeader(ctx, tx, block); err != nil {
+	if err := validateBlockShape(block); err != nil {
 		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+	}
+
+	if err := checkCanonicalContinuity(block, checkpoint); err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+	}
+
+	blockFresh, err := applyBlockHeader(ctx, tx, block)
+	if err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+	}
+	if !blockFresh {
+		if err := verifyExactCount(ctx, tx, "block_transactions for "+block.Hash,
+			`SELECT count(*) FROM block_transactions WHERE block_hash = $1`,
+			[]any{block.Hash}, len(block.Transactions),
+		); err != nil {
+			return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+		}
 	}
 
 	touched := map[string]struct{}{}
@@ -59,19 +129,20 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 		}
 	}
 
-	// The checkpoint is the FINAL logical write (task item 10) — and is
-	// only ever advanced, never rewound, by a lower-or-equal-height block
-	// (e.g. a deliberate historical re-index run). The
-	// sync_state_validate_checkpoint_trigger independently re-derives
-	// indexed_height from blocks.height and verifies block.Hash is
-	// canonical, so this doubles as a final correctness gate before
-	// commit.
-	if block.Height >= currentCheckpointHeight {
-		if _, err := tx.Exec(ctx, `
-			UPDATE sync_state SET indexed_block_hash = $1, updated_at = now() WHERE name = 'main'
-		`, block.Hash); err != nil {
-			return fmt.Errorf("store: apply block %s: checkpoint: %w", block.Hash, err)
-		}
+	// The checkpoint is the FINAL logical write (task item 10). Continuity
+	// has already proven block is either an exact tip replay (a harmless
+	// no-op set here) or the immediate child of the previous checkpoint, so
+	// this unconditionally advances (or re-affirms) it — no separate
+	// height comparison is needed here anymore; continuity already did
+	// the only comparison that matters. sync_state_validate_checkpoint_
+	// trigger independently re-derives indexed_height from blocks.height
+	// and verifies block.Hash is canonical (true by construction: either
+	// it always was, or applyBlockHeader just promoted it), so this
+	// doubles as a final correctness gate before commit.
+	if _, err := tx.Exec(ctx, `
+		UPDATE sync_state SET indexed_block_hash = $1, updated_at = now() WHERE name = 'main'
+	`, block.Hash); err != nil {
+		return fmt.Errorf("store: apply block %s: checkpoint: %w", block.Hash, err)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
@@ -80,12 +151,64 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	return nil
 }
 
-func applyBlockHeader(ctx context.Context, tx pgx.Tx, block chain.Block) error {
+// validateBlockShape checks block is internally self-consistent, before
+// any database access: block.TxCount must match len(block.Transactions)
+// exactly (ApplyBlock represents a fully indexed block, never a
+// header-only one — see ErrIncompleteBlock), and every transaction's
+// inputs/outputs must use the canonical positional index Core's own
+// vin/vout array semantics guarantee (chain.Input.Index/chain.Output.Index
+// documented as "this input/output's position within its transaction's
+// vin/vout list" — internal/chain/input.go, output.go). Enforcing this
+// up front makes an "index moved to another slot" attack structurally
+// impossible to even express, which is what lets the completeness checks
+// in applyInput/applyOutput/applyTransaction rely on a simple count
+// comparison rather than a full index-set comparison.
+func validateBlockShape(block chain.Block) error {
+	if len(block.Transactions) != block.TxCount {
+		return fmt.Errorf("%w: block %s has TxCount=%d but %d transactions supplied",
+			ErrIncompleteBlock, block.Hash, block.TxCount, len(block.Transactions))
+	}
+	for _, txn := range block.Transactions {
+		for i, in := range txn.Inputs {
+			if in.Index != uint32(i) {
+				return fmt.Errorf("%w: tx %s input %d has Index=%d, want %d (canonical positional index)",
+					ErrImmutableConflict, txn.TxID, i, in.Index, i)
+			}
+		}
+		for i, out := range txn.Outputs {
+			if out.Index != uint32(i) {
+				return fmt.Errorf("%w: tx %s output %d has Index=%d, want %d (canonical positional index)",
+					ErrImmutableConflict, txn.TxID, i, out.Index, i)
+			}
+		}
+	}
+	return nil
+}
+
+// checkCanonicalContinuity enforces the relationship documented on
+// ApplyBlock: for an uninitialized checkpoint, anything is accepted as
+// this store's bootstrap point; otherwise block must be either an exact
+// replay of the checkpoint or its immediate canonical child.
+func checkCanonicalContinuity(block chain.Block, checkpoint Checkpoint) error {
+	if checkpoint.Hash == "" {
+		return nil
+	}
+	if block.Hash == checkpoint.Hash && block.Height == checkpoint.Height {
+		return nil
+	}
+	if block.Height == checkpoint.Height+1 && block.PreviousHash == checkpoint.Hash {
+		return nil
+	}
+	return fmt.Errorf("%w: block %s (height %d, prevHash %q) does not extend or replay checkpoint %s (height %d)",
+		ErrNonSequentialBlock, block.Hash, block.Height, block.PreviousHash, checkpoint.Hash, checkpoint.Height)
+}
+
+func applyBlockHeader(ctx context.Context, tx pgx.Tx, block chain.Block) (bool, error) {
 	var prevHash *string
 	if block.PreviousHash != "" {
 		prevHash = &block.PreviousHash
 	}
-	return insertOrVerifyIdempotent(ctx, tx, "block "+block.Hash,
+	fresh, err := insertOrVerifyIdempotent(ctx, tx, "block "+block.Hash,
 		`INSERT INTO blocks (hash, height, prev_hash, merkle_root, "time", bits, difficulty, nonce, size, weight, tx_count)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		 ON CONFLICT (hash) DO NOTHING`,
@@ -96,6 +219,44 @@ func applyBlockHeader(ctx context.Context, tx pgx.Tx, block chain.Block) error {
 		block.Hash, block.Height, prevHash, block.MerkleRoot, block.Time, block.Bits,
 		block.Difficulty, int64(block.Nonce), block.Size, block.Weight, block.TxCount,
 	)
+	if err != nil {
+		return false, err
+	}
+	if fresh {
+		return true, nil
+	}
+
+	// Safe orphan re-promotion (see ApplyBlock's doc comment): by the time
+	// this runs, checkCanonicalContinuity has already proven block is
+	// either an exact tip replay (always already canonical — the branch
+	// below is a no-op for it) or the immediate child of the current tip.
+	// If the existing row is currently orphaned, that means it's exactly
+	// the "a previously orphaned branch becomes canonical again" case, and
+	// it is now provably safe to promote it: the unique canonical-height
+	// index remains a final DB guard against ever having two canonical
+	// blocks at the same height regardless.
+	var canonical bool
+	if err := tx.QueryRow(ctx, `SELECT canonical FROM blocks WHERE hash = $1`, block.Hash).Scan(&canonical); err != nil {
+		return false, fmt.Errorf("store: read canonical status of block %s: %w", block.Hash, err)
+	}
+	if !canonical {
+		if _, err := tx.Exec(ctx, `UPDATE blocks SET canonical = true, orphaned_at = NULL WHERE hash = $1`, block.Hash); err != nil {
+			return false, fmt.Errorf("store: promote orphaned block %s to canonical: %w", block.Hash, err)
+		}
+	}
+	return false, nil
+}
+
+// addChecked adds b to a, returning ok=false instead of silently wrapping
+// on int64 overflow (task item 6). Real QOGE mainnet values are far below
+// this range, but the possibility is kept structurally impossible rather
+// than merely improbable.
+func addChecked(a, b int64) (int64, bool) {
+	sum := a + b
+	if (b > 0 && sum < a) || (b < 0 && sum > a) {
+		return 0, false
+	}
+	return sum, true
 }
 
 // applyTransaction persists one transaction's body/variant/occurrence,
@@ -127,11 +288,19 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 			if err != nil {
 				return err
 			}
-			inputSum += value
+			sum, ok := addChecked(inputSum, value)
+			if !ok {
+				return fmt.Errorf("%w: input value sum for tx %s", ErrAmountOverflow, txn.TxID)
+			}
+			inputSum = sum
 		}
 		var outputSum int64
 		for _, out := range txn.Outputs {
-			outputSum += out.Value.Satoshis()
+			sum, ok := addChecked(outputSum, out.Value.Satoshis())
+			if !ok {
+				return fmt.Errorf("%w: output value sum for tx %s", ErrAmountOverflow, txn.TxID)
+			}
+			outputSum = sum
 		}
 		f := inputSum - outputSum
 		if f < 0 {
@@ -140,27 +309,29 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		fee = &f
 	}
 
-	if err := insertOrVerifyIdempotent(ctx, tx, "transaction "+txn.TxID,
+	transactionFresh, err := insertOrVerifyIdempotent(ctx, tx, "transaction "+txn.TxID,
 		`INSERT INTO transactions (txid, version, locktime, is_coinbase, fee_satoshis)
 		 VALUES ($1,$2,$3,$4,$5) ON CONFLICT (txid) DO NOTHING`,
 		`SELECT version = $2 AND locktime = $3 AND is_coinbase = $4 AND fee_satoshis IS NOT DISTINCT FROM $5
 		 FROM transactions WHERE txid = $1`,
 		txn.TxID, int64(txn.Version), int64(txn.LockTime), txn.IsCoinbase, fee,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 
-	if err := insertOrVerifyIdempotent(ctx, tx, "transaction_variant "+txn.WTxID,
+	variantFresh, err := insertOrVerifyIdempotent(ctx, tx, "transaction_variant "+txn.WTxID,
 		`INSERT INTO transaction_variants (wtxid, txid, size, vsize, weight)
 		 VALUES ($1,$2,$3,$4,$5) ON CONFLICT (wtxid) DO NOTHING`,
 		`SELECT txid = $2 AND size = $3 AND vsize = $4 AND weight = $5
 		 FROM transaction_variants WHERE wtxid = $1`,
 		txn.WTxID, txn.TxID, txn.Size, txn.VSize, txn.Weight,
-	); err != nil {
+	)
+	if err != nil {
 		return err
 	}
 
-	if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("block_transaction %s:%d", blockHash, txIndex),
+	if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("block_transaction %s:%d", blockHash, txIndex),
 		`INSERT INTO block_transactions (block_hash, tx_index, txid, wtxid)
 		 VALUES ($1,$2,$3,$4) ON CONFLICT (block_hash, tx_index) DO NOTHING`,
 		`SELECT txid = $3 AND wtxid = $4 FROM block_transactions WHERE block_hash = $1 AND tx_index = $2`,
@@ -169,8 +340,21 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		return err
 	}
 
+	if !transactionFresh {
+		if err := verifyExactCount(ctx, tx, "transaction_inputs for "+txn.TxID,
+			`SELECT count(*) FROM transaction_inputs WHERE txid = $1`, []any{txn.TxID}, len(txn.Inputs),
+		); err != nil {
+			return err
+		}
+		if err := verifyExactCount(ctx, tx, "transaction_outputs for "+txn.TxID,
+			`SELECT count(*) FROM transaction_outputs WHERE txid = $1`, []any{txn.TxID}, len(txn.Outputs),
+		); err != nil {
+			return err
+		}
+	}
+
 	for _, in := range txn.Inputs {
-		if err := applyInput(ctx, tx, txn.TxID, txn.WTxID, in); err != nil {
+		if err := applyInput(ctx, tx, txn.TxID, txn.WTxID, in, variantFresh); err != nil {
 			return err
 		}
 	}
@@ -233,23 +417,39 @@ func checkPrevout(ctx context.Context, tx pgx.Tx, prevTxid string, prevVout int,
 }
 
 // markSpent records that (prevTxid, prevVout) was spent by
-// (spenderTxid, spenderVin) in spendingBlockHash. The WHERE spent = false
-// guard makes this a safe no-op when checkPrevout already confirmed the
-// row is spent by exactly this input (idempotent replay) — by the time
-// this runs, checkPrevout has already ruled out every other case. Returns
-// the spent output's destination address, if any, for address-cache
-// touch-tracking.
+// (spenderTxid, spenderVin) in spendingBlockHash. It never assumes the
+// UPDATE succeeded just because checkPrevout earlier saw spent = false:
+// RowsAffected is inspected directly, and a zero-row result triggers a
+// re-read to distinguish "already spent by exactly this input"
+// (idempotent replay — a safe no-op) from a genuine conflict
+// (ErrDoubleSpend) rather than silently treating zero rows as success.
+// Returns the spent output's destination address, if any, for
+// address-cache touch-tracking.
 func markSpent(ctx context.Context, tx pgx.Tx, prevTxid string, prevVout int, spenderTxid string, spenderVin int, spendingBlockHash string) (string, error) {
-	if _, err := tx.Exec(ctx, `
+	tag, err := tx.Exec(ctx, `
 		UPDATE utxo_state
 		SET spent = true, spending_txid = $1, spending_vin_index = $2, spending_block_hash = $3
 		WHERE txid = $4 AND vout_index = $5 AND spent = false
-	`, spenderTxid, spenderVin, spendingBlockHash, prevTxid, prevVout); err != nil {
+	`, spenderTxid, spenderVin, spendingBlockHash, prevTxid, prevVout)
+	if err != nil {
 		return "", fmt.Errorf("store: mark spent %s:%d: %w", prevTxid, prevVout, err)
+	}
+	if tag.RowsAffected() == 0 {
+		var spendingTxid *string
+		var spendingVinIndex *int64
+		err := tx.QueryRow(ctx, `SELECT spending_txid, spending_vin_index FROM utxo_state WHERE txid = $1 AND vout_index = $2`, prevTxid, prevVout).
+			Scan(&spendingTxid, &spendingVinIndex)
+		if err != nil {
+			return "", fmt.Errorf("store: re-read spend state %s:%d: %w", prevTxid, prevVout, err)
+		}
+		idempotent := spendingTxid != nil && *spendingTxid == spenderTxid && spendingVinIndex != nil && int(*spendingVinIndex) == spenderVin
+		if !idempotent {
+			return "", fmt.Errorf("%w: %s:%d", ErrDoubleSpend, prevTxid, prevVout)
+		}
 	}
 
 	var addr string
-	err := tx.QueryRow(ctx, `SELECT address FROM output_addresses WHERE txid = $1 AND vout_index = $2`, prevTxid, prevVout).Scan(&addr)
+	err = tx.QueryRow(ctx, `SELECT address FROM output_addresses WHERE txid = $1 AND vout_index = $2`, prevTxid, prevVout).Scan(&addr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -259,7 +459,7 @@ func markSpent(ctx context.Context, tx pgx.Tx, prevTxid string, prevVout int, sp
 	return addr, nil
 }
 
-func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Input) error {
+func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Input, variantFresh bool) error {
 	var prevTxid *string
 	var prevVout *int64
 	var coinbase []byte
@@ -272,7 +472,7 @@ func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Inp
 		coinbase = in.Coinbase
 	}
 
-	if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_input %s:%d", txid, in.Index),
+	if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_input %s:%d", txid, in.Index),
 		`INSERT INTO transaction_inputs (txid, vin_index, prev_txid, prev_vout_index, coinbase, script_sig, sequence)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (txid, vin_index) DO NOTHING`,
 		`SELECT prev_txid IS NOT DISTINCT FROM $3 AND prev_vout_index IS NOT DISTINCT FROM $4
@@ -283,8 +483,23 @@ func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Inp
 		return err
 	}
 
+	// Witness completeness is checked per (wtxid, vin_index) — not
+	// aggregated across the whole wtxid — so a witness stack "moved" from
+	// one input to another (same total item count, different
+	// distribution) is caught here rather than only at an aggregate level:
+	// each vin's own count must match exactly if this wtxid was already
+	// observed before this call (variantFresh = false).
+	if !variantFresh {
+		if err := verifyExactCount(ctx, tx, fmt.Sprintf("transaction_input_witness for %s vin %d", wtxid, in.Index),
+			`SELECT count(*) FROM transaction_input_witness WHERE wtxid = $1 AND vin_index = $2`,
+			[]any{wtxid, int64(in.Index)}, len(in.Witness),
+		); err != nil {
+			return err
+		}
+	}
+
 	for itemIndex, item := range in.Witness {
-		if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_input_witness %s:%d:%d", wtxid, in.Index, itemIndex),
+		if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_input_witness %s:%d:%d", wtxid, in.Index, itemIndex),
 			`INSERT INTO transaction_input_witness (wtxid, txid, vin_index, item_index, data)
 			 VALUES ($1,$2,$3,$4,$5) ON CONFLICT (wtxid, vin_index, item_index) DO NOTHING`,
 			`SELECT txid = $2 AND data = $5
@@ -302,42 +517,76 @@ func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Inp
 // utxo_state row. Returns the destination address, if any, for
 // address-cache touch-tracking.
 func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out chain.Output) (string, error) {
-	if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_output %s:%d", txid, out.Index),
+	outputFresh, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_output %s:%d", txid, out.Index),
 		`INSERT INTO transaction_outputs (txid, vout_index, value_satoshis, script_pubkey, script_type, witness_version, witness_program)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (txid, vout_index) DO NOTHING`,
 		`SELECT value_satoshis = $3 AND script_pubkey = $4 AND script_type = $5
 		    AND witness_version IS NOT DISTINCT FROM $6 AND witness_program IS NOT DISTINCT FROM $7
 		 FROM transaction_outputs WHERE txid = $1 AND vout_index = $2`,
 		txid, int64(out.Index), out.Value.Satoshis(), out.ScriptPubKey, string(out.ScriptType), out.WitnessVersion, out.WitnessProgram,
-	); err != nil {
+	)
+	if err != nil {
 		return "", err
 	}
 
-	// output_addresses: balance-accounting destination ONLY. Never written
-	// for a multisig output (see docs/ARCHITECTURE.md §7/§13.A) — the
+	// output_addresses: balance-accounting destination ONLY, at most one
+	// row per output. Never written for a multisig output (see
+	// docs/ARCHITECTURE.md §7/§13.A) — the
 	// output_addresses_reject_multisig_trigger would reject it anyway, but
 	// we simply never attempt it, since Address is empty for the multisig
-	// outputs this codebase currently produces.
+	// outputs this codebase currently produces. On a replay
+	// (!outputFresh) that supplies NO address, a previously-persisted
+	// address row must not be silently left in place uncompared — that
+	// would be exactly the "one destination row iff the canonical Output
+	// supplies Address" completeness gap, just via omission rather than a
+	// content mismatch.
 	if out.Address != "" {
-		if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("output_address %s:%d", txid, out.Index),
+		if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("output_address %s:%d", txid, out.Index),
 			`INSERT INTO output_addresses (txid, vout_index, address) VALUES ($1,$2,$3) ON CONFLICT (txid, vout_index) DO NOTHING`,
 			`SELECT address = $3 FROM output_addresses WHERE txid = $1 AND vout_index = $2`,
 			txid, int64(out.Index), out.Address,
 		); err != nil {
 			return "", err
 		}
+	} else if !outputFresh {
+		var exists bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM output_addresses WHERE txid = $1 AND vout_index = $2)`, txid, int64(out.Index)).Scan(&exists); err != nil {
+			return "", fmt.Errorf("store: check existing output_address %s:%d: %w", txid, out.Index, err)
+		}
+		if exists {
+			return "", fmt.Errorf("%w: output %s:%d previously had a destination address, now supplies none", ErrImmutableConflict, txid, out.Index)
+		}
 	}
 
 	// output_participants: MULTISIG search/display identities ONLY, never
 	// used for balance accounting (see recomputeAddress, which only ever
-	// reads output_addresses).
+	// reads output_addresses). ParticipantAddresses is documented as
+	// parallel to PubKeys (chain.Output) — that relationship is required
+	// explicitly here, not silently tolerated: a shape mismatch, or any
+	// empty address, is rejected rather than quietly skipping the
+	// offending entries, and (on replay) the persisted participant count
+	// must exactly match what's supplied, same as every other child set.
 	if out.ScriptType == script.TypeMultisig {
-		for i, pubkey := range out.PubKeys {
-			if i >= len(out.ParticipantAddresses) || out.ParticipantAddresses[i] == "" {
-				continue
+		if len(out.ParticipantAddresses) != len(out.PubKeys) {
+			return "", fmt.Errorf("%w: output %s:%d is multisig with %d pubkeys but %d participant addresses",
+				ErrImmutableConflict, txid, out.Index, len(out.PubKeys), len(out.ParticipantAddresses))
+		}
+		for i, addr := range out.ParticipantAddresses {
+			if addr == "" {
+				return "", fmt.Errorf("%w: output %s:%d participant %d has an empty address", ErrImmutableConflict, txid, out.Index, i)
 			}
+		}
+		if !outputFresh {
+			if err := verifyExactCount(ctx, tx, fmt.Sprintf("output_participants for %s:%d", txid, out.Index),
+				`SELECT count(*) FROM output_participants WHERE txid = $1 AND vout_index = $2`,
+				[]any{txid, int64(out.Index)}, len(out.PubKeys),
+			); err != nil {
+				return "", err
+			}
+		}
+		for i, pubkey := range out.PubKeys {
 			addr := out.ParticipantAddresses[i]
-			if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("output_participant %s:%d:%s", txid, out.Index, addr),
+			if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("output_participant %s:%d:%s", txid, out.Index, addr),
 				`INSERT INTO output_participants (txid, vout_index, address, pubkey) VALUES ($1,$2,$3,$4) ON CONFLICT (txid, vout_index, address) DO NOTHING`,
 				`SELECT pubkey = $4 FROM output_participants WHERE txid = $1 AND vout_index = $2 AND address = $3`,
 				txid, int64(out.Index), addr, pubkey,
@@ -351,7 +600,7 @@ func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out cha
 	// SQL only compares creation_block_hash, never spent/spending_* — a
 	// conflict check here must never disturb a row's current mutable spend
 	// status (see docs/ARCHITECTURE.md §16).
-	if err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("utxo_state creation %s:%d", txid, out.Index),
+	if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("utxo_state creation %s:%d", txid, out.Index),
 		`INSERT INTO utxo_state (txid, vout_index, creation_block_hash) VALUES ($1,$2,$3) ON CONFLICT (txid, vout_index) DO NOTHING`,
 		`SELECT creation_block_hash = $3 FROM utxo_state WHERE txid = $1 AND vout_index = $2`,
 		txid, int64(out.Index), blockHash,
