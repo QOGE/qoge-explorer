@@ -89,35 +89,69 @@ type AddressHistoryPage struct {
 // AddressHistory returns address's canonical transaction history,
 // newest-first, keyset-paginated by (block height, txid). beforeHeight/
 // beforeTxID must both be nil (first page) or both non-nil (a cursor
-// returned by a previous call). Built entirely from utxo_state
-// (creation/spending occurrences), which internal/store already keeps
-// canonical-only via RollbackTo — an orphaned output's creation or spend
-// never appears here. Multisig participant identities never appear in this
-// history — searching by participant address, if ever exposed, must remain
-// a structurally separate query (docs/ARCHITECTURE.md §13.A).
+// returned by a previous call).
+//
+// Built from IMMUTABLE destination/input relations
+// (output_addresses/transaction_inputs) joined against canonical block
+// OCCURRENCE state (block_transactions/blocks), never from utxo_state —
+// utxo_state is deliberately missing a row for every genesis output and
+// every script.IsUnspendable output (see Store.ApplyBlock's "Core UTXO
+// semantics" doc comment in internal/store/apply.go), so gating history
+// visibility on a utxo_state row existing would silently drop those
+// outputs' real canonical transaction history even though
+// transaction_outputs/output_addresses both persist them — see
+// docs/ARCHITECTURE.md §19 "Address history vs. UTXO eligibility". Balance
+// accounting (AddressSummary) is intentionally unaffected by this — it
+// still reads the `addresses` cache exactly as before, so a genesis-only
+// destination shows real history with zero spendable balance, not the
+// other way around.
+//
+//   - RECEIVE side: output_addresses -> transaction_outputs (proves the
+//     output really has this address, txid, vout) -> block_transactions
+//     (that txid's occurrence) -> blocks WHERE canonical.
+//   - SPEND side: output_addresses' (txid, vout_index) -> transaction_inputs
+//     whose (prev_txid, prev_vout_index) reference exactly that output
+//     (transaction_inputs is immutable per-transaction body data, kept
+//     forever regardless of branch — see §3 "Reorg keeps an audit trail" —
+//     so this alone would include orphaned spend attempts) -> the SPENDING
+//     transaction's own block_transactions/blocks WHERE canonical, which is
+//     what actually restricts this to canonical spends only.
+//
+// An orphaned output's creation or spend never appears here — both sides
+// require a canonical block_transactions/blocks join, exactly mirroring
+// how RollbackTo already keeps utxo_state/addresses canonical-only.
+// Multisig participant identities (output_participants) never appear in
+// this history — searching by participant address, if ever exposed, must
+// remain a structurally separate query (docs/ARCHITECTURE.md §13.A).
 func (s *Store) AddressHistory(ctx context.Context, address string, beforeHeight *int64, beforeTxID *string, pageSize int) (AddressHistoryPage, error) {
 	pageSize = clampPageSize(pageSize)
 
 	rows, err := s.pool.Query(ctx, `
-		WITH addr_utxos AS (
-			SELECT o.txid AS created_txid, u.creation_block_hash, u.creation_block_height,
-			       u.spent, u.spending_txid, u.spending_block_hash, u.spending_block_height
+		WITH received AS (
+			SELECT bt.txid, bt.block_hash, bt.block_height
 			FROM output_addresses oa
 			JOIN transaction_outputs o ON o.txid = oa.txid AND o.vout_index = oa.vout_index
-			JOIN utxo_state u ON u.txid = oa.txid AND u.vout_index = oa.vout_index
+			JOIN block_transactions bt ON bt.txid = oa.txid
+			JOIN blocks b ON b.hash = bt.block_hash AND b.canonical
+			WHERE oa.address = $1
+		),
+		spent AS (
+			SELECT bt.txid, bt.block_hash, bt.block_height
+			FROM output_addresses oa
+			JOIN transaction_inputs ti ON ti.prev_txid = oa.txid AND ti.prev_vout_index = oa.vout_index
+			JOIN block_transactions bt ON bt.txid = ti.txid
+			JOIN blocks b ON b.hash = bt.block_hash AND b.canonical
 			WHERE oa.address = $1
 		),
 		touches AS (
-			SELECT created_txid AS txid, creation_block_hash AS block_hash, creation_block_height AS height
-			FROM addr_utxos
+			SELECT txid, block_hash, block_height FROM received
 			UNION
-			SELECT spending_txid AS txid, spending_block_hash AS block_hash, spending_block_height AS height
-			FROM addr_utxos WHERE spent
+			SELECT txid, block_hash, block_height FROM spent
 		)
-		SELECT DISTINCT txid, block_hash, height
+		SELECT DISTINCT txid, block_hash, block_height
 		FROM touches
-		WHERE $2::bigint IS NULL OR height < $2 OR (height = $2 AND txid < $3)
-		ORDER BY height DESC, txid DESC
+		WHERE $2::bigint IS NULL OR block_height < $2 OR (block_height = $2 AND txid < $3)
+		ORDER BY block_height DESC, txid DESC
 		LIMIT $4
 	`, address, beforeHeight, beforeTxID, pageSize)
 	if err != nil {

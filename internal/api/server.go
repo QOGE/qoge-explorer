@@ -31,6 +31,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// knownGETRoutes lists every route pattern this API serves — every one of
+// them is GET-only today. routes() registers each pattern twice: once as
+// "GET <pattern>" for the real handler, and once as the bare "<pattern>"
+// (method-agnostic) for a JSON 405. net/http.ServeMux resolves a request
+// against the MORE SPECIFIC pattern first — a method-qualified pattern
+// beats a bare one for a request whose method matches — so a GET request
+// hits the real handler and any other method falls through to the 405
+// registration for that exact path (confirmed directly against the
+// stdlib: see internal/api's review notes / git history). This is why a
+// naive single catch-all "/" registered ALONE (an earlier version of this
+// file did that) is wrong: an unrestricted-method "/" pattern is itself a
+// valid match for a wrong-method request on a real path, which pre-empts
+// net/http's own built-in 405 detection and silently turns it into a 404
+// instead.
+var knownGETRoutes = []string{
+	"/healthz",
+	"/readyz",
+	"/api/v1/status",
+	"/api/v1/blocks",
+	"/api/v1/block/{id}",
+	"/api/v1/tx/{id}",
+	"/api/v1/address/{address}",
+	"/api/v1/address/{address}/transactions",
+}
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /readyz", s.handleReadyz)
@@ -45,18 +70,17 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/v1/address/{address}", s.handleAddress)
 	s.mux.HandleFunc("GET /api/v1/address/{address}/transactions", s.handleAddressHistory)
 
-	// Deliberately no catch-all "/" pattern: registering one would make it
-	// a valid (if low-priority) match for every method, including on a
-	// path that DOES have a route registered under a different method —
-	// which silently defeats net/http.ServeMux's own automatic 405
-	// Method Not Allowed detection (confirmed via the stdlib: a
-	// registered "/" handler intercepts a wrong-method request as a 404
-	// match instead of it hitting mux's built-in 405 path). Leaving no
-	// catch-all means a truly unmatched route gets net/http's own 404,
-	// and a wrong method on a real route gets its own automatic 405 (with
-	// an Allow header) — both correct status codes, just plain-text
-	// bodies rather than the JSON error envelope every handled route
-	// below returns for its own 400/404s.
+	for _, pattern := range knownGETRoutes {
+		s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			writeMethodNotAllowed(w, http.MethodGet)
+		})
+	}
+
+	// Final fallback: any path not matched by any pattern above (with any
+	// method) gets a JSON 404, never net/http's plain-text default.
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeNotFound(w, "no such route")
+	})
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {

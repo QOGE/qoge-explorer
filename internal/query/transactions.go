@@ -87,36 +87,57 @@ type TransactionDetail struct {
 // (Core's GetHash(), RPC field "txid"). The witness variant shown
 // (WTxID/Size/VSize/Weight/witness metadata) is the CANONICAL occurrence's
 // variant if one exists, otherwise the most recently observed orphaned
-// variant — see pickRepresentativeWTxID.
+// variant — see pickRepresentativeWTxID. Every read that makes up the
+// response — the transaction body, its occurrences/canonical flags, the
+// chosen variant, witness data, inputs, and outputs/utxo_state — comes
+// from ONE read-only REPEATABLE READ snapshot (readTx), so a concurrent
+// reorg can never produce a response mixing pre- and post-reorg state —
+// see docs/ARCHITECTURE.md §19 "Multi-statement read consistency".
 func (s *Store) TransactionByTxID(ctx context.Context, txid string, includeRawWitness bool) (TransactionDetail, error) {
-	return s.transactionDetail(ctx, txid, nil, includeRawWitness)
+	tx, done, err := s.readTx(ctx)
+	if err != nil {
+		return TransactionDetail{}, err
+	}
+	defer done()
+	return transactionDetail(ctx, tx, txid, nil, includeRawWitness)
 }
 
 // TransactionByWTxID looks up a transaction by a specific witness variant's
 // identity (Core's GetWitnessHash(), RPC field "hash"). Unlike
 // TransactionByTxID, the variant shown is always exactly the one requested
 // — canonical or not — never silently substituted for a different variant
-// of the same txid.
+// of the same txid. The wtxid->txid identity resolution and every
+// subsequent detail read share the SAME read-only REPEATABLE READ
+// snapshot — resolving the identity in a separate, earlier statement
+// (as an initial version of this code did) would let a concurrent reorg
+// land between identity resolution and detail reads.
 func (s *Store) TransactionByWTxID(ctx context.Context, wtxid string, includeRawWitness bool) (TransactionDetail, error) {
+	tx, done, err := s.readTx(ctx)
+	if err != nil {
+		return TransactionDetail{}, err
+	}
+	defer done()
+
 	var txid string
-	err := s.pool.QueryRow(ctx, `SELECT txid FROM transaction_variants WHERE wtxid = $1`, wtxid).Scan(&txid)
+	err = tx.QueryRow(ctx, `SELECT txid FROM transaction_variants WHERE wtxid = $1`, wtxid).Scan(&txid)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return TransactionDetail{}, ErrNotFound
 	}
 	if err != nil {
 		return TransactionDetail{}, fmt.Errorf("query: transaction variant %s: %w", wtxid, err)
 	}
-	return s.transactionDetail(ctx, txid, &wtxid, includeRawWitness)
+	return transactionDetail(ctx, tx, txid, &wtxid, includeRawWitness)
 }
 
-// transactionDetail builds a TransactionDetail for txid. preferredWTxID, if
-// non-nil, pins the shown variant to exactly that wtxid (TransactionByWTxID
+// transactionDetail builds a TransactionDetail for txid using q — the
+// caller's read-only snapshot transaction. preferredWTxID, if non-nil,
+// pins the shown variant to exactly that wtxid (TransactionByWTxID
 // callers); nil lets pickRepresentativeWTxID choose (TransactionByTxID
 // callers).
-func (s *Store) transactionDetail(ctx context.Context, txid string, preferredWTxID *string, includeRawWitness bool) (TransactionDetail, error) {
+func transactionDetail(ctx context.Context, q querier, txid string, preferredWTxID *string, includeRawWitness bool) (TransactionDetail, error) {
 	var d TransactionDetail
 	var fee *int64
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT txid, version, locktime, is_coinbase, fee_satoshis FROM transactions WHERE txid = $1
 	`, txid).Scan(&d.TxID, &d.Version, &d.LockTime, &d.IsCoinbase, &fee)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -125,13 +146,14 @@ func (s *Store) transactionDetail(ctx context.Context, txid string, preferredWTx
 	if err != nil {
 		return TransactionDetail{}, fmt.Errorf("query: transaction %s: %w", txid, err)
 	}
+	fireSnapshotTestHook() // snapshot is now fixed as of this first statement
 	if fee != nil {
 		d.FeeSatoshis = fee
 		q := chain.Amount(*fee).String()
 		d.FeeQOGE = &q
 	}
 
-	occurrences, err := s.txOccurrences(ctx, txid)
+	occurrences, err := txOccurrences(ctx, q, txid)
 	if err != nil {
 		return TransactionDetail{}, err
 	}
@@ -143,24 +165,24 @@ func (s *Store) transactionDetail(ctx context.Context, txid string, preferredWTx
 	}
 	d.WTxID = wtxid
 
-	if err := s.pool.QueryRow(ctx, `
+	if err := q.QueryRow(ctx, `
 		SELECT size, vsize, weight FROM transaction_variants WHERE wtxid = $1
 	`, wtxid).Scan(&d.Size, &d.VSize, &d.Weight); err != nil {
 		return TransactionDetail{}, fmt.Errorf("query: transaction variant %s: %w", wtxid, err)
 	}
 
-	witnessByVin, err := s.witnessByVin(ctx, wtxid, includeRawWitness)
+	witnessByVin, err := witnessByVin(ctx, q, wtxid, includeRawWitness)
 	if err != nil {
 		return TransactionDetail{}, err
 	}
 
-	inputs, err := s.txInputs(ctx, txid, witnessByVin)
+	inputs, err := txInputs(ctx, q, txid, witnessByVin)
 	if err != nil {
 		return TransactionDetail{}, err
 	}
 	d.Inputs = inputs
 
-	outputs, err := s.txOutputs(ctx, txid)
+	outputs, err := txOutputs(ctx, q, txid)
 	if err != nil {
 		return TransactionDetail{}, err
 	}
@@ -198,8 +220,8 @@ func pickRepresentativeWTxID(txid string, occurrences []TxOccurrence, preferred 
 	return best.WTxID, nil
 }
 
-func (s *Store) txOccurrences(ctx context.Context, txid string) ([]TxOccurrence, error) {
-	rows, err := s.pool.Query(ctx, `
+func txOccurrences(ctx context.Context, q querier, txid string) ([]TxOccurrence, error) {
+	rows, err := q.Query(ctx, `
 		SELECT b.hash, bt.block_height, bt.tx_index, bt.wtxid, b.canonical
 		FROM block_transactions bt
 		JOIN blocks b ON b.hash = bt.block_hash
@@ -230,16 +252,16 @@ func (s *Store) txOccurrences(ctx context.Context, txid string) ([]TxOccurrence,
 // PostgreSQL at all when includeRaw is true — a P2QPK signature item alone
 // is 17,088 bytes, and this must never be pulled for an ordinary
 // transaction-detail response (docs/ARCHITECTURE.md §19).
-func (s *Store) witnessByVin(ctx context.Context, wtxid string, includeRaw bool) (map[int][]WitnessItem, error) {
+func witnessByVin(ctx context.Context, q querier, wtxid string, includeRaw bool) (map[int][]WitnessItem, error) {
 	var rows pgx.Rows
 	var err error
 	if includeRaw {
-		rows, err = s.pool.Query(ctx, `
+		rows, err = q.Query(ctx, `
 			SELECT vin_index, item_index, data FROM transaction_input_witness
 			WHERE wtxid = $1 ORDER BY vin_index, item_index
 		`, wtxid)
 	} else {
-		rows, err = s.pool.Query(ctx, `
+		rows, err = q.Query(ctx, `
 			SELECT vin_index, item_index, octet_length(data) FROM transaction_input_witness
 			WHERE wtxid = $1 ORDER BY vin_index, item_index
 		`, wtxid)
@@ -275,8 +297,8 @@ func (s *Store) witnessByVin(ctx context.Context, wtxid string, includeRaw bool)
 	return result, nil
 }
 
-func (s *Store) txInputs(ctx context.Context, txid string, witnessByVin map[int][]WitnessItem) ([]InputDetail, error) {
-	rows, err := s.pool.Query(ctx, `
+func txInputs(ctx context.Context, q querier, txid string, witnessByVin map[int][]WitnessItem) ([]InputDetail, error) {
+	rows, err := q.Query(ctx, `
 		SELECT vin_index, prev_txid, prev_vout_index, coinbase, script_sig, sequence
 		FROM transaction_inputs WHERE txid = $1 ORDER BY vin_index
 	`, txid)
@@ -313,8 +335,8 @@ func (s *Store) txInputs(ctx context.Context, txid string, witnessByVin map[int]
 	return inputs, nil
 }
 
-func (s *Store) txOutputs(ctx context.Context, txid string) ([]OutputDetail, error) {
-	rows, err := s.pool.Query(ctx, `
+func txOutputs(ctx context.Context, q querier, txid string) ([]OutputDetail, error) {
+	rows, err := q.Query(ctx, `
 		SELECT o.vout_index, o.value_satoshis, o.script_pubkey, o.script_type,
 		       o.witness_version, o.witness_program, oa.address, u.spent
 		FROM transaction_outputs o
@@ -350,7 +372,7 @@ func (s *Store) txOutputs(ctx context.Context, txid string) ([]OutputDetail, err
 		return nil, fmt.Errorf("query: outputs for %s: %w", txid, err)
 	}
 
-	if err := s.attachParticipants(ctx, txid, outputs); err != nil {
+	if err := attachParticipants(ctx, q, txid, outputs); err != nil {
 		return nil, err
 	}
 	return outputs, nil
@@ -360,7 +382,7 @@ func (s *Store) txOutputs(ctx context.Context, txid string) ([]OutputDetail, err
 // outputs, in place. Participant addresses are search/display identities
 // only (output_participants) — never merged into Address, which remains
 // the sole balance-accounting destination field (docs/ARCHITECTURE.md §7).
-func (s *Store) attachParticipants(ctx context.Context, txid string, outputs []OutputDetail) error {
+func attachParticipants(ctx context.Context, q querier, txid string, outputs []OutputDetail) error {
 	byVout := make(map[int]*OutputDetail, len(outputs))
 	for i := range outputs {
 		if outputs[i].ScriptType == "multisig" {
@@ -371,7 +393,7 @@ func (s *Store) attachParticipants(ctx context.Context, txid string, outputs []O
 		return nil
 	}
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT vout_index, address FROM output_participants WHERE txid = $1 ORDER BY vout_index, address
 	`, txid)
 	if err != nil {

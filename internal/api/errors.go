@@ -32,6 +32,14 @@ func writeNotFound(w http.ResponseWriter, message string) {
 	writeError(w, http.StatusNotFound, "not_found", message)
 }
 
+// writeMethodNotAllowed sets an Allow header (the RFC 7231-recommended way
+// to advertise which methods a resource actually accepts) alongside the
+// JSON error envelope.
+func writeMethodNotAllowed(w http.ResponseWriter, allow string) {
+	w.Header().Set("Allow", allow)
+	writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
+}
+
 // writeInternalError logs the real error server-side (never a stack trace
 // to the client) and returns a generic 500 body that never leaks a SQL
 // string or any internal detail.

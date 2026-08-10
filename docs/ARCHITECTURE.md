@@ -2141,21 +2141,123 @@ through its exported API.
 There is no separate read-only database role in this phase (task-scoped
 out; `query.Store` shares `Store`'s pool and its ordinary write
 privileges at the connection level) — the guarantee is structural, not
-credential-based: every query in `internal/query/*.go` is a `SELECT`,
-verified by `internal/query/readonly_test.go`, which snapshots row counts
+credential-based: every query in `internal/query/*.go` is a `SELECT`.
+Verified by `internal/query/readonly_test.go` two ways: (1) row COUNTS
 across every mutable table (`blocks`, `transactions`,
 `transaction_variants`, `block_transactions`, `transaction_inputs`,
 `transaction_input_witness`, `transaction_outputs`, `addresses`,
-`output_addresses`, `output_participants`, `utxo_state`) plus
-`sync_state.indexed_height`, runs a broad sweep of every exported query
-call (including not-found error paths), and requires exact equality
-before/after. `query.Store` never calls `lockCheckpoint`'s row lock
+`output_addresses`, `output_participants`, `utxo_state`) — a coarse,
+cheap check that nothing was inserted or deleted; and (2) exact table
+CONTENT for every column an UPDATE could realistically touch —
+`sync_state` (height/hash), `blocks` (`canonical`, `orphaned_at IS
+NULL`), `utxo_state` (identity, creation, spend state in full), and
+`addresses` (every cached balance field) — via `mutableContentSnapshot`,
+compared with `reflect.DeepEqual`. Row counts alone cannot catch an
+UPDATE-only mutation (`blocks.canonical` flipping, `utxo_state.spent`
+flipping, `addresses.balance_satoshis` changing) — the leaves-count-
+unchanged class of bug review specifically flagged — which is exactly
+what the content comparison exists to catch; it was verified (in a
+throwaway, not-committed test) to actually fail when a `blocks.canonical`
+flip was injected between snapshots, before being relied on as a real
+regression gate. `query.Store` never calls `lockCheckpoint`'s row lock
 (`internal/store/store.go`) — ordinary reads are never serialized behind
-canonical-mutation writers, matching Postgres's default READ COMMITTED
-isolation: each individual `SELECT`/multi-statement handler sees a
-consistent, committed snapshot as of when it runs, and the API is
-expected to tolerate the indexer concurrently advancing canonical state
-between two separate requests (there is no cross-request transaction).
+canonical-mutation writers.
+
+### Multi-statement read consistency
+
+A single `SELECT` is trivially internally consistent — Postgres gives it
+one statement-level snapshot regardless of isolation level, so
+single-statement methods (`Status`, `RecentBlocks`, `AddressSummary`,
+`AddressHistory`) need nothing extra.
+
+A DETAIL response assembled from several related `SELECT`s is a different
+problem. Under the default READ COMMITTED isolation, EACH statement in an
+implicit (non-transactional) sequence gets its OWN, independently-taken
+snapshot — read committed does **not** make a multi-statement handler
+behave as one consistent snapshot, and an earlier draft of this section
+incorrectly claimed otherwise. Concretely, without explicit
+transactional scoping, `TransactionByTxID` could read `block_transactions`
++ `blocks` and see branch A (`canonical: true`), then have a concurrent
+`Store.RollbackTo` + `Store.ApplyBlock` sequence commit a full reorg to
+branch B, and only THEN read `utxo_state` for the outputs — observing
+branch B's spend state. The resulting JSON response would silently mix
+two different committed states that never coexisted.
+
+The fix: `TransactionByTxID`, `TransactionByWTxID`, `BlockByHeight`, and
+`BlockByHash` each open one explicit `pgx.Tx` via `Store.readTx`
+(`internal/query/query.go`) —
+
+```go
+pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}
+```
+
+— before issuing any of their statements. PostgreSQL fixes a REPEATABLE
+READ transaction's snapshot at its FIRST statement and holds it for
+every later statement in the same transaction, so every read composing
+one response — for `TransactionByTxID`/`TransactionByWTxID`: the
+transaction body, block occurrences/canonical flags, the chosen witness
+variant, witness data, inputs, and outputs/`utxo_state`; for
+`BlockByHeight`/`BlockByHash`: the header/canonical flag and its ordered
+transaction list — comes from one indivisible view, no matter what
+commits concurrently in the meantime. `AccessMode: ReadOnly` means the
+transaction takes no locks a writer would ever wait on — it never
+acquires `lockCheckpoint`'s row lock and never blocks `ApplyBlock`/
+`RollbackTo` beyond PostgreSQL's ordinary MVCC bookkeeping. The
+transaction is always rolled back (`readTx`'s returned `done` func), never
+committed — there is nothing to persist either way, so an abandon is
+exactly as correct as a commit and simpler to reason about.
+
+For `TransactionByWTxID` specifically, the wtxid→txid identity resolution
+is the transaction's FIRST statement, inside the same `pgx.Tx` as every
+subsequent detail read — resolving it as an earlier, separate statement
+(which an initial version of this code did) would let a concurrent reorg
+land in the gap between identity resolution and the detail reads that
+depend on it.
+
+Private helpers below `Store`'s exported methods (`txOccurrences`,
+`witnessByVin`, `txInputs`, `txOutputs`, `attachParticipants`,
+`blockTxRefs`) take a `querier` interface —
+
+```go
+type querier interface {
+    Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+    QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+```
+
+— rather than being hardcoded to `s.pool`, so the identical SQL runs
+whether the caller is a single-statement method passing the pool directly
+or a multi-statement method passing its `pgx.Tx`. This is deliberately
+just an interface (both `*pgxpool.Pool` and `pgx.Tx` already satisfy it),
+not a query builder or ORM.
+
+`internal/query/snapshot_test.go` proves this deterministically — never
+via `sleep` — using a package-level test hook
+(`snapshotTestHook`, always `nil` in production) invoked exactly once,
+synchronously, immediately after a wrapped method's first statement has
+fixed its snapshot. The test blocks the in-flight query there, commits a
+full reorg through the REAL `Store` (`RollbackTo` + two `ApplyBlock`
+calls) on a concurrent goroutine, then releases the hook and asserts the
+in-flight response still reflects branch-A truth (`canonical: true` for
+a block/occurrence that is, by the time the response is actually
+returned, already orphaned) while a brand-new query issued afterward
+correctly sees branch B. Covers both `TransactionByTxID` (combining
+canonical occurrence state with mutable `utxo_state` — the review's
+specific concern) and `BlockByHash`.
+
+### Cross-request consistency (intentionally not guaranteed)
+
+Snapshot consistency is a per-response guarantee, not a per-connection or
+per-session one. Two SEPARATE API requests — even milliseconds apart —
+are two separate `readTx` calls with two separate snapshots; a later
+request may legitimately observe newer indexed state than an earlier one
+did, including a block that was canonical in the first response's
+snapshot becoming orphaned by the time the second request runs. This is
+expected and correct: the API is explicitly designed to tolerate the
+indexer concurrently advancing canonical state between requests (§19's
+opening summary), and nothing in this phase holds any cross-request
+transaction or lock — doing so would contradict "never acquire
+`lockCheckpoint`" above and would block the indexer for no benefit.
 
 ### Canonical vs. orphan semantics
 
@@ -2258,14 +2360,64 @@ schema has no address-validity concept to distinguish "malformed
 address" from "syntactically fine, never used" — `AddressSummary`'s doc
 comment in `internal/query/addresses.go` states this explicitly.
 `output_participants` (bare-multisig co-signer identities, §7/§13.A)
-never contributes to `AddressSummary` or `AddressHistory` — both are
-built exclusively from `output_addresses`/`utxo_state`. A multisig
-output's participants ARE surfaced, but only as `OutputDetail.
+never contributes to `AddressSummary` or `AddressHistory`. Balance
+(`AddressSummary`) is built exclusively from the `addresses` cache, as
+above; history (`AddressHistory`) is built from IMMUTABLE destination/
+input relations (`output_addresses`/`transaction_inputs`) joined against
+canonical block OCCURRENCE state (`block_transactions`/`blocks WHERE
+canonical`) — deliberately NOT from `utxo_state` (see "Address history
+vs. UTXO eligibility" below), even though the two happen to agree for
+every ordinary spendable output. A multisig output's participants ARE
+surfaced, but only as `OutputDetail.
 Participants []string` on the owning TRANSACTION's output list
 (`attachParticipants`, `internal/query/transactions.go`) — structurally
 separate from `Address` (the sole balance-accounting field) on the same
 struct, so a caller can never mistake "who could sign this" for "who
 owns this."
+
+### Address history vs. UTXO eligibility
+
+Balance semantics and historical visibility are two different questions,
+and an earlier version of `AddressHistory` conflated them: it joined
+`output_addresses` through `utxo_state` for BOTH the receive and spend
+sides, which makes UTXO eligibility a silent prerequisite for even
+APPEARING in an address's history. That drops legitimate canonical
+destinations `Store` genuinely persists but Core intentionally never
+inserts into its UTXO set at all — `utxo_state` is deliberately missing a
+row for every height-0 (genesis) output AND every `script.IsUnspendable`
+output, regardless of height (`Store.ApplyBlock`'s "Core UTXO semantics"
+doc comment, `internal/store/apply.go`). The clearest concrete case: the
+genesis coinbase's destination address has real, canonical
+`transaction_outputs`/`output_addresses` rows, forever — but with the old
+query, its address history was silently empty.
+
+The fix keeps `AddressSummary`'s balance semantics completely unchanged
+(still exclusively the `addresses` cache — a genesis-only destination
+correctly shows a zero balance, since Core never treats that coinbase as
+spendable) and rebuilds `AddressHistory` to require only canonical block
+OCCURRENCE, never UTXO eligibility:
+
+  - RECEIVE side: `output_addresses` → `transaction_outputs` (proves the
+    output really has this exact address/txid/vout) → `block_transactions`
+    (that txid's occurrence) → `blocks WHERE canonical`.
+  - SPEND side: `output_addresses`' `(txid, vout_index)` →
+    `transaction_inputs` whose `(prev_txid, prev_vout_index)` reference
+    exactly that output. `transaction_inputs` is immutable per-transaction
+    body data kept forever regardless of branch (§3 "Reorg keeps an audit
+    trail"), so this step ALONE would include orphaned spend attempts —
+    it's the join through the SPENDING transaction's own
+    `block_transactions`/`blocks WHERE canonical` that actually restricts
+    results to canonical spends only.
+
+An orphaned output's creation or spend still never appears (both sides
+require their own canonical `block_transactions`/`blocks` join) —
+verified directly, alongside the genesis case, reorg branch-following,
+flip-back, and multisig-participant exclusion, by
+`internal/query/addresses_test.go`'s
+`TestAddressHistory_GenesisDestinationVisibleDespiteZeroBalance`,
+`TestAddressHistory_ReorgAndFlipBack`,
+`TestAddressHistory_CanonicalSpendAppears`, and
+`TestAddressHistory_MultisigParticipantsExcluded`.
 
 ### API routes and versioning
 
@@ -2288,16 +2440,31 @@ GET /api/v1/address/{address}/transactions
 
 No mutation endpoint exists (`internal/api/api_test.go`'s
 `TestNoMutationEndpoints` confirms `POST`/`PUT`/`PATCH`/`DELETE` never
-return 200 on an existing route). Errors use a consistent JSON envelope
-(`{"error":{"code":...,"message":...}}`, `internal/api/errors.go`) for
-every 400/404/500 a handler itself produces; a wrong HTTP method on a
-real route or a truly unregistered path falls through to
-`net/http.ServeMux`'s own automatic 405/404 (confirmed empirically that
-registering a catch-all `"/"` pattern would silently defeat the stdlib's
-built-in method-mismatch 405 detection — see `server.go`'s `routes()`
-doc comment — so no catch-all is registered; those two specific cases get
-the stdlib's plain-text body rather than the JSON envelope, still with
-the correct status code). List endpoints are keyset-paginated
+return 200 on an existing route). EVERY response uses a consistent JSON
+envelope for its errors (`{"error":{"code":...,"message":...}}`,
+`internal/api/errors.go`) — including a wrong HTTP method on a real route
+(405, `error.code = "method_not_allowed"`, with an `Allow` header) and a
+truly unregistered path (404, `error.code = "not_found"`), not just the
+400/404/500s individual handlers produce. `server.go`'s `routes()`
+registers each known path pattern TWICE: once as `"GET <pattern>"` for the
+real handler, once as the bare, method-agnostic `"<pattern>"` returning
+the JSON 405. `net/http.ServeMux` resolves a request against the more
+specific of two overlapping patterns — a method-qualified pattern beats a
+bare one for a request whose method actually matches it — so a GET hits
+the real handler and any other method falls through to that path's 405
+registration; a final unrestricted-method `"/"` pattern catches anything
+left over as the JSON 404. This is the opposite of what a naive single
+catch-all does: registering ONLY an unrestricted `"/"` pattern (with no
+per-path 405 registrations) makes it a valid, if low-priority, match for
+a WRONG-method request on a real path too — which was confirmed directly
+against the stdlib to silently turn a should-be-405 into a 404 instead,
+and is exactly the bug an earlier version of this file had (see
+`internal/api/server.go`'s `knownGETRoutes`/`routes()` doc comments for
+the full mechanism, and `TestMethodNotAllowed`/`TestUnknownRoute` in
+`internal/api/api_test.go` for the routing-precedence proof: GET on a
+known route reaches the real handler, every other method on that same
+route gets a JSON 405 with `Allow`, an unknown path gets a JSON 404
+regardless of method). List endpoints are keyset-paginated
 (`before`/`before_txid` cursors, never raw `OFFSET`) with a hard maximum
 page size (`query.MaxPageSize = 100`) enforced in the query layer
 regardless of what a caller requests. Identifier validation happens
@@ -2325,17 +2492,20 @@ signal handling.
 
 ### Testing
 
-`internal/query`'s tests (A–T in the phase task list) build every fixture
-through the real `Store.ApplyBlock`/`RollbackTo` — never ad-hoc SQL —
-using either plain `chain.Block` literals or, for the P2QPK/P2TR/real
-script-type vectors, the actual `decode.DecodeBlock` pipeline
+`internal/query`'s tests (A–T in the phase task list, plus a dedicated
+`snapshot_test.go` for concurrent-reorg snapshot consistency — see
+"Multi-statement read consistency" above) build every fixture through the
+real `Store.ApplyBlock`/`RollbackTo` — never ad-hoc SQL — using either
+plain `chain.Block` literals or, for the P2QPK/P2TR/real script-type
+vectors, the actual `decode.DecodeBlock` pipeline
 (`decoded_vectors_test.go`), so the query layer is always tested against
 data that passed through the same decoder/classifier every other phase
 already reviewed. `internal/api`'s tests exercise the same fixtures one
 layer up, through `Server.ServeHTTP` via `httptest`, confirming HTTP
-status codes, JSON shapes, and the witness opt-in behavior end-to-end.
-Both packages skip their PostgreSQL-backed tests (never fail `go test
-./...`) when `QOGE_TEST_DATABASE_URL` is unset, matching every prior
-phase's convention.
+status codes, JSON shapes, the witness opt-in behavior, and the JSON
+404/405 error-envelope routing precedence end-to-end. Both packages skip
+their PostgreSQL-backed tests (never fail `go test ./...`) when
+`QOGE_TEST_DATABASE_URL` is unset, matching every prior phase's
+convention.
 
 This phase does not implement a public explorer HTML web UI.

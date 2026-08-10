@@ -333,41 +333,100 @@ func TestAddressEndpoints(t *testing.T) {
 func TestErrorEnvelopeShape(t *testing.T) {
 	s, _ := newTestServer(t)
 	rec := doRequest(t, s, "GET", "/api/v1/block/not-valid")
-	assertErrorEnvelope(t, rec)
+	assertJSONError(t, rec, http.StatusBadRequest, "bad_request")
 }
 
+// assertErrorEnvelope checks the JSON error envelope shape (code/message
+// both present) and that the body never leaks internal detail, without
+// asserting a specific status/code — used where the caller already checked
+// those separately. rec.Body is only ever read here via its already-final
+// string form (Body.String() does not consume/advance the buffer, unlike
+// decoding straight from rec.Body, which would leave nothing for a second
+// check to read).
 func assertErrorEnvelope(t *testing.T, rec *httptest.ResponseRecorder) {
 	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	raw := rec.Body.String()
 	var body struct {
 		Error struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	decodeBody(t, rec, &body)
+	if err := json.Unmarshal([]byte(raw), &body); err != nil {
+		t.Fatalf("decode error body %q: %v", raw, err)
+	}
 	if body.Error.Code == "" || body.Error.Message == "" {
 		t.Fatalf("error envelope incomplete: %+v", body)
 	}
-	raw := rec.Body.String()
 	if strings.Contains(strings.ToLower(raw), "select ") || strings.Contains(raw, "password") {
 		t.Fatalf("error body leaks internal detail: %s", raw)
 	}
 }
 
+// assertJSONError additionally requires the exact status code and
+// error.code.
+func assertJSONError(t *testing.T, rec *httptest.ResponseRecorder, wantStatus int, wantCode string) {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("status = %d, want %d (body=%s)", rec.Code, wantStatus, rec.Body.String())
+	}
+	assertErrorEnvelope(t, rec)
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode error body %q: %v", rec.Body.String(), err)
+	}
+	if body.Error.Code != wantCode {
+		t.Fatalf("error.code = %q, want %q", body.Error.Code, wantCode)
+	}
+}
+
+// 10, 11, 12: unknown paths and wrong methods on known routes both return
+// the JSON error envelope with the correct status code — never
+// net/http's plain-text default, and a wrong method must never be
+// silently reported as a fake 404 (or vice versa).
 func TestMethodNotAllowed(t *testing.T) {
-	s, _ := newTestServer(t)
-	rec := doRequest(t, s, "POST", "/api/v1/status")
-	if rec.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("status = %d, want 405", rec.Code)
+	s, st := newTestServer(t)
+	ctx := context.Background()
+	g := block("mna-g", 0, "", coinbaseTx("mna-g", 100_00000000, "qMnaG"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+	validTxid := g.Transactions[0].TxID
+
+	for _, tc := range []struct {
+		method, path string
+	}{
+		{"POST", "/api/v1/status"},
+		{"POST", "/api/v1/tx/" + validTxid},
+		{"PUT", "/api/v1/blocks"},
+		{"DELETE", "/api/v1/block/1"},
+	} {
+		rec := doRequest(t, s, tc.method, tc.path)
+		assertJSONError(t, rec, http.StatusMethodNotAllowed, "method_not_allowed")
+		if allow := rec.Header().Get("Allow"); allow == "" {
+			t.Fatalf("%s %s: missing Allow header", tc.method, tc.path)
+		}
 	}
 }
 
 func TestUnknownRoute(t *testing.T) {
 	s, _ := newTestServer(t)
+
+	// Unknown path, GET.
 	rec := doRequest(t, s, "GET", "/api/v1/does-not-exist")
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
+	assertJSONError(t, rec, http.StatusNotFound, "not_found")
+
+	// Unknown path, non-GET: must still be a genuine 404, never a fake 405
+	// (there is no real route at this path to be "wrong-methoded" against).
+	rec = doRequest(t, s, "POST", "/api/v1/does-not-exist")
+	assertJSONError(t, rec, http.StatusNotFound, "not_found")
 }
 
 func TestNoMutationEndpoints(t *testing.T) {

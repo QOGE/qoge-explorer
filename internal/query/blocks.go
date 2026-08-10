@@ -106,26 +106,42 @@ func (s *Store) RecentBlocks(ctx context.Context, beforeHeight *int64, pageSize 
 
 // BlockByHeight returns the CANONICAL block at height, or ErrNotFound if
 // none exists (there is never an orphan-by-height lookup — orphaned blocks
-// are only reachable by hash, via BlockByHash).
+// are only reachable by hash, via BlockByHash). The header and its ordered
+// transaction list are read from one read-only REPEATABLE READ snapshot
+// (readTx) — see docs/ARCHITECTURE.md §19 "Multi-statement read
+// consistency".
 func (s *Store) BlockByHeight(ctx context.Context, height int64) (BlockDetail, error) {
-	row := s.pool.QueryRow(ctx, `
+	tx, done, err := s.readTx(ctx)
+	if err != nil {
+		return BlockDetail{}, err
+	}
+	defer done()
+
+	row := tx.QueryRow(ctx, `
 		SELECT `+blockColumns+` FROM blocks WHERE height = $1 AND canonical
 	`, height)
-	return s.blockDetailFromRow(ctx, row)
+	return blockDetailFromRow(ctx, tx, row)
 }
 
 // BlockByHash returns the block with the given hash — canonical or
 // orphaned, either is a valid historical/audit lookup. Callers must check
 // BlockDetail.Canonical rather than assuming a hash lookup is always
-// canonical.
+// canonical. Reads one read-only REPEATABLE READ snapshot, same as
+// BlockByHeight.
 func (s *Store) BlockByHash(ctx context.Context, hash string) (BlockDetail, error) {
-	row := s.pool.QueryRow(ctx, `
+	tx, done, err := s.readTx(ctx)
+	if err != nil {
+		return BlockDetail{}, err
+	}
+	defer done()
+
+	row := tx.QueryRow(ctx, `
 		SELECT `+blockColumns+` FROM blocks WHERE hash = $1
 	`, hash)
-	return s.blockDetailFromRow(ctx, row)
+	return blockDetailFromRow(ctx, tx, row)
 }
 
-func (s *Store) blockDetailFromRow(ctx context.Context, row pgx.Row) (BlockDetail, error) {
+func blockDetailFromRow(ctx context.Context, q querier, row pgx.Row) (BlockDetail, error) {
 	summary, err := scanBlockSummary(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return BlockDetail{}, ErrNotFound
@@ -133,8 +149,9 @@ func (s *Store) blockDetailFromRow(ctx context.Context, row pgx.Row) (BlockDetai
 	if err != nil {
 		return BlockDetail{}, fmt.Errorf("query: block: %w", err)
 	}
+	fireSnapshotTestHook() // snapshot is now fixed as of this first statement
 
-	txs, err := s.blockTxRefs(ctx, summary.Hash)
+	txs, err := blockTxRefs(ctx, q, summary.Hash)
 	if err != nil {
 		return BlockDetail{}, err
 	}
@@ -143,8 +160,8 @@ func (s *Store) blockDetailFromRow(ctx context.Context, row pgx.Row) (BlockDetai
 
 // blockTxRefs returns blockHash's transactions in actual on-chain order
 // (block_transactions.tx_index), never reordered.
-func (s *Store) blockTxRefs(ctx context.Context, blockHash string) ([]BlockTxRef, error) {
-	rows, err := s.pool.Query(ctx, `
+func blockTxRefs(ctx context.Context, q querier, blockHash string) ([]BlockTxRef, error) {
+	rows, err := q.Query(ctx, `
 		SELECT tx_index, txid, wtxid FROM block_transactions
 		WHERE block_hash = $1
 		ORDER BY tx_index
