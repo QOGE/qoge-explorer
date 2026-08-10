@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -267,10 +268,7 @@ func runMigrate(cfg config.Config, log interface {
 // indexing against a pruned node, a node in initial block download, or a
 // node whose network doesn't exactly match QOGE_NETWORK — see
 // indexer.ValidateStartup.
-func runIndex(cfg config.Config, log interface {
-	Info(msg string, args ...any)
-	Error(msg string, args ...any)
-}) int {
+func runIndex(cfg config.Config, log *slog.Logger) int {
 	if err := cfg.RPC.Validate(); err != nil {
 		log.Error("config error", "error", err)
 		return 1
@@ -322,7 +320,7 @@ func runIndex(cfg config.Config, log interface {
 	resolver := decode.NewCoreAddressResolver(client)
 	st := store.New(pool)
 	pollInterval := time.Duration(cfg.IndexPollSeconds) * time.Second
-	idx := indexer.New(client, st, resolver, pollInterval, nil)
+	idx := indexer.New(client, st, resolver, pollInterval, log)
 
 	log.Info("starting indexer", "poll_interval", pollInterval.String())
 	// idx.Run returns nil on a clean SIGINT/SIGTERM shutdown; any non-nil

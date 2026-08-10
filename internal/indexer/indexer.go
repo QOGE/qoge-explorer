@@ -88,13 +88,31 @@ func (idx *Indexer) syncToTipLocked(ctx context.Context) error {
 			return fmt.Errorf("indexer: read local tip: %w", err)
 		}
 
-		target, err := idx.rpc.GetBlockCount(ctx)
+		target, err := idx.getBlockCount(ctx)
 		if err != nil {
 			return fmt.Errorf("indexer: getblockcount: %w", err)
 		}
 
-		if local.Height >= target {
-			return nil // caught up: on Core's active chain, at or past the observed target
+		if local.Height > target {
+			// Core's active chain retreated below the local tip in the
+			// instant between reconcile()'s check and this read — restart
+			// reconciliation immediately rather than waiting a full poll
+			// interval (review round: task item 4A).
+			continue
+		}
+
+		if local.Height == target {
+			caughtUp, err := idx.confirmCaughtUp(ctx, local)
+			if err != nil {
+				if errors.Is(err, ErrRemoteChainMoved) {
+					continue
+				}
+				return err
+			}
+			if caughtUp {
+				return nil
+			}
+			continue // same-height reorg detected: restart reconciliation
 		}
 
 		idx.logSyncStart(local.Height, target)
@@ -109,6 +127,22 @@ func (idx *Indexer) syncToTipLocked(ctx context.Context) error {
 		// Reached target this pass; loop back to re-check whether Core
 		// advanced further or changed branch since the snapshot above.
 	}
+}
+
+// confirmCaughtUp re-reads Core's hash at local.Height immediately before a
+// sync pass declares itself complete, closing the same-height-reorg window
+// between reconcile()'s check (at the top of this pass) and this moment
+// (review round: task item 4B). Core and PostgreSQL can never share one
+// atomic snapshot; this closes the observable orchestration window rather
+// than eliminating the race entirely — a genuine mismatch here just means
+// the caller restarts reconciliation, which will observe and handle
+// whatever Core's state has become by then.
+func (idx *Indexer) confirmCaughtUp(ctx context.Context, local store.Checkpoint) (bool, error) {
+	currentHash, err := idx.rpc.GetBlockHash(ctx, local.Height)
+	if err != nil {
+		return false, idx.classifyHashUnavailable(ctx, local.Height, err)
+	}
+	return currentHash == local.Hash, nil
 }
 
 // applyRange sequentially applies heights [from, to]. It returns

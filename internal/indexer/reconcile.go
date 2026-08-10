@@ -29,7 +29,7 @@ func (idx *Indexer) reconcile(ctx context.Context) error {
 		return nil // uninitialized store: forward sync starts at genesis
 	}
 
-	remoteHeight, err := idx.rpc.GetBlockCount(ctx)
+	remoteHeight, err := idx.getBlockCount(ctx)
 	if err != nil {
 		return fmt.Errorf("indexer: getblockcount: %w", err)
 	}
@@ -37,7 +37,7 @@ func (idx *Indexer) reconcile(ctx context.Context) error {
 	if local.Height <= remoteHeight {
 		coreHash, err := idx.rpc.GetBlockHash(ctx, local.Height)
 		if err != nil {
-			return fmt.Errorf("indexer: getblockhash(%d): %w", local.Height, err)
+			return idx.classifyHashUnavailable(ctx, local.Height, err)
 		}
 		if coreHash == local.Hash {
 			return nil // local tip is still on Core's active chain
@@ -87,7 +87,7 @@ func (idx *Indexer) reorg(ctx context.Context, local store.Checkpoint, remoteHei
 
 		coreHash, err := idx.rpc.GetBlockHash(ctx, h)
 		if err != nil {
-			return fmt.Errorf("indexer: getblockhash(%d): %w", h, err)
+			return idx.classifyHashUnavailable(ctx, h, err)
 		}
 
 		if localHash == coreHash {
@@ -108,9 +108,24 @@ func (idx *Indexer) reorg(ctx context.Context, local store.Checkpoint, remoteHei
 	// and must be discarded rather than trusted (task item 10).
 	recheck, err := idx.rpc.GetBlockHash(ctx, ancestorHeight)
 	if err != nil {
-		return fmt.Errorf("indexer: re-verify ancestor hash at %d: %w", ancestorHeight, err)
+		return idx.classifyHashUnavailable(ctx, ancestorHeight, err)
 	}
 	if recheck != ancestorHash {
+		return ErrRemoteChainMoved
+	}
+
+	// Re-read the LOCAL checkpoint too, immediately before rolling back:
+	// Store's canonical-mutation lock explicitly permits another writer
+	// sharing the same database (docs/ARCHITECTURE.md §16), so the
+	// checkpoint this depth calculation was based on may no longer be
+	// current. If it changed, discard this reorg decision and restart
+	// reconciliation against the fresh state rather than rolling back
+	// based on a stale local snapshot (review round: task item 8).
+	currentLocal, err := idx.store.Tip(ctx)
+	if err != nil {
+		return fmt.Errorf("indexer: read local tip before rollback: %w", err)
+	}
+	if currentLocal != local {
 		return ErrRemoteChainMoved
 	}
 

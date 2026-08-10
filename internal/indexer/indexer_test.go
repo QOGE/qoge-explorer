@@ -613,6 +613,253 @@ func TestSyncToTip_NoOverlappingPasses(t *testing.T) {
 	}
 }
 
+// ─── U: reorg between reconcile() and the next child fetch ──────────────
+//
+// Review round follow-up: reconcile() confirms the local tip is still on
+// Core's active chain, but Core reorganizes in the window between that
+// check and the next height's fetch. Store.ApplyBlock correctly rejects
+// the resulting block with ErrNonSequentialBlock (its own parent no
+// longer matches the checkpoint) — this must be diagnosed as normal
+// remote chain movement, not surfaced as a terminal error.
+
+func TestSyncToTip_ReorgBetweenReconcileAndNextChildFetch(t *testing.T) {
+	ctx := context.Background()
+	st, pool := newTestStore(t)
+
+	g := buildBlock("U-g", 0, "")
+	a1 := buildBlock("U-a1", 1, g.hash)
+	fr := newFakeRPC()
+	fr.setActiveChain(g, a1)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	b1 := buildBlock("U-b1", 1, g.hash)
+	b2 := buildBlock("U-b2", 2, b1.hash)
+	// Core has ALREADY reorganized to A0->B1->B2 by the time this pass
+	// runs, but reconcile()'s first GetBlockHash(1) call is stubbed to
+	// return the stale A1 hash exactly once — modeling "reconcile
+	// observed the chain a moment before Core reorganized."
+	fr.setActiveChain(g, b1, b2)
+	fr.queueHashOnce(1, a1.hash)
+
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	tip, _ := st.Tip(ctx)
+	if tip.Height != 2 || tip.Hash != b2.hash {
+		t.Fatalf("tip = (%d, %s), want (2, %s)", tip.Height, tip.Hash, b2.hash)
+	}
+	assertCanonical(t, ctx, st, 0, g.hash)
+	assertCanonical(t, ctx, st, 1, b1.hash)
+	assertCanonical(t, ctx, st, 2, b2.hash)
+	assertOrphaned(t, ctx, pool, a1.hash)
+}
+
+// ─── V: tip retreats between reconcile() and the target read ────────────
+
+func TestSyncToTip_TipRetreatsBetweenReconcileAndTargetRead(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newTestStore(t)
+
+	g := buildBlock("V-g", 0, "")
+	a1 := buildBlock("V-a1", 1, g.hash)
+	a2 := buildBlock("V-a2", 2, a1.hash)
+	fr := newFakeRPC()
+	fr.setActiveChain(g, a1, a2)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Core has ALREADY retreated to a shorter chain (A0->A1 only) by the
+	// time this pass runs, but reconcile()'s checks are stubbed to
+	// return the stale height-2 values exactly once each — modeling
+	// "reconcile observed the taller chain a moment before Core
+	// retreated," which the SEPARATE getblockcount read moments later
+	// (for `target`) must not still trust.
+	fr.setActiveChain(g, a1)
+	fr.queueCountOnce(2)
+	fr.queueHashOnce(2, a2.hash)
+
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	tip, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tip.Height != 1 || tip.Hash != a1.hash {
+		t.Fatalf("tip = (%d, %s), want (1, %s) — the shortened Core branch, not the stale A2 tip", tip.Height, tip.Hash, a1.hash)
+	}
+}
+
+// ─── W: the requested height disappears during forward sync ─────────────
+
+func TestSyncToTip_RequestedHeightDisappearsDuringApply(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newTestStore(t)
+
+	g := buildBlock("W-g", 0, "")
+	a1 := buildBlock("W-1", 1, g.hash)
+	fr := newFakeRPC()
+	// Core's real active chain only reaches height 1, but the FIRST
+	// getblockcount call (the syncToTipLocked target snapshot; reconcile
+	// makes no RPC calls at all against a fresh store) is stubbed to
+	// report a target of 2 once — modeling a target snapshotted right
+	// before Core retreated. GetBlockHash(2) then genuinely has nothing
+	// to return, exactly like a real node erroring for a height above
+	// its current tip.
+	fr.setActiveChain(g, a1)
+	fr.queueCountOnce(2)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("SyncToTip: %v", err)
+	}
+
+	tip, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tip.Height != 1 || tip.Hash != a1.hash {
+		t.Fatalf("tip = (%d, %s), want (1, %s)", tip.Height, tip.Hash, a1.hash)
+	}
+}
+
+// ─── X: same-height reorg discovered only at the final caught-up check ──
+
+func TestSyncToTip_SameHeightReorgAfterReconcile(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newTestStore(t)
+
+	g := buildBlock("X-g", 0, "")
+	a1 := buildBlock("X-a1", 1, g.hash)
+	a2 := buildBlock("X-a2", 2, a1.hash)
+	fr := newFakeRPC()
+	fr.setActiveChain(g, a1, a2)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	b1 := buildBlock("X-b1", 1, g.hash)
+	b2 := buildBlock("X-b2", 2, b1.hash)
+	// Core has ALREADY switched to A0->B1->B2 at the same height, but
+	// reconcile()'s GetBlockHash(2) call is stubbed to return the stale
+	// A2 hash exactly once, so reconcile() falsely confirms the tip is
+	// still valid. The final caught-up confirmation (a SEPARATE
+	// GetBlockHash(2) call, made after reconcile() already returned)
+	// must catch the mismatch instead of returning stale success.
+	fr.setActiveChain(g, b1, b2)
+	fr.queueHashOnce(2, a2.hash)
+
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	tip, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tip.Height != 2 || tip.Hash != b2.hash {
+		t.Fatalf("tip = (%d, %s), want (2, %s) — never a stale A2 success", tip.Height, tip.Hash, b2.hash)
+	}
+}
+
+// ─── Y: stable Core + a contradictory fetched block stays terminal ──────
+
+func TestSyncToTip_StableCoreContradictoryParentIsTerminal(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newTestStore(t)
+
+	g := buildBlock("Y-g", 0, "")
+	a1 := buildBlock("Y-a1", 1, g.hash)
+	fr := newFakeRPC()
+	fr.setActiveChain(g, a1)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Core/local remain perfectly stable at height 1 (A1) throughout —
+	// GetBlockHash(1) never changes. The height-2 block Core hands back
+	// is internally self-consistent (its own hash is stable across the
+	// two-hash race check) but claims a bogus, unrelated parent instead
+	// of A1. This must never be explained away as a race: it is a
+	// genuinely contradictory fetched block.
+	bogusParent := fakeHash("Y-bogus-parent")
+	bad2 := buildBlock("Y-bad2", 2, bogusParent)
+	fr.setActiveChain(g, a1, bad2)
+
+	tipBefore, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+
+	err = idx.SyncToTip(ctx)
+	if err == nil {
+		t.Fatal("expected a terminal error for a contradictory fetched block")
+	}
+	if errors.Is(err, ErrRemoteChainMoved) {
+		t.Fatalf("error = %v, must not be classified as a retryable remote-chain-moved race", err)
+	}
+	if errors.Is(err, ErrReorgTooDeep) || errors.Is(err, ErrLocalChainGap) {
+		t.Fatalf("unexpected sentinel error: %v", err)
+	}
+
+	tipAfter, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tipAfter != tipBefore {
+		t.Fatalf("checkpoint changed on a terminal contradictory-block error: before=%+v after=%+v", tipBefore, tipAfter)
+	}
+}
+
+// ─── negative GetBlockCount is rejected as malformed RPC data ───────────
+//
+// Review round item 10: Core can never legitimately report a negative
+// height. Silently accepting one could make an uninitialized store
+// (Tip().Height == -1) appear accidentally "caught up" against it.
+
+func TestSyncToTip_NegativeBlockCountRejected(t *testing.T) {
+	ctx := context.Background()
+	st, _ := newTestStore(t)
+
+	fr := newFakeRPC()
+	fr.queueCountOnce(-1)
+
+	tipBefore, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+
+	idx := New(fr, st, nil, time.Second, nil)
+	err = idx.SyncToTip(ctx)
+	if err == nil {
+		t.Fatal("expected an error for a negative getblockcount result")
+	}
+	if errors.Is(err, ErrRemoteChainMoved) {
+		t.Fatalf("negative getblockcount must not be classified as a retryable race: %v", err)
+	}
+
+	tipAfter, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tipAfter != tipBefore {
+		t.Fatalf("checkpoint changed on a malformed negative getblockcount: before=%+v after=%+v", tipBefore, tipAfter)
+	}
+}
+
 // ─── helpers ──────────────────────────────────────────────────────────
 
 func buildChain(prefix string, height int) []*fakeBlock {

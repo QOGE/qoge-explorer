@@ -2,10 +2,12 @@ package indexer
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/QOGE/qoge-explorer/internal/decode"
+	"github.com/QOGE/qoge-explorer/internal/store"
 )
 
 // applyHeight fetches, decodes, and applies exactly one block at height,
@@ -28,7 +30,7 @@ func (idx *Indexer) applyHeight(ctx context.Context, height int64) error {
 	fetchStart := time.Now()
 	hash1, err := idx.rpc.GetBlockHash(ctx, height)
 	if err != nil {
-		return fmt.Errorf("indexer: getblockhash(%d): %w", height, err)
+		return idx.classifyHashUnavailable(ctx, height, err)
 	}
 
 	raw, err := idx.rpc.GetBlockVerbose2(ctx, hash1)
@@ -55,7 +57,7 @@ func (idx *Indexer) applyHeight(ctx context.Context, height int64) error {
 
 	hash2, err := idx.rpc.GetBlockHash(ctx, height)
 	if err != nil {
-		return fmt.Errorf("indexer: getblockhash(%d) race recheck: %w", height, err)
+		return idx.classifyHashUnavailable(ctx, height, err)
 	}
 	if hash2 != hash1 {
 		idx.log.Warn("remote chain moved during block fetch; discarding stale block",
@@ -65,6 +67,13 @@ func (idx *Indexer) applyHeight(ctx context.Context, height int64) error {
 
 	applyStart := time.Now()
 	if err := idx.store.ApplyBlock(ctx, block); err != nil {
+		if errors.Is(err, store.ErrNonSequentialBlock) {
+			// Not automatically an integrity failure — Core or the local
+			// checkpoint may have moved since the last reconciliation.
+			// diagnoseNonSequential distinguishes that normal race from a
+			// genuinely self-contradictory fetched block.
+			return idx.diagnoseNonSequential(ctx, height, block, err)
+		}
 		return fmt.Errorf("indexer: apply block %d (%s): %w", height, hash1, err)
 	}
 	applyElapsed := time.Since(applyStart)
