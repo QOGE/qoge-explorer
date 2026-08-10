@@ -14,10 +14,19 @@ import (
 // Config holds all runtime configuration for the explorer service.
 type Config struct {
 	RPC         RPCConfig
-	DatabaseURL string // postgres://... ; only required by subcommands that touch the database (e.g. migrate)
+	DatabaseURL string // postgres://... ; only required by subcommands that touch the database (e.g. migrate, index)
 	HTTPAddr    string // bind address for the internal health/API server (loopback only in Phase 1)
 	LogLevel    string // debug, info, warn, error
 	LogJSON     bool
+
+	// Network is the Core network name (getblockchaininfo's "chain") the
+	// index command requires an exact match against before indexing —
+	// never inferred from an address HRP (docs/ARCHITECTURE.md §18).
+	Network string
+
+	// IndexPollSeconds is how long the index command's live loop waits
+	// between SyncToTip passes once it has caught up to Core's tip.
+	IndexPollSeconds int
 }
 
 // RPCConfig holds Qogecoin Core JSON-RPC connection parameters.
@@ -49,10 +58,12 @@ func Load() (Config, error) {
 			UseTLS:   getEnvBool("QOGE_RPC_TLS", false),
 			Timeout:  getEnvInt("QOGE_RPC_TIMEOUT_SECONDS", 30),
 		},
-		DatabaseURL: getEnv("QOGE_DATABASE_URL", ""),
-		HTTPAddr:    getEnv("QOGE_HTTP_ADDR", "127.0.0.1:8532"),
-		LogLevel:    getEnv("QOGE_LOG_LEVEL", "info"),
-		LogJSON:     getEnvBool("QOGE_LOG_JSON", false),
+		DatabaseURL:      getEnv("QOGE_DATABASE_URL", ""),
+		HTTPAddr:         getEnv("QOGE_HTTP_ADDR", "127.0.0.1:8532"),
+		LogLevel:         getEnv("QOGE_LOG_LEVEL", "info"),
+		LogJSON:          getEnvBool("QOGE_LOG_JSON", false),
+		Network:          getEnv("QOGE_NETWORK", ""),
+		IndexPollSeconds: getEnvInt("QOGE_INDEX_POLL_SECONDS", 10),
 	}
 	return cfg, nil
 }

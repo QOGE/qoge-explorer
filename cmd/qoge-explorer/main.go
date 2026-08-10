@@ -1,17 +1,24 @@
 // Command qoge-explorer is the entry point for the QOGE block explorer
-// service. Phase 1 only implements RPC connectivity verification and a
-// loopback health endpoint; no chain indexing happens yet.
+// service. It implements RPC connectivity verification, schema migrations,
+// a loopback health endpoint, and — as of Phase 2C.2 — historical/live
+// chain indexing (`index`). A public explorer API/web UI does not exist
+// yet.
 package main
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
+	"syscall"
 	"time"
 
 	"github.com/QOGE/qoge-explorer/internal/config"
+	"github.com/QOGE/qoge-explorer/internal/decode"
+	"github.com/QOGE/qoge-explorer/internal/indexer"
 	"github.com/QOGE/qoge-explorer/internal/logging"
 	"github.com/QOGE/qoge-explorer/internal/rpc"
 	"github.com/QOGE/qoge-explorer/internal/store"
@@ -38,6 +45,8 @@ func main() {
 		os.Exit(runServe(cfg, log))
 	case "migrate":
 		os.Exit(runMigrate(cfg, log, os.Args[2:]))
+	case "index":
+		os.Exit(runIndex(cfg, log))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -48,7 +57,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2B.1: schema/migrations, no indexing yet)
+	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2C.2: historical sync + live reorg orchestration)
 
 Usage:
   qoge-explorer check-rpc          Connect to the configured Qogecoin Core node
@@ -58,16 +67,24 @@ Usage:
   qoge-explorer migrate down [n]    Roll back the n most recent migrations
                                      (default 1).
   qoge-explorer migrate version     Print the current schema version.
+  qoge-explorer index               Validate Core/network/database safety,
+                                     then historically sync from genesis (or
+                                     resume from the last checkpoint) and
+                                     poll for new blocks/reorgs until
+                                     SIGINT/SIGTERM. No public API/UI.
 
 Configuration is read from environment variables:
-  QOGE_RPC_HOST             default 127.0.0.1 (check-rpc)
-  QOGE_RPC_PORT             default 8332      (check-rpc)
-  QOGE_RPC_USER             required for check-rpc
-  QOGE_RPC_PASSWORD         required for check-rpc
-  QOGE_RPC_TLS              default false     (check-rpc)
-  QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc)
-  QOGE_DATABASE_URL         required for migrate, e.g. postgres://user:pass@host:5432/dbname
+  QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
+  QOGE_RPC_PORT             default 8332      (check-rpc, index)
+  QOGE_RPC_USER             required for check-rpc, index
+  QOGE_RPC_PASSWORD         required for check-rpc, index
+  QOGE_RPC_TLS              default false     (check-rpc, index)
+  QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc, index)
+  QOGE_DATABASE_URL         required for migrate/index, e.g. postgres://user:pass@host:5432/dbname
   QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
+  QOGE_NETWORK              required for index; must exactly match Core's
+                             getblockchaininfo "chain" (e.g. main/test/regtest)
+  QOGE_INDEX_POLL_SECONDS   default 10 (index; live-loop wait once caught up)
   QOGE_HTTP_ADDR            default 127.0.0.1:8532
   QOGE_LOG_LEVEL            default info
   QOGE_LOG_JSON             default false`)
@@ -243,4 +260,77 @@ func runMigrate(cfg config.Config, log interface {
 		fmt.Fprintf(os.Stderr, "unknown migrate subcommand: %s\n", args[0])
 		return 2
 	}
+}
+
+// runIndex validates the Core/database/network environment, then runs
+// historical sync + the live reorg-aware polling loop
+// (docs/ARCHITECTURE.md §18) until SIGINT/SIGTERM. It never starts
+// indexing against a pruned node, a node in initial block download, or a
+// node whose network doesn't exactly match QOGE_NETWORK — see
+// indexer.ValidateStartup.
+func runIndex(cfg config.Config, log *slog.Logger) int {
+	if err := cfg.RPC.Validate(); err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+	if cfg.Network == "" {
+		log.Error("config error", "error", "QOGE_NETWORK is not set")
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	client := rpc.New(rpc.Config{
+		Host:     cfg.RPC.Host,
+		Port:     cfg.RPC.Port,
+		User:     cfg.RPC.User,
+		Password: cfg.RPC.Password,
+		UseTLS:   cfg.RPC.UseTLS,
+		Timeout:  time.Duration(cfg.RPC.Timeout) * time.Second,
+	})
+
+	log.Info("connecting to qogecoin core", "rpc", cfg.RPC.Redacted(), "network", cfg.Network)
+
+	startupCtx, cancelStartup := context.WithTimeout(ctx, time.Duration(cfg.RPC.Timeout)*time.Second)
+	chainInfo, err := client.GetBlockchainInfo(startupCtx)
+	cancelStartup()
+	if err != nil {
+		log.Error("getblockchaininfo failed", "error", err)
+		return 1
+	}
+	if err := indexer.ValidateStartup(chainInfo, cfg.Network); err != nil {
+		log.Error("startup safety check failed", "error", err)
+		return 1
+	}
+	log.Info("startup safety checks passed",
+		"chain", chainInfo.Chain, "blocks", chainInfo.Blocks, "pruned", chainInfo.Pruned)
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	resolver := decode.NewCoreAddressResolver(client)
+	st := store.New(pool)
+	pollInterval := time.Duration(cfg.IndexPollSeconds) * time.Second
+	idx := indexer.New(client, st, resolver, pollInterval, log)
+
+	log.Info("starting indexer", "poll_interval", pollInterval.String())
+	// idx.Run returns nil on a clean SIGINT/SIGTERM shutdown; any non-nil
+	// error is a deterministic halt (decode/store/integrity/deep-reorg
+	// failure) that a process supervisor should treat as a failed exit,
+	// not silently retry.
+	if err := idx.Run(ctx); err != nil {
+		log.Error("indexer halted", "error", err)
+		return 1
+	}
+	log.Info("indexer stopped")
+	return 0
 }

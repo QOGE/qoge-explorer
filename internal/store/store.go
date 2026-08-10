@@ -146,6 +146,30 @@ func lockCheckpoint(ctx context.Context, tx pgx.Tx) (Checkpoint, error) {
 	return cp, nil
 }
 
+// CanonicalBlockHash returns the hash of the currently-canonical block at
+// height, for the future indexer's common-ancestor discovery: comparing
+// Core's canonical hash at height H against the hash the explorer itself
+// currently considers canonical at that same height, without needing
+// Tip()/RollbackTo to have already walked that far. Read-only — never
+// mutates anything and never mutates ApplyBlock/RollbackTo semantics.
+//
+// found is false (with an empty hash and nil error) when no canonical block
+// exists at height, which is a normal outcome (e.g. height above the
+// current tip), not an error. A genuine database error is returned as
+// err, distinct from "not found."
+func (s *Store) CanonicalBlockHash(ctx context.Context, height int64) (hash string, found bool, err error) {
+	err = s.pool.QueryRow(ctx,
+		`SELECT hash FROM blocks WHERE height = $1 AND canonical`, height,
+	).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("store: canonical block hash at height %d: %w", height, err)
+	}
+	return hash, true, nil
+}
+
 // UTXO is the canonical, mutable spend state of one transaction output —
 // a read-only view of one utxo_state row.
 type UTXO struct {

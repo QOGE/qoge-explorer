@@ -64,3 +64,11 @@ func (c *Client) GetBestBlockHash(ctx context.Context) (string, error) {
 	err := c.CallInto(ctx, &hash, "getbestblockhash")
 	return hash, err
 }
+
+// GetBlockCount calls getblockcount, returning Core's current best-chain
+// height.
+func (c *Client) GetBlockCount(ctx context.Context) (int64, error) {
+	var height int64
+	err := c.CallInto(ctx, &height, "getblockcount")
+	return height, err
+}

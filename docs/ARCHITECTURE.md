@@ -1882,3 +1882,234 @@ production fetch loop — `TestDecodeBlock_ThroughStore_PipelineTest` is a
 one-shot pipeline proof (decode → apply → assert), not a poller. Those
 remain a later phase, built on top of this decoder once it has been
 independently reviewed.
+
+## 18. Indexer: historical sync + live reorg orchestration (Phase 2C.2)
+
+`internal/indexer` is orchestration only — it coordinates the already-
+reviewed pipeline (`rpc.Client` → `decode.DecodeBlock` → `store.Store`) into
+a production fetch/apply loop. It parses no SQL, classifies no scripts,
+and decodes no raw Core JSON itself. It does not redesign the schema,
+change `Store.ApplyBlock`/`RollbackTo` semantics, or implement a public
+API/UI/mempool/wallet — those remain out of scope.
+
+### `Store.Tip` is the sole durable resume point
+
+The database checkpoint is exactly `sync_state('main')`, read via
+`Store.Tip`. The indexer never adds a second checkpoint (no JSON resume
+file, no LevelDB marker, no in-memory-only durable height). On every
+restart — clean or crashed — the indexer's only source of "where was I"
+is `Store.Tip()`.
+
+### Fresh production sync always starts at genesis
+
+If `Store.Tip().Height == -1` (an uninitialized store), the indexer's
+forward-sync loop starts at `local.Height + 1 == 0` — height 0, genesis —
+unconditionally. `Store.ApplyBlock` itself still permits an arbitrary
+bootstrap height for this codebase's own synthetic tests (see §16,
+"Canonical tip continuity"); the indexer never exercises that freedom in
+production. This guarantees the explorer's history is always complete
+from genesis forward, never starting mid-chain at whatever height Core
+happens to currently report as its tip.
+
+### Sequential fetch/decode/apply pipeline, with a race-closing recheck
+
+For each height `H`, in order:
+
+1. `hash1 := rpc.GetBlockHash(H)`
+2. `raw := rpc.GetBlockVerbose2(hash1)`
+3. `block := decode.DecodeBlock(raw)`
+4. verify `block.Height == H && block.Hash == hash1`
+5. `hash2 := rpc.GetBlockHash(H)` (a **second**, independent call)
+6. require `hash2 == hash1` before calling `ApplyBlock` at all
+7. `store.ApplyBlock(block)`
+
+Step 5/6 closes the race where Core reorganizes between step 1 and the
+point `ApplyBlock` would otherwise commit: fetching/decoding an
+already-orphaned block is wasted work, but *applying* one would let a
+block that's no longer on Core's active chain reach `Store.ApplyBlock`.
+If `hash2 != hash1`, the stale block is discarded — this is
+`ErrRemoteChainMoved`, an internal control-flow sentinel, never a
+terminal error — and reconciliation restarts from the top rather than
+being treated as corruption. Blocks are always applied one at a time, in
+height order; a failed height is never skipped, and PostgreSQL writes are
+never batched across blocks — the reviewed invariant "one SQL transaction
+per block" is unchanged.
+
+### Local-tip/Core-tip reconciliation, every pass
+
+Every `SyncToTip` pass begins by reconciling the local checkpoint against
+Core before any forward syncing: if `local.Height <= remoteHeight` and
+Core's hash at `local.Height` equals the local tip's hash, the local tip
+is confirmed still on Core's active chain and forward sync may proceed
+from `local.Height + 1`. Any other case — a hash mismatch at that height,
+or the local tip being taller than Core's current tip at all (a "tip
+retreat") — triggers common-ancestor discovery.
+
+### Common ancestor discovery
+
+Ancestor discovery compares the two actual canonical chains by height,
+walking downward from `min(localTip.Height, coreTipHeight)`, using the one
+minimal read-only Store API this phase adds:
+
+```go
+func (s *Store) CanonicalBlockHash(ctx context.Context, height int64) (hash string, found bool, err error)
+```
+
+`found == false` means no canonical row at that height (e.g. above the
+current tip) — a normal, non-error outcome. If local canonical data is
+unexpectedly *missing* at a height `<= local tip`, that is
+`ErrLocalChainGap`, a local integrity failure, and is never conflated with
+"no match found." The first height where the local and Core hashes agree
+is the common ancestor. Immediately before calling `RollbackTo`, the
+ancestor's Core hash is re-read one more time; if it no longer matches the
+candidate (Core moved again during the search), the candidate is
+discarded via `ErrRemoteChainMoved` and reconciliation restarts — this
+avoids rolling back based on a hash mixed from two different Core
+branches observed at different instants.
+
+### Reorg depth policy: ≤100 automatic, >100 halt
+
+`MaxAutomaticReorgDepth = 100` is a code constant
+(`internal/indexer/errors.go`), not an environment variable — an operator
+cannot accidentally weaken it via process configuration. Depth is
+`localTip.Height - ancestorHeight`. The search is bounded, not
+exhaustive: if Core's own tip is already more than 100 blocks behind the
+local tip, that alone proves any ancestor would violate the policy, so the
+indexer halts (`ErrReorgTooDeep`) without searching at all; otherwise the
+walk is bounded to `localTip.Height - 100`. `Store.RollbackTo` is never
+called before this policy check. Depth exactly 100 is automatic; depth
+101 halts with `ErrReorgTooDeep` and the database is left completely
+unchanged (this is exercised directly — see `internal/indexer/indexer_test.go`,
+items J/K/L).
+
+### Reorg execution: `RollbackTo` + the normal `ApplyBlock` path
+
+Once a stable ancestor within policy is found, the indexer logs the old
+tip, ancestor, and depth (no secrets), calls `Store.RollbackTo(ancestorHash)`,
+re-reads `Store.Tip()` to confirm it now equals the ancestor, and resumes
+ordinary forward syncing from `ancestorHeight + 1`. Replacement blocks use
+the exact same fetch/decode/apply pipeline as any other forward sync —
+there is no second "replacement branch insertion" code path. This is
+deliberate: `Store` already knows how to restore UTXOs, preserve orphan
+audit history, re-promote a previously orphaned block that becomes
+canonical again, recompute address caches, and preserve txid/wtxid
+witness variants (§16) — the indexer does not reimplement any of that.
+Branch flip-back (A→B→A) is exercised directly, confirming the old A
+branch's blocks are safely re-promoted rather than reinserted, and the B
+branch remains queryable orphan audit history.
+
+### Multi-writer policy
+
+`Store` itself is fully cross-process transaction-safe: `ApplyBlock` and
+`RollbackTo` each acquire the same `sync_state('main')` row lock
+(`lockCheckpoint`, §16) before touching anything, so any number of
+processes sharing one database can never corrupt canonical state, race
+each other into an inconsistent write, or apply two conflicting blocks at
+the same height — Postgres serializes them regardless of what any
+particular writer believed the checkpoint was.
+
+**Phase 2C.2 production policy is exactly ONE active indexer orchestrator
+per database.** The indexer layer — not `Store` — is where this matters:
+`reorg`'s automatic-reorg depth policy (`localTip.Height - ancestorHeight
+<= 100`) is *computed* against a checkpoint read moments earlier, and the
+pre-`RollbackTo` local-tip recheck (above) only detects — never
+atomically prevents — a second writer having changed that checkpoint in
+the interim (it re-reads `Store.Tip()` and discards the decision via
+`ErrRemoteChainMoved` if it no longer matches, rather than trusting a
+stale snapshot). That check closes the *correctness* gap — an indexer
+never rolls back based on a depth computed against a checkpoint that is no
+longer current — but it does not make the depth-approval decision itself
+atomic with a second writer's own concurrent mutation the way `Store`'s
+internal row lock makes `ApplyBlock`/`RollbackTo` atomic with each other.
+Running two indexer orchestrators against the same database concurrently
+is therefore unsupported/undefined behavior for this phase: `Store`'s data
+will never become inconsistent, but the two orchestrators' reorg-depth
+decisions are not coordinated, and either could observe
+`ErrRemoteChainMoved`/`ErrNonSequentialBlock` churn from the other's
+writes rather than making forward progress.
+
+A `pg_advisory_lock`-based singleton lease was considered as an
+enforcement mechanism (it needs no schema/migration change), but the
+indexer only holds a `*store.Store`, which deliberately exposes no raw SQL
+execution surface (§16) — implementing one cleanly would mean either
+adding new `Store` API surface beyond `CanonicalBlockHash`, or having the
+indexer open a second, independent database connection outside `Store`
+entirely. Both are more than this phase's minimal read-only Store addition
+was scoped for; enforcing single-orchestrator as a hard guarantee (rather
+than an operational policy) is left for a later phase. For now: run
+exactly one `qoge-explorer index` process per database.
+
+### Sync target moving forward
+
+A `SyncToTip` pass snapshots `target := rpc.GetBlockCount()` and
+sequentially forward-syncs to it, but does not return "caught up" just
+because that snapshot was reached: it loops back to reconcile again and
+re-read the current tip height, continuing if Core advanced further or
+reorganizing if Core changed branch. This is what lets historical
+catch-up transition naturally into live operation, and correctly handles
+Core continuing to produce blocks throughout a long historical sync.
+
+### Live loop
+
+`Indexer.Run(ctx)` is a thin loop: sync/reconcile to Core's current tip,
+wait `QOGE_INDEX_POLL_SECONDS` (default 10), repeat, until `ctx` is
+cancelled. `SyncToTip` calls never overlap — a second concurrent call
+fails fast with `ErrSyncInProgress` rather than blocking or queuing. A
+chain-moved race is retried immediately inside `SyncToTip` itself, never
+surfaced to `Run`, so it's never delayed by a full poll interval. A
+deterministic decoder/store/local-integrity/deep-reorg error is returned
+from `Run` and halts the process — failing safely (letting a process
+supervisor restart it) is preferred over endlessly retrying an error
+whose meaning is unknown.
+
+### Startup safety: network, pruning, IBD
+
+`qoge-explorer index` validates the Core/database environment before any
+database mutation: `QOGE_NETWORK` must exactly match Core's
+`getblockchaininfo().chain` (`indexer.ErrNetworkMismatch` otherwise) —
+never inferred from an address HRP, since network/address representations
+can overlap. A pruned node (`pruned: true`) is rejected outright
+(`indexer.ErrPrunedNode`): historical sync needs every block from genesis.
+A node still in initial block download is also rejected outright rather
+than retried — indexing an unstable, partial history is worse than making
+the operator re-run the command once IBD completes; this is the simplest
+auditable behavior for a fresh production start. `txindex` is not
+required — `getblock <hash> 2` doesn't need it, and none of this phase's
+RPC calls do either. RPC credentials are never printed; only
+`config.RPCConfig.Redacted()`'s fixed placeholder ever reaches a log line.
+
+### Crash/restart semantics
+
+Because `Store.ApplyBlock` is one atomic transaction per block with the
+checkpoint as its final write (§16), and the indexer always resumes from
+`Store.Tip()`:
+
+  - stopping between blocks resumes at `checkpoint + 1`;
+  - a failure inside `ApplyBlock` before commit leaves the checkpoint at
+    the prior block, and a restart retries the same height;
+  - stopping right after a block's commit leaves the checkpoint including
+    that block, and a restart starts at the next height;
+  - restarting when the exact tip is already indexed reconciles (confirms
+    the local tip is still on Core's active chain) and is a no-op — no
+    duplicate balance/accounting changes.
+
+No additional checkpoint state (file, LevelDB marker, etc.) is ever
+introduced.
+
+### Testing
+
+`internal/indexer` tests run against a deterministic in-memory fake RPC
+client (`RPCClient` — `GetBlockCount`/`GetBlockHash`/`GetBlockVerbose2`,
+the only interface this phase adds) and a real, isolated PostgreSQL
+schema per test — the same "fake the RPC boundary, use a real database"
+split established in Phase 2B.2/2C.1. A synthetic P2QPK fixture (exactly
+17,088-byte and 32-byte witness items, a structural witness v2/32-byte-
+program output) is run through the real `Indexer → rpc.RawBlock →
+decode.DecodeBlock → Store.ApplyBlock → PostgreSQL` path to prove
+byte-exact persistence end to end; the indexer itself never inspects or
+transforms witness bytes. An opt-in suite (`QOGE_INDEXER_INTEGRATION=1`)
+runs the real `Indexer` against a real local `qogecoind`, capped to a
+small height via a test-only RPC wrapper — normal `go test ./...` never
+needs `qogecoind`, RPC credentials, or network access.
+
+This phase does not implement a public explorer API or web UI.
