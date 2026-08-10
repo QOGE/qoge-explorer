@@ -183,15 +183,19 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 // validateBlockShape checks block is internally self-consistent, before
 // any database access: block.TxCount must match len(block.Transactions)
 // exactly (ApplyBlock represents a fully indexed block, never a
-// header-only one — see ErrIncompleteBlock), every transaction's
-// inputs/outputs must use the canonical positional index Core's own
-// vin/vout array semantics guarantee (chain.Input.Index/chain.Output.Index
-// documented as "this input/output's position within its transaction's
-// vin/vout list" — internal/chain/input.go, output.go), and the
-// transaction list must have Core-valid coinbase shape/positioning (see
-// below). Enforcing the positional-index rule up front makes an "index
-// moved to another slot" attack structurally impossible to even express,
-// which is what lets the completeness checks in
+// header-only one — see ErrIncompleteBlock), every transaction must have
+// at least one input and one output (ApplyBlock represents a fully decoded
+// transaction, never a possibly-partial RPC translation), every
+// transaction's inputs/outputs must use the canonical positional index
+// Core's own vin/vout array semantics guarantee
+// (chain.Input.Index/chain.Output.Index documented as "this input/output's
+// position within its transaction's vin/vout list" —
+// internal/chain/input.go, output.go), every input's
+// PreviousOut/Coinbase/ScriptSig fields must be mutually consistent (see
+// below), and the transaction list must have Core-valid coinbase shape/
+// positioning (see below). Enforcing the positional-index rule up front
+// makes an "index moved to another slot" attack structurally impossible to
+// even express, which is what lets the completeness checks in
 // applyInput/applyOutput/applyTransaction rely on a simple count
 // comparison rather than a full index-set comparison.
 func validateBlockShape(block chain.Block) error {
@@ -203,10 +207,44 @@ func validateBlockShape(block chain.Block) error {
 		return fmt.Errorf("%w: block %s has no transactions", ErrInvalidTransactionShape, block.Hash)
 	}
 	for idx, txn := range block.Transactions {
+		// Completeness, not consensus: ApplyBlock claims to persist a fully
+		// decoded transaction, so an empty vin or vout must never be
+		// accepted as a possibly-partial RPC translation — mirrors the
+		// shape (not the reachability) of Core's CheckTransaction
+		// bad-txns-vin-empty/bad-txns-vout-empty checks.
+		if len(txn.Inputs) == 0 {
+			return fmt.Errorf("%w: tx %s has no inputs", ErrInvalidTransactionShape, txn.TxID)
+		}
+		if len(txn.Outputs) == 0 {
+			return fmt.Errorf("%w: tx %s has no outputs", ErrInvalidTransactionShape, txn.TxID)
+		}
+
 		for i, in := range txn.Inputs {
 			if in.Index != uint32(i) {
 				return fmt.Errorf("%w: tx %s input %d has Index=%d, want %d (canonical positional index)",
 					ErrImmutableConflict, txn.TxID, i, in.Index, i)
+			}
+			// chain.Input documents PreviousOut/Coinbase/ScriptSig as
+			// mutually exclusive by construction (internal/chain/input.go):
+			// Coinbase is set only when PreviousOut is nil, ScriptSig is
+			// empty for coinbase. Enforced here, not silently tolerated —
+			// a future RPC decoder that ever constructs an inconsistent
+			// model must not have its Coinbase bytes silently discarded
+			// (applyInput never even looks at Coinbase when PreviousOut !=
+			// nil). A non-coinbase input's ScriptSig is legitimately empty
+			// for a pure witness spend, so that alone is never rejected.
+			if in.PreviousOut == nil {
+				if len(in.Coinbase) == 0 {
+					return fmt.Errorf("%w: tx %s input %d is coinbase (nil PreviousOut) but has no Coinbase script bytes",
+						ErrInvalidTransactionShape, txn.TxID, i)
+				}
+				if len(in.ScriptSig) != 0 {
+					return fmt.Errorf("%w: tx %s input %d is coinbase (nil PreviousOut) but has a non-empty ScriptSig",
+						ErrInvalidTransactionShape, txn.TxID, i)
+				}
+			} else if len(in.Coinbase) != 0 {
+				return fmt.Errorf("%w: tx %s input %d is non-coinbase (PreviousOut set) but has Coinbase script bytes populated",
+					ErrInvalidTransactionShape, txn.TxID, i)
 			}
 		}
 		for i, out := range txn.Outputs {

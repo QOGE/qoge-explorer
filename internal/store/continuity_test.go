@@ -409,7 +409,7 @@ func TestApplyBlock_ImmutableChildSetCompleteness(t *testing.T) {
 
 	t.Run("M: changed vin/vout index set rejected", func(t *testing.T) {
 		s, pool := newTestStore(t)
-		txBad := spendTx(hash64("compMtx"), hash64("compMtx"), 200, nil, nil)
+		txBad := spendTx(hash64("compMtx"), hash64("compMtx"), 200, nil, []chain.Output{out(0, 100, "qBob")})
 		txBad.Inputs = []chain.Input{
 			{Index: 0, Coinbase: []byte{0x51}, Sequence: 4294967295},
 			{Index: 2, Coinbase: []byte{0x52}, Sequence: 4294967295}, // should be Index 1
@@ -659,14 +659,21 @@ func TestMarkSpent_ZeroRowUpdateDetectsConflict(t *testing.T) {
 
 // ─── Core-facing review round: genesis coinbase unspendable (item 1) ───
 
-// TestApplyBlock_GenesisCoinbaseUnspendable uses the real QOGE mainnet
-// genesis block hash/txid — Core's ConnectBlock skips connecting the
-// genesis block's transactions at all ("its coinbase is unspendable"), and
-// QOGE's own chainparams document the same for the genesis output
-// specifically. The block header fields around the hash/txid are synthetic
-// (this repo has no offline historical block source — see task item 14 of
-// the prior review round, which explicitly permits this for real-vector
-// fixtures), but the hash and txid themselves are genuine.
+// TestApplyBlock_GenesisCoinbaseUnspendable is a SOURCE-DERIVED genesis
+// identity/UTXO-semantics fixture — not a claim that this reproduces the
+// genuine full QOGE genesis transaction byte-for-byte. The block hash,
+// txid, coinbase reward (100 QOGE = 10,000,000,000 satoshis), transaction
+// version (1), and the real genesis output scriptPubKey — a bare P2PK push
+// of the documented genesis public key followed by OP_CHECKSIG — are all
+// taken from Qogecoin's stable chainparams/genesis block as reported in an
+// independent review. The coinbase input's raw script bytes are NOT
+// reproduced (this repo has no offline historical block source to verify
+// them against — see task item 14 of an earlier review round, which
+// explicitly permits real-vector fixtures under this constraint) and
+// remain a synthetic placeholder, clearly marked below. The test's purpose
+// is proving Store's genesis-exclusion UTXO semantics against a
+// source-faithful identity/value/script/version, not exercising a
+// byte-exact consensus-serialization vector.
 func TestApplyBlock_GenesisCoinbaseUnspendable(t *testing.T) {
 	ctx := context.Background()
 	s, pool := newTestStore(t)
@@ -674,27 +681,76 @@ func TestApplyBlock_GenesisCoinbaseUnspendable(t *testing.T) {
 	const (
 		genesisBlockHash = "78cf9e38dad7e61400f3a3e4e987efa7c90c09f69d9be7ce95e504bfa447aadc"
 		genesisTxID      = "a0bc982915c0435f85fa6e44b7e6bd7b32e2a6ad10f968d223d4a56fa2aabc9e"
+		genesisPubKeyHex = "042f87f89b47b6d60836b56bb0b112e573913f47361c07852957ce967c618ea09577c10b0c7a6d54d785860e45309318056c387e0e15047e57ad45e5f623b61594"
+		genesisRewardSat = 10_000_000_000 // 100 QOGE, per Qogecoin's stable chainparams
 	)
 
-	genesis := testBlock(genesisBlockHash, 0, "", coinbaseTx(genesisTxID, out(0, 5_000_000_000, "qGenesis")))
+	pubKey := mustHex(t, genesisPubKeyHex)
+	if len(pubKey) != 65 { // uncompressed EC pubkey (0x04 prefix), sanity-check only
+		t.Fatalf("genesis pubkey hex decoded to %d bytes, want 65", len(pubKey))
+	}
+	// <push 65 bytes> <pubkey> OP_CHECKSIG — Core's bare P2PK form.
+	scriptPubKey := append(append([]byte{byte(len(pubKey))}, pubKey...), 0xac)
+	classified := script.Classify(scriptPubKey)
+	if classified.Type != script.TypeP2PK {
+		t.Fatalf("genesis scriptPubKey classified as %s, want %s", classified.Type, script.TypeP2PK)
+	}
+
+	genesisTx := chain.Transaction{
+		TxID:     genesisTxID,
+		WTxID:    genesisTxID, // no witness data
+		Version:  1,
+		LockTime: 0,
+		Size:     100, VSize: 100, Weight: 400, // synthetic — not source-derived
+		IsCoinbase: true,
+		Inputs: []chain.Input{
+			// Synthetic placeholder — the genuine genesis coinbase script
+			// (height/extranonce/message bytes) is not reproduced here;
+			// see the doc comment above.
+			{Index: 0, Coinbase: []byte{0x04, 0xff, 0xff, 0x00, 0x1d}, Sequence: 4294967295},
+		},
+		Outputs: []chain.Output{
+			{
+				Index:        0,
+				Value:        chain.Amount(genesisRewardSat),
+				ScriptPubKey: scriptPubKey,
+				ScriptType:   classified.Type,
+				PubKeys:      classified.PubKeys,
+				// Address intentionally left empty: Core deliberately omits
+				// the address field for bare P2PK (docs/ARCHITECTURE.md §7)
+				// — this genesis output genuinely has none to give.
+			},
+		},
+	}
+
+	genesis := testBlock(genesisBlockHash, 0, "", genesisTx)
 	if err := s.ApplyBlock(ctx, genesis); err != nil {
 		t.Fatalf("apply genesis block: %v", err)
 	}
 
-	var txCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM transactions WHERE txid = $1`, genesisTxID).Scan(&txCount); err != nil {
-		t.Fatalf("count genesis transaction: %v", err)
+	var txVersion int64
+	if err := pool.QueryRow(ctx, `SELECT version FROM transactions WHERE txid = $1`, genesisTxID).Scan(&txVersion); err != nil {
+		t.Fatalf("genesis transaction not persisted: %v", err)
 	}
-	if txCount != 1 {
-		t.Errorf("genesis transaction persisted: count = %d, want 1", txCount)
+	if txVersion != 1 {
+		t.Errorf("genesis transaction version = %d, want 1", txVersion)
 	}
 
 	var value int64
-	if err := pool.QueryRow(ctx, `SELECT value_satoshis FROM transaction_outputs WHERE txid = $1 AND vout_index = 0`, genesisTxID).Scan(&value); err != nil {
+	var storedScript []byte
+	var scriptType string
+	if err := pool.QueryRow(ctx, `SELECT value_satoshis, script_pubkey, script_type FROM transaction_outputs WHERE txid = $1 AND vout_index = 0`, genesisTxID).
+		Scan(&value, &storedScript, &scriptType); err != nil {
 		t.Fatalf("genesis output not persisted: %v", err)
 	}
-	if value != 5_000_000_000 {
-		t.Errorf("genesis output value_satoshis = %d, want 5000000000", value)
+	if value != genesisRewardSat {
+		t.Errorf("genesis output value_satoshis = %d, want %d", value, genesisRewardSat)
+	}
+	if !bytes.Equal(storedScript, scriptPubKey) {
+		t.Error("genesis output scriptPubKey did not round-trip exactly")
+	}
+	if scriptType != string(script.TypeP2PK) {
+		t.Errorf("genesis output script_type = %s, want %s", scriptType, script.TypeP2PK)
 	}
 
 	utxo, err := s.GetUTXO(ctx, genesisTxID, 0)
@@ -705,12 +761,18 @@ func TestApplyBlock_GenesisCoinbaseUnspendable(t *testing.T) {
 		t.Errorf("GetUTXO for the genesis output = %+v, want nil (genesis coinbase is unspendable)", utxo)
 	}
 
+	// Confirms the store never synthesizes an address/balance cache entry
+	// from the genesis output — trivially true here since bare P2PK has no
+	// Address to begin with (see TestApplyBlock_UnspendableOutputs and
+	// ApplyBlock's "Core UTXO semantics" for the general utxo_state-join
+	// exclusion mechanism this relies on, exercised there with a real
+	// destination address instead).
 	var addrCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM addresses WHERE address = 'qGenesis'`).Scan(&addrCount); err != nil {
-		t.Fatalf("count qGenesis address cache: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM addresses`).Scan(&addrCount); err != nil {
+		t.Fatalf("count address cache rows: %v", err)
 	}
 	if addrCount != 0 {
-		t.Errorf("address cache created from the genesis output: count = %d, want 0", addrCount)
+		t.Errorf("address cache rows exist after applying only the genesis block: count = %d, want 0", addrCount)
 	}
 
 	// Replay remains idempotent.
@@ -1078,4 +1140,214 @@ func TestApplyBlock_MultisigSameAddressDifferentPubkeyConflict(t *testing.T) {
 	if !errors.Is(err, ErrImmutableConflict) {
 		t.Errorf("error = %v, want ErrImmutableConflict", err)
 	}
+}
+
+// ─── Final review round: transaction completeness (item 1) ─────────────
+
+// TestApplyBlock_TransactionCompleteness proves ApplyBlock rejects a
+// transaction with an empty vin or vout — ApplyBlock represents a fully
+// decoded transaction, so an empty vin/vout must never be accepted as a
+// possibly-partial RPC translation. Mirrors the shape (not the
+// reachability) of Core's CheckTransaction bad-txns-vin-empty/
+// bad-txns-vout-empty checks — Store is not becoming a consensus
+// validator.
+func TestApplyBlock_TransactionCompleteness(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("coinbase with zero outputs rejected, zero writes, checkpoint unmoved", func(t *testing.T) {
+		s, pool := newTestStore(t)
+		g := testBlock(hash64("emptyvoutG"), 100, "", coinbaseTx(hash64("emptyvoutGtx"), out(0, 5_000_000_000, "qAlice")))
+		mustApply(t, ctx, s, g)
+
+		bad := chain.Transaction{
+			TxID: hash64("emptyvouttx"), WTxID: hash64("emptyvouttx"), Version: 2, Size: 100, VSize: 100, Weight: 400,
+			IsCoinbase: true,
+			Inputs:     []chain.Input{{Index: 0, Coinbase: []byte{0x51}, Sequence: 4294967295}},
+			Outputs:    nil,
+		}
+		block := testBlock(hash64("emptyvout"), 101, hash64("emptyvoutG"), bad)
+		err := s.ApplyBlock(ctx, block)
+		if err == nil {
+			t.Fatal("expected a coinbase with zero outputs to be rejected")
+		}
+		if !errors.Is(err, ErrInvalidTransactionShape) {
+			t.Errorf("error = %v, want ErrInvalidTransactionShape", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE hash = $1`, hash64("emptyvout")).Scan(&count); err != nil {
+			t.Fatalf("count blocks: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("rejected block persisted: count = %d", count)
+		}
+		tip, err := s.Tip(ctx)
+		if err != nil {
+			t.Fatalf("Tip: %v", err)
+		}
+		if tip.Hash != hash64("emptyvoutG") {
+			t.Errorf("Tip.Hash = %s, want %s (checkpoint must not move)", tip.Hash, hash64("emptyvoutG"))
+		}
+	})
+
+	t.Run("non-coinbase with zero inputs rejected, zero writes, checkpoint unmoved", func(t *testing.T) {
+		s, pool := newTestStore(t)
+		g := testBlock(hash64("emptyvinG"), 100, "", coinbaseTx(hash64("emptyvinGtx"), out(0, 5_000_000_000, "qAlice")))
+		mustApply(t, ctx, s, g)
+
+		bad := chain.Transaction{
+			TxID: hash64("emptyvintx"), WTxID: hash64("emptyvintx"), Version: 2, Size: 100, VSize: 100, Weight: 400,
+			IsCoinbase: false,
+			Inputs:     nil,
+			Outputs:    []chain.Output{out(0, 1_000_000_000, "qBob")},
+		}
+		block := testBlock(hash64("emptyvin"), 101, hash64("emptyvinG"), minerCoinbase("emptyvin"), bad)
+		err := s.ApplyBlock(ctx, block)
+		if err == nil {
+			t.Fatal("expected a non-coinbase with zero inputs to be rejected")
+		}
+		if !errors.Is(err, ErrInvalidTransactionShape) {
+			t.Errorf("error = %v, want ErrInvalidTransactionShape", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE hash = $1`, hash64("emptyvin")).Scan(&count); err != nil {
+			t.Fatalf("count blocks: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("rejected block persisted: count = %d", count)
+		}
+		tip, err := s.Tip(ctx)
+		if err != nil {
+			t.Fatalf("Tip: %v", err)
+		}
+		if tip.Hash != hash64("emptyvinG") {
+			t.Errorf("Tip.Hash = %s, want %s (checkpoint must not move)", tip.Hash, hash64("emptyvinG"))
+		}
+	})
+
+	t.Run("normal vin/vout accepted", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		block := testBlock(hash64("normalvv"), 100, "", coinbaseTx(hash64("normalvvtx"), out(0, 5_000_000_000, "qAlice")))
+		if err := s.ApplyBlock(ctx, block); err != nil {
+			t.Fatalf("expected a normal vin/vout transaction to be accepted: %v", err)
+		}
+	})
+}
+
+// ─── Final review round: chain.Input field exclusivity (item 2) ────────
+
+// TestApplyBlock_InputFieldExclusivity proves ApplyBlock enforces
+// chain.Input's documented invariant — PreviousOut/Coinbase/ScriptSig are
+// mutually exclusive by construction — before any database write, rather
+// than silently discarding Input.Coinbase whenever PreviousOut != nil (the
+// gap the review flagged: a future RPC decoder that ever constructs an
+// inconsistent model must be caught, not silently tolerated).
+func TestApplyBlock_InputFieldExclusivity(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("normal coinbase representation accepted", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		block := testBlock(hash64("inputexclA"), 100, "", coinbaseTx(hash64("inputexclAtx"), out(0, 5_000_000_000, "qAlice")))
+		if err := s.ApplyBlock(ctx, block); err != nil {
+			t.Fatalf("expected a normal coinbase representation to be accepted: %v", err)
+		}
+	})
+
+	t.Run("coinbase with non-empty ScriptSig rejected", func(t *testing.T) {
+		s, pool := newTestStore(t)
+		bad := chain.Transaction{
+			TxID: hash64("inputexclBtx"), WTxID: hash64("inputexclBtx"), Version: 2, Size: 100, VSize: 100, Weight: 400,
+			IsCoinbase: true,
+			Inputs: []chain.Input{
+				{Index: 0, Coinbase: []byte{0x51}, ScriptSig: []byte{0x00}, Sequence: 4294967295},
+			},
+			Outputs: []chain.Output{out(0, 5_000_000_000, "qAlice")},
+		}
+		block := testBlock(hash64("inputexclB"), 100, "", bad)
+		err := s.ApplyBlock(ctx, block)
+		if err == nil {
+			t.Fatal("expected a coinbase with a non-empty ScriptSig to be rejected")
+		}
+		if !errors.Is(err, ErrInvalidTransactionShape) {
+			t.Errorf("error = %v, want ErrInvalidTransactionShape", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE hash = $1`, hash64("inputexclB")).Scan(&count); err != nil {
+			t.Fatalf("count blocks: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("rejected block persisted: count = %d", count)
+		}
+	})
+
+	t.Run("coinbase with missing/empty Coinbase bytes rejected", func(t *testing.T) {
+		s, pool := newTestStore(t)
+		bad := chain.Transaction{
+			TxID: hash64("inputexclCtx"), WTxID: hash64("inputexclCtx"), Version: 2, Size: 100, VSize: 100, Weight: 400,
+			IsCoinbase: true,
+			Inputs: []chain.Input{
+				{Index: 0, Coinbase: nil, Sequence: 4294967295},
+			},
+			Outputs: []chain.Output{out(0, 5_000_000_000, "qAlice")},
+		}
+		block := testBlock(hash64("inputexclC"), 100, "", bad)
+		err := s.ApplyBlock(ctx, block)
+		if err == nil {
+			t.Fatal("expected a coinbase with empty Coinbase bytes to be rejected")
+		}
+		if !errors.Is(err, ErrInvalidTransactionShape) {
+			t.Errorf("error = %v, want ErrInvalidTransactionShape", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE hash = $1`, hash64("inputexclC")).Scan(&count); err != nil {
+			t.Fatalf("count blocks: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("rejected block persisted: count = %d", count)
+		}
+	})
+
+	t.Run("non-coinbase with Coinbase bytes populated rejected", func(t *testing.T) {
+		s, pool := newTestStore(t)
+		g := testBlock(hash64("inputexclDG"), 100, "", coinbaseTx(hash64("inputexclDGtx"), out(0, 5_000_000_000, "qAlice")))
+		mustApply(t, ctx, s, g)
+
+		bad := chain.Transaction{
+			TxID: hash64("inputexclDtx"), WTxID: hash64("inputexclDtx"), Version: 2, Size: 200, VSize: 200, Weight: 800,
+			IsCoinbase: false,
+			Inputs: []chain.Input{
+				{Index: 0, PreviousOut: &chain.OutPoint{TxID: hash64("inputexclDGtx"), Index: 0}, Coinbase: []byte{0x51}, ScriptSig: []byte{}, Sequence: 4294967295},
+			},
+			Outputs: []chain.Output{out(0, 4_999_000_000, "qBob")},
+		}
+		block := testBlock(hash64("inputexclD"), 101, hash64("inputexclDG"), minerCoinbase("inputexclD"), bad)
+		err := s.ApplyBlock(ctx, block)
+		if err == nil {
+			t.Fatal("expected a non-coinbase input with Coinbase bytes populated to be rejected")
+		}
+		if !errors.Is(err, ErrInvalidTransactionShape) {
+			t.Errorf("error = %v, want ErrInvalidTransactionShape", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM blocks WHERE hash = $1`, hash64("inputexclD")).Scan(&count); err != nil {
+			t.Fatalf("count blocks: %v", err)
+		}
+		if count != 0 {
+			t.Errorf("rejected block persisted: count = %d", count)
+		}
+	})
+
+	t.Run("pure-witness non-coinbase with empty ScriptSig accepted", func(t *testing.T) {
+		s, _ := newTestStore(t)
+		g := testBlock(hash64("inputexclEG"), 100, "", coinbaseTx(hash64("inputexclEGtx"), out(0, 5_000_000_000, "qAlice")))
+		mustApply(t, ctx, s, g)
+
+		spend := spendTx(hash64("inputexclEtx"), hash64("inputexclEwtx"), 200,
+			[]chain.Input{spendInput(0, hash64("inputexclEGtx"), 0, chain.WitnessStack{{0xaa}})},
+			[]chain.Output{out(0, 4_999_000_000, "qBob")},
+		)
+		block := testBlock(hash64("inputexclE"), 101, hash64("inputexclEG"), minerCoinbase("inputexclE"), spend)
+		if err := s.ApplyBlock(ctx, block); err != nil {
+			t.Fatalf("expected a pure-witness spend with an empty ScriptSig to be accepted: %v", err)
+		}
+	})
 }

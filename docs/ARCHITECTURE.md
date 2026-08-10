@@ -1273,8 +1273,10 @@ safe orphan re-promotion, canonical-mutation concurrency, Core-equivalent
 UTXO semantics (genesis and `IsUnspendable` exclusion, below), and coinbase
 structural consistency — plus a real-mainnet-vector exercise reusing the
 P2PK/P2PKH/OP_RETURN/P2WPKH/P2TR scriptPubKeys already documented in
-`internal/script/classify_test.go`, and the real QOGE mainnet genesis
-block hash/txid for the genesis exclusion specifically.
+`internal/script/classify_test.go`, and a source-derived genesis
+identity/UTXO-semantics fixture (real block hash/txid/reward/version/
+scriptPubKey, synthetic coinbase input script — see the test's doc
+comment) for the genesis exclusion specifically.
 
 ### Canonical tip continuity, and safe orphan re-promotion
 
@@ -1395,8 +1397,13 @@ Qogecoin Core source:
    the genesis output specifically — it never existed in the coins database
    at all. `ApplyBlock` derives `isGenesis := block.Height == 0` and threads
    it down to `applyOutput`. `TestApplyBlock_GenesisCoinbaseUnspendable`
-   proves this against the real QOGE mainnet genesis block hash/txid: the
-   transaction and its output persist exactly, but `GetUTXO` is `nil` and no
+   proves this against a source-derived fixture — the real QOGE mainnet
+   genesis block hash, txid, coinbase reward (100 QOGE), transaction
+   version (1), and genesis output scriptPubKey (bare P2PK; the coinbase
+   input's raw script is a synthetic placeholder, not reproduced from
+   source — see the test's doc comment): the transaction and its output
+   persist exactly (including the real scriptPubKey round-tripping through
+   `script.Classify` as `TypeP2PK`), but `GetUTXO` is `nil` and no
    `addresses` cache row is created from it.
 2. **`script.IsUnspendable`.** Mirrors Core's `CScript::IsUnspendable()`
    (`src/script/script.h`) exactly: `(len(script) > 0 && script[0] ==
@@ -1421,6 +1428,41 @@ exactly as if it didn't exist, which is structurally correct: Core would
 reject spending it too) and, transitively, `recomputeAddress` (which reads
 `utxo_state` via an inner join — an address whose only activity is an
 excluded output gets no `addresses` cache row at all, not a zero-value one).
+
+### Transaction completeness and input field exclusivity
+
+**Added in a third, final review round.** Two more `validateBlockShape`
+checks, run before any database access, alongside the ones above:
+
+1. **Every transaction must have at least one input and one output.**
+   `ApplyBlock` claims to persist a fully decoded transaction, so an empty
+   `vin`/`vout` must never be silently accepted as a possibly-partial RPC
+   translation — the same completeness concern as `ErrIncompleteBlock`
+   above, applied one level down. This mirrors the *shape* (not the
+   reachability) of Core's `CheckTransaction` `bad-txns-vin-empty`/
+   `bad-txns-vout-empty` checks; `Store` is not becoming a consensus
+   validator. `ErrInvalidTransactionShape`.
+2. **`chain.Input`'s `PreviousOut`/`Coinbase`/`ScriptSig` fields are
+   mutually exclusive by construction** (`internal/chain/input.go`):
+   `Coinbase` is set only when `PreviousOut` is `nil`; `ScriptSig` is empty
+   for a coinbase input. Previously `applyInput` silently ignored
+   `Input.Coinbase` whenever `PreviousOut != nil` — a raw-preservation gap
+   if a future RPC decoder ever constructed an inconsistent model.
+   `validateBlockShape` now requires, per input: if `PreviousOut == nil`,
+   `Coinbase` must be non-empty and `ScriptSig` must be empty; if
+   `PreviousOut != nil`, `Coinbase` must be empty (`ScriptSig` may
+   legitimately be empty *or* non-empty either way — a pure witness spend
+   has no `ScriptSig`, and that alone is never rejected).
+   `ErrInvalidTransactionShape`.
+
+`TestApplyBlock_TransactionCompleteness` covers: a coinbase with zero
+outputs (rejected, zero writes); a non-coinbase with zero inputs (rejected,
+zero writes, checkpoint unmoved); a transaction with normal vin/vout
+(accepted). `TestApplyBlock_InputFieldExclusivity` covers: a normal
+coinbase representation (accepted); a coinbase with a non-empty `ScriptSig`
+(rejected); a coinbase with missing/empty `Coinbase` bytes (rejected); a
+non-coinbase with `Coinbase` bytes populated (rejected); and a pure-witness
+non-coinbase with an empty `ScriptSig` (accepted).
 
 ### Coinbase structural consistency
 
