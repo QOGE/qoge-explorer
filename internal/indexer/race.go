@@ -56,56 +56,92 @@ func (idx *Indexer) classifyHashUnavailable(ctx context.Context, height int64, o
 // already passed applyHeight's two-GetBlockHash race check (it was stable
 // at the moment it was fetched). A non-sequential rejection is NOT
 // automatically a corruption/integrity failure: Core may have
-// reorganized, or the local checkpoint may have moved via a concurrent
-// writer (Store's canonical-mutation lock explicitly permits other
-// writers sharing the same database — see docs/ARCHITECTURE.md §16), in
-// the window between the last reconcile() and this ApplyBlock call. This
-// distinguishes that normal orchestration race (ErrRemoteChainMoved, safe
-// to retry) from a genuinely self-contradictory fetched block (a terminal
-// error) — every ErrNonSequentialBlock is diagnosed individually, never
-// blindly mapped to a retry, which could hide a reproducibly malformed
-// Core/decoder result forever (review round: task item 2).
+// reorganized — including a SAME-HEIGHT branch replacement, where a
+// different block now sits at `height` entirely — or the local checkpoint
+// may have moved via a concurrent writer (Store's canonical-mutation lock
+// explicitly permits other writers sharing the same database — see
+// docs/ARCHITECTURE.md §16 and §18 "Multi-writer policy"), possibly to a
+// DIFFERENT HASH at the SAME height, in the window between the last
+// reconcile() and this ApplyBlock call. This distinguishes that normal
+// orchestration race (ErrRemoteChainMoved, safe to retry) from a
+// genuinely self-contradictory fetched block (a terminal error) — every
+// ErrNonSequentialBlock is diagnosed individually, never blindly mapped to
+// a retry, which could hide a reproducibly malformed Core/decoder result
+// forever (review round: task item 2).
+//
+// Step 1 re-checks the fetched block's own CURRENT identity at `height`
+// before reasoning about its parent at all: if Core no longer reports
+// `block.Hash` as current at `height` — e.g. a same-height branch
+// replacement made this exact block obsolete — that alone fully explains
+// the rejection, independent of whatever the local checkpoint's height or
+// hash happen to be. Only once that identity is confirmed does diagnosis
+// proceed to the parent/checkpoint comparison, bracketed by a second read
+// of the same height (mirroring applyHeight's own two-hash philosophy) so
+// a second reorg arriving mid-diagnosis can't produce a mixed-snapshot
+// terminal judgment (review round: task item 3, final hardening round).
 func (idx *Indexer) diagnoseNonSequential(ctx context.Context, height int64, block chain.Block, applyErr error) error {
+	currentBlockHash1, err := idx.rpc.GetBlockHash(ctx, height)
+	if err != nil {
+		return idx.classifyHashUnavailable(ctx, height, err)
+	}
+	if currentBlockHash1 != block.Hash {
+		// Core no longer reports this exact block as current at height —
+		// e.g. a same-height branch replacement (whether or not the local
+		// checkpoint has been updated to reflect it yet). Not malformed
+		// data; restart reconciliation.
+		return ErrRemoteChainMoved
+	}
+
 	currentLocal, err := idx.store.Tip(ctx)
 	if err != nil {
 		return fmt.Errorf("indexer: read local tip while diagnosing non-sequential block %d: %w", height, err)
 	}
 
-	// Rule A: the local checkpoint no longer matches what this height
-	// assumed (height-1) — another writer committed a block, rolled back,
-	// or otherwise changed canonical state concurrently. Restart
+	// The local checkpoint no longer matches what this height assumed
+	// (height-1) — another writer committed a block, rolled back, or
+	// otherwise advanced canonical state concurrently. Restart
 	// reconciliation rather than reasoning further about a stale view.
 	if currentLocal.Height != height-1 {
 		return ErrRemoteChainMoved
 	}
 
-	// Rule B/C: the local checkpoint is exactly the expected parent
-	// height. Check whether Core itself still agrees on that parent's
-	// hash — classifyHashUnavailable handles the sub-case where Core's
-	// tip has retreated below currentLocal.Height entirely (rule C).
-	coreHashAtParent, err := idx.rpc.GetBlockHash(ctx, currentLocal.Height)
+	// Bracket the parent read with a second check of the block's own
+	// identity at height: if it changed between the two reads, a second
+	// reorg arrived mid-diagnosis and this observation is a mix of two
+	// different Core snapshots — discard it rather than drawing a
+	// terminal conclusion from it.
+	currentParentHash, err := idx.rpc.GetBlockHash(ctx, currentLocal.Height)
 	if err != nil {
 		return idx.classifyHashUnavailable(ctx, currentLocal.Height, err)
 	}
+	currentBlockHash2, err := idx.rpc.GetBlockHash(ctx, height)
+	if err != nil {
+		return idx.classifyHashUnavailable(ctx, height, err)
+	}
+	if currentBlockHash2 != block.Hash {
+		return ErrRemoteChainMoved
+	}
 
-	if coreHashAtParent != currentLocal.Hash {
+	if currentParentHash != currentLocal.Hash {
 		// Core reorganized below the block being applied.
 		return ErrRemoteChainMoved
 	}
 
 	if block.PreviousHash != currentLocal.Hash {
-		// Core and the local checkpoint agree on the parent, and neither
-		// moved — yet the block fetched for this height claims a
-		// different parent. This is not a race; the fetched
-		// representation is internally contradictory relative to the
-		// currently-active parent. Halt rather than retry forever.
+		// block.Hash was confirmed stably current at `height` across both
+		// reads, and Core/the local checkpoint agree on the parent at
+		// height-1 — yet the fetched block's own PreviousHash contradicts
+		// that stable parent. This is not a race; the fetched
+		// representation is internally contradictory. Halt rather than
+		// retry forever.
 		return fmt.Errorf("indexer: block %d (%s) claims parent %s but the stable, currently-active parent at height %d is %s: %w",
 			height, block.Hash, block.PreviousHash, currentLocal.Height, currentLocal.Hash, applyErr)
 	}
 
 	// Every known race explanation checked out clean — Core and the local
-	// checkpoint agree, and the fetched block's parent matches both.
-	// Store's rejection is therefore unexplained by any known
-	// orchestration race; surface it as-is rather than guessing further.
+	// checkpoint agree, and the fetched block's identity/parent match
+	// both, stably. Store's rejection is therefore unexplained by any
+	// known orchestration race; surface it as-is rather than guessing
+	// further.
 	return fmt.Errorf("indexer: apply block %d (%s): %w", height, block.Hash, applyErr)
 }

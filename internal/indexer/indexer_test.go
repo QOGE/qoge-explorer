@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QOGE/qoge-explorer/internal/decode"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -822,6 +823,77 @@ func TestSyncToTip_StableCoreContradictoryParentIsTerminal(t *testing.T) {
 	if tipAfter != tipBefore {
 		t.Fatalf("checkpoint changed on a terminal contradictory-block error: before=%+v after=%+v", tipBefore, tipAfter)
 	}
+}
+
+// ─── Z: same-height LOCAL checkpoint replacement is diagnosed, not fatal ──
+//
+// Final review round: a same-height canonical-context race where the
+// local checkpoint itself has already been moved (by a second writer
+// sharing this Store) to a DIFFERENT HASH at the SAME height a block was
+// about to be applied at. The old diagnosis only checked
+// currentLocal.Height != height-1 (true here — the checkpoint's height
+// hasn't changed, only its hash) and incorrectly reached the terminal
+// "contradictory parent" conclusion. The fix re-checks the fetched
+// block's own CURRENT Core identity first, which — since Core has also
+// moved to the same new branch — correctly explains the rejection as a
+// race before parent reasoning is even attempted.
+
+func TestSyncToTip_SameHeightLocalCheckpointReplacement(t *testing.T) {
+	ctx := context.Background()
+	st, pool := newTestStore(t)
+
+	g := buildBlock("Z-g", 0, "")
+	a1 := buildBlock("Z-a1", 1, g.hash)
+	a2 := buildBlock("Z-a2", 2, a1.hash)
+	b1 := buildBlock("Z-b1", 1, g.hash)
+	b2 := buildBlock("Z-b2", 2, b1.hash)
+
+	fr := newFakeRPC()
+	fr.setActiveChain(g, a1)
+
+	idx := New(fr, st, nil, time.Second, nil)
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("first sync: %v", err)
+	}
+
+	// Simulate a SECOND writer sharing this Store having already
+	// reconciled the checkpoint to B1 at height 1 (Store's canonical-
+	// mutation lock explicitly permits this — docs/ARCHITECTURE.md §16).
+	b1Block, err := decode.DecodeBlock(ctx, b1.raw(), nil)
+	if err != nil {
+		t.Fatalf("decode b1: %v", err)
+	}
+	if err := st.RollbackTo(ctx, g.hash); err != nil {
+		t.Fatalf("simulate second writer rollback: %v", err)
+	}
+	if err := st.ApplyBlock(ctx, b1Block); err != nil {
+		t.Fatalf("simulate second writer apply b1: %v", err)
+	}
+
+	// Core has ALSO genuinely reorganized to A0->B1->B2 by now. Model this
+	// indexer instance having already fetched/stably-verified A2 BEFORE
+	// any of the above happened: both of applyHeight's GetBlockHash(2)
+	// calls are stubbed to return the stale A2 hash exactly once each.
+	fr.setActiveChain(g, b1, b2)
+	fr.registerOrphan(a2)
+	fr.queueHashOnce(2, a2.hash)
+	fr.queueHashOnce(2, a2.hash)
+
+	if err := idx.SyncToTip(ctx); err != nil {
+		t.Fatalf("second sync: %v", err)
+	}
+
+	tip, err := st.Tip(ctx)
+	if err != nil {
+		t.Fatalf("Tip: %v", err)
+	}
+	if tip.Height != 2 || tip.Hash != b2.hash {
+		t.Fatalf("tip = (%d, %s), want (2, %s) — the real B branch, never a terminal halt on stale A2", tip.Height, tip.Hash, b2.hash)
+	}
+	assertCanonical(t, ctx, st, 0, g.hash)
+	assertCanonical(t, ctx, st, 1, b1.hash)
+	assertCanonical(t, ctx, st, 2, b2.hash)
+	assertOrphaned(t, ctx, pool, a1.hash)
 }
 
 // ─── negative GetBlockCount is rejected as malformed RPC data ───────────

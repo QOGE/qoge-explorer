@@ -1998,6 +1998,47 @@ Branch flip-back (A→B→A) is exercised directly, confirming the old A
 branch's blocks are safely re-promoted rather than reinserted, and the B
 branch remains queryable orphan audit history.
 
+### Multi-writer policy
+
+`Store` itself is fully cross-process transaction-safe: `ApplyBlock` and
+`RollbackTo` each acquire the same `sync_state('main')` row lock
+(`lockCheckpoint`, §16) before touching anything, so any number of
+processes sharing one database can never corrupt canonical state, race
+each other into an inconsistent write, or apply two conflicting blocks at
+the same height — Postgres serializes them regardless of what any
+particular writer believed the checkpoint was.
+
+**Phase 2C.2 production policy is exactly ONE active indexer orchestrator
+per database.** The indexer layer — not `Store` — is where this matters:
+`reorg`'s automatic-reorg depth policy (`localTip.Height - ancestorHeight
+<= 100`) is *computed* against a checkpoint read moments earlier, and the
+pre-`RollbackTo` local-tip recheck (above) only detects — never
+atomically prevents — a second writer having changed that checkpoint in
+the interim (it re-reads `Store.Tip()` and discards the decision via
+`ErrRemoteChainMoved` if it no longer matches, rather than trusting a
+stale snapshot). That check closes the *correctness* gap — an indexer
+never rolls back based on a depth computed against a checkpoint that is no
+longer current — but it does not make the depth-approval decision itself
+atomic with a second writer's own concurrent mutation the way `Store`'s
+internal row lock makes `ApplyBlock`/`RollbackTo` atomic with each other.
+Running two indexer orchestrators against the same database concurrently
+is therefore unsupported/undefined behavior for this phase: `Store`'s data
+will never become inconsistent, but the two orchestrators' reorg-depth
+decisions are not coordinated, and either could observe
+`ErrRemoteChainMoved`/`ErrNonSequentialBlock` churn from the other's
+writes rather than making forward progress.
+
+A `pg_advisory_lock`-based singleton lease was considered as an
+enforcement mechanism (it needs no schema/migration change), but the
+indexer only holds a `*store.Store`, which deliberately exposes no raw SQL
+execution surface (§16) — implementing one cleanly would mean either
+adding new `Store` API surface beyond `CanonicalBlockHash`, or having the
+indexer open a second, independent database connection outside `Store`
+entirely. Both are more than this phase's minimal read-only Store addition
+was scoped for; enforcing single-orchestrator as a hard guarantee (rather
+than an operational policy) is left for a later phase. For now: run
+exactly one `qoge-explorer index` process per database.
+
 ### Sync target moving forward
 
 A `SyncToTip` pass snapshots `target := rpc.GetBlockCount()` and
