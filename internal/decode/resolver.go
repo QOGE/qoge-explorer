@@ -48,8 +48,14 @@ func NewCoreAddressResolver(client *rpc.Client) *CoreAddressResolver {
 	}
 }
 
-// ResolvePubKeyAddress implements AddressResolver.
+// ResolvePubKeyAddress implements AddressResolver. It fails cleanly
+// (returns an error) rather than panicking if the resolver was
+// constructed with a nil RPC client.
 func (r *CoreAddressResolver) ResolvePubKeyAddress(ctx context.Context, pubKeyHex string) (string, error) {
+	if r.client == nil {
+		return "", fmt.Errorf("resolve address for pubkey %s: CoreAddressResolver has no RPC client (nil)", pubKeyHex)
+	}
+
 	r.mu.Lock()
 	if addr, ok := r.cache[pubKeyHex]; ok {
 		r.mu.Unlock()

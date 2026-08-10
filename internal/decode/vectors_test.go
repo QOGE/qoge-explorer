@@ -10,8 +10,6 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/script"
 )
 
-func strPtr(s string) *string { return &s }
-
 // ─── real mainnet vectors (task item 13) ─────────────────────────────────
 //
 // Real block hashes/heights/txids/scriptPubKey bytes, reusing the same
@@ -21,8 +19,8 @@ func strPtr(s string) *string { return &s }
 // (this repo has no offline historical block source — the prior review
 // round's task item 14 explicitly permits this for real-vector fixtures).
 // P2PK address resolution here uses a deterministic fake resolver, not a
-// live node; TestGenesisVector_LiveRPCIntegration in integration_test.go
-// opt-in-cross-checks selected vectors against a real running node.
+// live node; TestLiveRPC_* in integration_test.go opt-in-cross-checks
+// selected vectors against a real running node.
 
 func TestDecodeBlock_RealVector_Genesis(t *testing.T) {
 	ctx := context.Background()
@@ -34,19 +32,19 @@ func TestDecodeBlock_RealVector_Genesis(t *testing.T) {
 	scriptHex := "41" + genesisPubKeyHex + "ac" // <push 65><pubkey> OP_CHECKSIG
 
 	raw := rawBlockFixture(genesisBlockHash, 0, "", rpc.RawTransaction{
-		TxID: genesisTxID, Hash: genesisTxID,
-		Version: 1, Size: 100, VSize: 100, Weight: 400, LockTime: 0,
-		Vin: []rpc.RawVin{{Coinbase: strPtr("04ffff001d"), Sequence: 4294967295}},
+		TxID: strPtr(genesisTxID), Hash: strPtr(genesisTxID),
+		Version: uint32Ptr(1), Size: intPtr(100), VSize: intPtr(100), Weight: intPtr(400), LockTime: uint32Ptr(0),
+		Vin: []rpc.RawVin{{Coinbase: strPtr("04ffff001d"), Sequence: uint32Ptr(4294967295)}},
 		Vout: []rpc.RawVout{{
 			Value:        "100", // 100 QOGE, per Qogecoin's stable chainparams
-			N:            0,
-			ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}, // Core omits address for bare P2PK
+			N:            uint32Ptr(0),
+			ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}, // Core omits address for bare P2PK
 		}},
 	})
 
 	// "qd4Cs5rBh6JF89JNms9YpyGP1J5uEgs3jT" is the address live
 	// getdescriptorinfo/deriveaddresses resolved this exact pubkey to on
-	// the local node during this review round (see
+	// the local node during an earlier review round (see
 	// TestLiveRPC_GenesisBlockDecodesAgainstRealNode) — used here via the
 	// deterministic fake resolver so this test never needs a running
 	// qogecoind.
@@ -88,20 +86,21 @@ func TestDecodeOutput_RealVector_EarlyP2PK(t *testing.T) {
 	// internal/store/apply_test.go's TestApplyBlock_RealMainnetFixtures
 	// and internal/script/classify_test.go). txid, script, and value
 	// cross-checked live against `getblock 09d272c0...a35 2` on the local
-	// node during this review round, which also confirmed Core reports no
-	// "address" field for this output. The fake resolver below returns the
-	// SAME address that live getdescriptorinfo/deriveaddresses resolved
-	// this exact pubkey to on that node (TestLiveRPC_DescriptorResolutionRoundTrip,
-	// integration_test.go) — deterministic here so this test never needs a
-	// running qogecoind, but not an arbitrary placeholder either.
+	// node during an earlier review round, which also confirmed Core
+	// reports no "address" field for this output. The fake resolver below
+	// returns the SAME address that live getdescriptorinfo/deriveaddresses
+	// resolved this exact pubkey to on that node
+	// (TestLiveRPC_DescriptorResolutionRoundTrip, integration_test.go) —
+	// deterministic here so this test never needs a running qogecoind, but
+	// not an arbitrary placeholder either.
 	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
 	scriptHex := "21" + pubKeyHex + "ac"
 	raw := rpc.RawVout{
 		Value:        "100",
-		N:            0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}, // Core RPC address field absent for a bare P2PK output
+		N:            uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}, // Core RPC address field absent for a bare P2PK output
 	}
-	if raw.ScriptPubKey.Address != "" {
+	if raw.ScriptPubKey.Address != nil {
 		t.Fatal("test fixture error: address must be absent for this vector")
 	}
 
@@ -126,12 +125,12 @@ func TestDecodeOutput_RealVector_P2PKH(t *testing.T) {
 	// Block 8000 coinbase — P2PKH (txid
 	// a8ee14b21e7d42a4e9c155de159c9836ce932d4c4cccf77a0f23a71acd031b45) —
 	// script, value, and address cross-checked live against `getblock
-	// 6d0bf534...1fd 2` on the local node during this review round.
+	// 6d0bf534...1fd 2` on the local node during an earlier review round.
 	scriptHex := "76a914db6cdf671aa4dc3a395b934ca08bffb54658f36c88ac"
 	raw := rpc.RawVout{
 		Value:        "100",
-		N:            0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "pubkeyhash", Address: "qdZbZeX5YG2rCFWUeGJrBdKjc2xFPeZ1YU"},
+		N:            uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "pubkeyhash", Address: strPtr("qdZbZeX5YG2rCFWUeGJrBdKjc2xFPeZ1YU")},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -153,13 +152,13 @@ func TestDecodeOutput_RealVector_OpReturn(t *testing.T) {
 	// Block 38393 — OP_RETURN witness commitment (txid
 	// 01d172762f277d6b2a48bc935ed2603dddd23f9eb85d84bd325fde05a3787be0) —
 	// script and value cross-checked live against `getblock
-	// d6ddea02...743 2` on the local node during this review round, which
-	// also confirmed Core reports no "address" field for this output.
+	// d6ddea02...743 2` on the local node during an earlier review round,
+	// which also confirmed Core reports no "address" field for this output.
 	scriptHex := "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9"
 	raw := rpc.RawVout{
 		Value:        "0",
-		N:            0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "nulldata"}, // no address field
+		N:            uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "nulldata"}, // no address field
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -184,13 +183,13 @@ func TestDecodeOutput_RealVector_P2WPKH(t *testing.T) {
 	// Native SegWit P2WPKH at height 494,289 (txid
 	// 180c6aee4e8ff354868f7f44945192e1bd2941827413203f5b69c36bb3fb4a29) —
 	// hash, script, value, and address all cross-checked live against
-	// `getblock 49e2123d...904 2` on the local node during this review
-	// round.
+	// `getblock 49e2123d...904 2` on the local node during an earlier
+	// review round.
 	scriptHex := "001471fcd715a320938d8dfa1b56d9acdab9b1616be1"
 	raw := rpc.RawVout{
 		Value:        "0.53687299",
-		N:            0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "witness_v0_keyhash", Address: "bq1qw87dw9dryzfcmr06rdtdntx6hxckz6lp9gj3nu"},
+		N:            uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "witness_v0_keyhash", Address: strPtr("bq1qw87dw9dryzfcmr06rdtdntx6hxckz6lp9gj3nu")},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -218,13 +217,13 @@ func TestDecodeOutput_RealVector_P2TR(t *testing.T) {
 	// Real QOGE Taproot output at height 1,284,510 (txid
 	// 8c7381260e076f781de4c0c5246c709579c80e964738a719579ae4fd5c312106) —
 	// hash, script, value, and address all cross-checked live against
-	// `getblock 983e028d...52f 2` on the local node during this review
-	// round.
+	// `getblock 983e028d...52f 2` on the local node during an earlier
+	// review round.
 	scriptHex := "51202e44fe044d16a3b7900c179d9bb3fc005f0d5e92c89b8c7c0d340c7d6f56077c"
 	raw := rpc.RawVout{
 		Value:        "149.24759996",
-		N:            0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "witness_v1_taproot", Address: "bq1p9ez0upzdz63m0yqvz7wehvluqp0s6h5jezdcclqdxsx86m6kqa7qwqlq3p"},
+		N:            uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "witness_v1_taproot", Address: strPtr("bq1p9ez0upzdz63m0yqvz7wehvluqp0s6h5jezdcclqdxsx86m6kqa7qwqlq3p")},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -266,14 +265,16 @@ func TestDecodeOutput_P2QPKSyntheticVector(t *testing.T) {
 
 	raw := rpc.RawVout{
 		Value: "1",
-		N:     0,
-		ScriptPubKey: rpc.RawScriptPubKey{
-			Hex:  scriptHex,
+		N:     uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{
+			Hex:  strPtr(scriptHex),
 			Type: "witness_unknown", // Core has no dedicated P2QPK type today
 			// Address is exactly as Core would expose a witness_unknown
-			// destination for this program — synthetic value here, but the
+			// destination for this program — synthetic value here (and
+			// required present, per Core's ExtractDestination succeeding
+			// for any structurally valid witness program), but the
 			// decoder's job is only to copy it, never derive it.
-			Address: "qP2QPKWitnessUnknownAddress",
+			Address: strPtr("qP2QPKWitnessUnknownAddress"),
 		},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
@@ -299,9 +300,9 @@ func TestDecodeInput_P2QPKWitnessSpendVector(t *testing.T) {
 	pub := strings.Repeat("ef", script.P2QPKPublicKeyLength) // 32 bytes, hex-encoded
 
 	raw := rpc.RawVin{
-		TxID: rawHash("p2qpkprevtx"), Vout: 0,
-		ScriptSig:   &rpc.RawScriptSig{Hex: ""}, // pure witness spend
-		Sequence:    4294967295,
+		TxID: strPtr(rawHash("p2qpkprevtx")), Vout: uint32Ptr(0),
+		ScriptSig:   &rpc.RawScriptSig{Hex: strPtr("")}, // pure witness spend
+		Sequence:    uint32Ptr(4294967295),
 		TxInWitness: []string{sig, pub},
 	}
 	in, err := decodeInput(0, raw)

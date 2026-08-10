@@ -10,9 +10,25 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/script"
 )
 
+// require returns the dereferenced value of a required pointer field, or
+// an error naming field if p is nil (Core omitted the key entirely).
+// Generic over every scalar field type this package's raw DTOs use
+// (string, int, int64, uint32, float64) — see rpc.RawBlock's doc comment
+// for why these must be pointers rather than plain zero-valued fields.
+func require[T any](p *T, field string) (T, error) {
+	if p == nil {
+		var zero T
+		return zero, fmt.Errorf("missing required field %q", field)
+	}
+	return *p, nil
+}
+
 // DecodeBlock strictly decodes raw (Core's `getblock <hash> 2` response)
 // into a chain.Block ready for Store.ApplyBlock. resolver is used to
-// resolve bare P2PK/multisig participant addresses (see AddressResolver).
+// resolve bare P2PK/multisig participant addresses (see AddressResolver);
+// it may be nil if raw is known not to contain any P2PK/multisig outputs,
+// but decodeOutput rejects — rather than panics — if a nil resolver is
+// actually needed.
 //
 // DecodeBlock requires raw.NTx == len(raw.Tx) before returning a complete
 // block — Store.ApplyBlock represents a fully indexed block, never a
@@ -20,52 +36,132 @@ import (
 // otherwise incomplete RPC response must fail here rather than construct a
 // chain.Block Store would later reject with less context.
 //
-// Genesis (raw.PreviousBlockHash absent, i.e. "") decodes to
-// chain.Block.PreviousHash == "", matching chain.Block's own documented
-// convention ("empty only for genesis").
+// Genesis (height 0) requires raw.PreviousBlockHash to be absent (nil);
+// every other height requires it present and a valid hash — Core's
+// blockheaderToJSON only emits "previousblockhash" when a previous block
+// actually exists, so decoding genesis to chain.Block.PreviousHash == ""
+// is a positive assertion about height, never inferred from an empty or
+// missing string alone.
 func DecodeBlock(ctx context.Context, raw rpc.RawBlock, resolver AddressResolver) (chain.Block, error) {
-	if err := validateHash(raw.Hash); err != nil {
+	hashStr, err := require(raw.Hash, "hash")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block: %w", err)
+	}
+	if err := validateHash(hashStr); err != nil {
 		return chain.Block{}, fmt.Errorf("decode block: hash: %w", err)
 	}
-	if err := validateHash(raw.MerkleRoot); err != nil {
-		return chain.Block{}, fmt.Errorf("decode block %s: merkleroot: %w", raw.Hash, err)
+
+	height, err := require(raw.Height, "height")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	if height < 0 {
+		return chain.Block{}, fmt.Errorf("decode block %s: height %d is negative", hashStr, height)
 	}
 
-	prevHash := ""
-	if raw.PreviousBlockHash != "" {
-		if err := validateHash(raw.PreviousBlockHash); err != nil {
-			return chain.Block{}, fmt.Errorf("decode block %s: previousblockhash: %w", raw.Hash, err)
-		}
-		prevHash = raw.PreviousBlockHash
+	merkleRootStr, err := require(raw.MerkleRoot, "merkleroot")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	if err := validateHash(merkleRootStr); err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: merkleroot: %w", hashStr, err)
 	}
 
-	if raw.NTx != len(raw.Tx) {
-		return chain.Block{}, fmt.Errorf("decode block %s: nTx=%d but %d transactions supplied", raw.Hash, raw.NTx, len(raw.Tx))
+	prevHash, err := decodeGenesisRelation(hashStr, height, raw.PreviousBlockHash)
+	if err != nil {
+		return chain.Block{}, err
+	}
+
+	timeVal, err := require(raw.Time, "time")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	bits, err := require(raw.Bits, "bits")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	if err := validateBits(bits); err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: bits: %w", hashStr, err)
+	}
+	difficulty, err := require(raw.Difficulty, "difficulty")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	nonce, err := require(raw.Nonce, "nonce")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	size, err := require(raw.Size, "size")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	if size < 0 {
+		return chain.Block{}, fmt.Errorf("decode block %s: size %d is negative", hashStr, size)
+	}
+	weight, err := require(raw.Weight, "weight")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+	if weight < 0 {
+		return chain.Block{}, fmt.Errorf("decode block %s: weight %d is negative", hashStr, weight)
+	}
+	nTx, err := require(raw.NTx, "nTx")
+	if err != nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: %w", hashStr, err)
+	}
+
+	if raw.Tx == nil {
+		return chain.Block{}, fmt.Errorf("decode block %s: missing required field %q", hashStr, "tx")
+	}
+	if nTx != len(raw.Tx) {
+		return chain.Block{}, fmt.Errorf("decode block %s: nTx=%d but %d transactions supplied", hashStr, nTx, len(raw.Tx))
 	}
 
 	txs := make([]chain.Transaction, len(raw.Tx))
 	for i, rawTx := range raw.Tx {
 		txn, err := DecodeTransaction(ctx, rawTx, resolver)
 		if err != nil {
-			return chain.Block{}, fmt.Errorf("decode block %s tx %d: %w", raw.Hash, i, err)
+			return chain.Block{}, fmt.Errorf("decode block %s tx %d: %w", hashStr, i, err)
 		}
 		txs[i] = txn
 	}
 
 	return chain.Block{
-		Hash:         raw.Hash,
-		Height:       raw.Height,
+		Hash:         hashStr,
+		Height:       height,
 		PreviousHash: prevHash,
-		MerkleRoot:   raw.MerkleRoot,
-		Time:         raw.Time,
-		Bits:         raw.Bits,
-		Difficulty:   raw.Difficulty,
-		Nonce:        raw.Nonce,
-		Size:         raw.Size,
-		Weight:       raw.Weight,
-		TxCount:      raw.NTx,
+		MerkleRoot:   merkleRootStr,
+		Time:         timeVal,
+		Bits:         bits,
+		Difficulty:   difficulty,
+		Nonce:        nonce,
+		Size:         size,
+		Weight:       weight,
+		TxCount:      nTx,
 		Transactions: txs,
 	}, nil
+}
+
+// decodeGenesisRelation enforces height<->previousblockhash presence
+// exactly: height 0 requires prevHashField absent; height > 0 requires it
+// present and a valid hash. Presence, not string emptiness, is what's
+// checked — Core never emits "previousblockhash":"" for any block.
+func decodeGenesisRelation(blockHash string, height int64, prevHashField *string) (string, error) {
+	switch {
+	case height == 0:
+		if prevHashField != nil {
+			return "", fmt.Errorf("decode block %s: height 0 (genesis) but previousblockhash is present (%q)", blockHash, *prevHashField)
+		}
+		return "", nil
+	default: // height > 0 (negative height already rejected by the caller)
+		if prevHashField == nil {
+			return "", fmt.Errorf("decode block %s: height %d but previousblockhash is missing", blockHash, height)
+		}
+		if err := validateHash(*prevHashField); err != nil {
+			return "", fmt.Errorf("decode block %s: previousblockhash: %w", blockHash, err)
+		}
+		return *prevHashField, nil
+	}
 }
 
 // DecodeTransaction strictly decodes one raw transaction. txid/wtxid are
@@ -73,24 +169,56 @@ func DecodeBlock(ctx context.Context, raw rpc.RawBlock, resolver AddressResolver
 // derived, recomputed, or substituted (docs/ARCHITECTURE.md §3a; see also
 // chain.Transaction's TxID/WTxID doc comments).
 func DecodeTransaction(ctx context.Context, raw rpc.RawTransaction, resolver AddressResolver) (chain.Transaction, error) {
-	if raw.TxID == "" {
-		return chain.Transaction{}, fmt.Errorf("decode transaction: missing txid")
+	txid, err := require(raw.TxID, "txid")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction: %w", err)
 	}
-	if err := validateHash(raw.TxID); err != nil {
+	if err := validateHash(txid); err != nil {
 		return chain.Transaction{}, fmt.Errorf("decode transaction: txid: %w", err)
 	}
-	if raw.Hash == "" {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: missing hash (wtxid)", raw.TxID)
+	wtxid, err := require(raw.Hash, "hash")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
 	}
-	if err := validateHash(raw.Hash); err != nil {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: hash (wtxid): %w", raw.TxID, err)
+	if err := validateHash(wtxid); err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: hash (wtxid): %w", txid, err)
+	}
+
+	version, err := require(raw.Version, "version")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
+	}
+	size, err := require(raw.Size, "size")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
+	}
+	if size < 0 {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: size %d is negative", txid, size)
+	}
+	vsize, err := require(raw.VSize, "vsize")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
+	}
+	if vsize < 0 {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: vsize %d is negative", txid, vsize)
+	}
+	weight, err := require(raw.Weight, "weight")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
+	}
+	if weight < 0 {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: weight %d is negative", txid, weight)
+	}
+	lockTime, err := require(raw.LockTime, "locktime")
+	if err != nil {
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %w", txid, err)
 	}
 
 	if len(raw.Vin) == 0 {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: no inputs", raw.TxID)
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: no inputs", txid)
 	}
 	if len(raw.Vout) == 0 {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: no outputs", raw.TxID)
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: no outputs", txid)
 	}
 
 	inputs := make([]chain.Input, len(raw.Vin))
@@ -98,7 +226,7 @@ func DecodeTransaction(ctx context.Context, raw rpc.RawTransaction, resolver Add
 	for i, rawVin := range raw.Vin {
 		in, err := decodeInput(uint32(i), rawVin)
 		if err != nil {
-			return chain.Transaction{}, fmt.Errorf("decode transaction %s vin %d: %w", raw.TxID, i, err)
+			return chain.Transaction{}, fmt.Errorf("decode transaction %s vin %d: %w", txid, i, err)
 		}
 		if in.PreviousOut == nil {
 			coinbaseCount++
@@ -106,30 +234,30 @@ func DecodeTransaction(ctx context.Context, raw rpc.RawTransaction, resolver Add
 		inputs[i] = in
 	}
 	if coinbaseCount > 1 {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %d coinbase-shaped inputs, want at most 1", raw.TxID, coinbaseCount)
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: %d coinbase-shaped inputs, want at most 1", txid, coinbaseCount)
 	}
 	isCoinbase := coinbaseCount == 1
 	if isCoinbase && len(inputs) != 1 {
-		return chain.Transaction{}, fmt.Errorf("decode transaction %s: coinbase input mixed with %d other input(s)", raw.TxID, len(inputs)-1)
+		return chain.Transaction{}, fmt.Errorf("decode transaction %s: coinbase input mixed with %d other input(s)", txid, len(inputs)-1)
 	}
 
 	outputs := make([]chain.Output, len(raw.Vout))
 	for i, rawVout := range raw.Vout {
 		out, err := decodeOutput(ctx, uint32(i), rawVout, resolver)
 		if err != nil {
-			return chain.Transaction{}, fmt.Errorf("decode transaction %s vout %d: %w", raw.TxID, i, err)
+			return chain.Transaction{}, fmt.Errorf("decode transaction %s vout %d: %w", txid, i, err)
 		}
 		outputs[i] = out
 	}
 
 	return chain.Transaction{
-		TxID:       raw.TxID,
-		WTxID:      raw.Hash,
-		Version:    raw.Version,
-		LockTime:   raw.LockTime,
-		Size:       raw.Size,
-		VSize:      raw.VSize,
-		Weight:     raw.Weight,
+		TxID:       txid,
+		WTxID:      wtxid,
+		Version:    version,
+		LockTime:   lockTime,
+		Size:       size,
+		VSize:      vsize,
+		Weight:     weight,
 		IsCoinbase: isCoinbase,
 		Inputs:     inputs,
 		Outputs:    outputs,
@@ -137,8 +265,11 @@ func DecodeTransaction(ctx context.Context, raw rpc.RawTransaction, resolver Add
 }
 
 // decodeInput decodes one vin into a chain.Input at the given positional
-// index. Core reports exactly one of two mutually exclusive shapes; see
-// rpc.RawVin's doc comment.
+// index. Core reports exactly one of two mutually exclusive wire shapes
+// (rpc.RawVin's doc comment); decodeInput requires the ENTIRE shape to
+// match one side exactly — a raw vin carrying fields from both shapes
+// (e.g. "coinbase" and "txid" together) is contradictory data, rejected
+// rather than resolved by silently preferring one field over the other.
 func decodeInput(index uint32, raw rpc.RawVin) (chain.Input, error) {
 	witness, err := decodeWitness(raw.TxInWitness)
 	if err != nil {
@@ -146,6 +277,19 @@ func decodeInput(index uint32, raw rpc.RawVin) (chain.Input, error) {
 	}
 
 	if raw.Coinbase != nil {
+		if raw.TxID != nil {
+			return chain.Input{}, fmt.Errorf("coinbase input also has txid (contradictory wire shape)")
+		}
+		if raw.Vout != nil {
+			return chain.Input{}, fmt.Errorf("coinbase input also has vout (contradictory wire shape)")
+		}
+		if raw.ScriptSig != nil {
+			return chain.Input{}, fmt.Errorf("coinbase input also has scriptSig (contradictory wire shape)")
+		}
+		sequence, err := require(raw.Sequence, "sequence")
+		if err != nil {
+			return chain.Input{}, err
+		}
 		coinbaseBytes, err := hex.DecodeString(*raw.Coinbase)
 		if err != nil {
 			return chain.Input{}, fmt.Errorf("invalid coinbase hex: %w", err)
@@ -158,33 +302,44 @@ func decodeInput(index uint32, raw rpc.RawVin) (chain.Input, error) {
 			PreviousOut: nil,
 			Coinbase:    coinbaseBytes,
 			ScriptSig:   nil,
-			Sequence:    raw.Sequence,
+			Sequence:    sequence,
 			Witness:     witness,
 		}, nil
 	}
 
-	if raw.TxID == "" {
-		return chain.Input{}, fmt.Errorf("ordinary (non-coinbase) input missing txid")
+	txid, err := require(raw.TxID, "txid")
+	if err != nil {
+		return chain.Input{}, fmt.Errorf("ordinary (non-coinbase) input: %w", err)
 	}
-	if err := validateHash(raw.TxID); err != nil {
+	if err := validateHash(txid); err != nil {
 		return chain.Input{}, fmt.Errorf("ordinary input prevout txid: %w", err)
 	}
-
-	var scriptSig []byte
-	if raw.ScriptSig != nil {
-		b, err := hex.DecodeString(raw.ScriptSig.Hex)
-		if err != nil {
-			return chain.Input{}, fmt.Errorf("invalid scriptSig hex: %w", err)
-		}
-		scriptSig = b
+	prevVout, err := require(raw.Vout, "vout")
+	if err != nil {
+		return chain.Input{}, fmt.Errorf("ordinary input: %w", err)
+	}
+	if raw.ScriptSig == nil {
+		return chain.Input{}, fmt.Errorf("ordinary input missing scriptSig")
+	}
+	scriptSigHex, err := require(raw.ScriptSig.Hex, "scriptSig.hex")
+	if err != nil {
+		return chain.Input{}, fmt.Errorf("ordinary input: %w", err)
+	}
+	scriptSig, err := hex.DecodeString(scriptSigHex)
+	if err != nil {
+		return chain.Input{}, fmt.Errorf("invalid scriptSig hex: %w", err)
+	}
+	sequence, err := require(raw.Sequence, "sequence")
+	if err != nil {
+		return chain.Input{}, fmt.Errorf("ordinary input: %w", err)
 	}
 
 	return chain.Input{
 		Index:       index,
-		PreviousOut: &chain.OutPoint{TxID: raw.TxID, Index: raw.Vout},
+		PreviousOut: &chain.OutPoint{TxID: txid, Index: prevVout},
 		Coinbase:    nil,
 		ScriptSig:   scriptSig,
-		Sequence:    raw.Sequence,
+		Sequence:    sequence,
 		Witness:     witness,
 	}, nil
 }
@@ -214,9 +369,35 @@ func decodeWitness(hexItems []string) (chain.WitnessStack, error) {
 // rpc.RawScriptPubKey's doc comment; this is what correctly turns a Core
 // "witness_unknown" v2/32 output into script.TypeP2QPK rather than trusting
 // Core's generic label).
+//
+// Once the structural type is known, decodeOutput enforces the address
+// SHAPE Core's own ScriptToUniv actually emits for that type (source:
+// Core's ScriptToUniv adds "address" iff ExtractDestination succeeds AND
+// the type isn't PUBKEY):
+//
+//   - P2PK: ExtractDestination succeeds but ScriptToUniv explicitly
+//     suppresses "address" for PUBKEY — an address present here is
+//     contradictory RPC data. Output.Address is instead resolved via
+//     resolver.
+//   - Multisig (bare CHECKMULTISIG): not a Core "address" type at all;
+//     Output.Address stays empty, and every participant pubkey is
+//     resolved via resolver into ParticipantAddresses.
+//   - P2PKH/P2SH/P2WPKH/P2WSH/P2TR/P2QPK/TypeUnknownWitness:
+//     ExtractDestination succeeds and ScriptToUniv does not suppress the
+//     address for these — a MISSING address here is contradictory RPC
+//     data (silently accepting it would persist the output with no
+//     output_addresses row and permanently undercount that address's
+//     balance). Copied as-is, never derived.
+//   - TypeNullData/TypeUnknown: ExtractDestination fails; Core reports no
+//     address. A present, non-empty address here is contradictory RPC
+//     data — never copied, always rejected rather than silently trusted.
 func decodeOutput(ctx context.Context, index uint32, raw rpc.RawVout, resolver AddressResolver) (chain.Output, error) {
-	if raw.N != index {
-		return chain.Output{}, fmt.Errorf("vout n=%d does not match its position %d in the vout list", raw.N, index)
+	n, err := require(raw.N, "n")
+	if err != nil {
+		return chain.Output{}, err
+	}
+	if n != index {
+		return chain.Output{}, fmt.Errorf("vout n=%d does not match its position %d in the vout list", n, index)
 	}
 
 	value, err := DecodeAmount(raw.Value)
@@ -224,15 +405,24 @@ func decodeOutput(ctx context.Context, index uint32, raw rpc.RawVout, resolver A
 		return chain.Output{}, fmt.Errorf("value: %w", err)
 	}
 
-	if raw.ScriptPubKey.Hex == "" {
-		return chain.Output{}, fmt.Errorf("missing scriptPubKey")
+	if raw.ScriptPubKey == nil {
+		return chain.Output{}, fmt.Errorf("missing scriptPubKey object")
 	}
-	rawScript, err := hex.DecodeString(raw.ScriptPubKey.Hex)
+	scriptHex, err := require(raw.ScriptPubKey.Hex, "scriptPubKey.hex")
+	if err != nil {
+		return chain.Output{}, err
+	}
+	// scriptHex == "" here is legitimate data (a genuinely empty CScript —
+	// Core's ScriptToUniv always emits "hex": HexStr(script), including
+	// for an empty script) — hex.DecodeString("") correctly yields a
+	// zero-length, non-nil []byte, not an error.
+	rawScript, err := hex.DecodeString(scriptHex)
 	if err != nil {
 		return chain.Output{}, fmt.Errorf("invalid scriptPubKey hex: %w", err)
 	}
 
 	classified := script.Classify(rawScript)
+	addr := raw.ScriptPubKey.Address // nil iff Core omitted "address"
 
 	out := chain.Output{
 		Index:          index,
@@ -246,51 +436,70 @@ func decodeOutput(ctx context.Context, index uint32, raw rpc.RawVout, resolver A
 
 	switch classified.Type {
 	case script.TypeMultisig:
-		// Core deliberately omits an address for a bare multisig output;
-		// resolve every participant pubkey through the same descriptor
-		// method as P2PK (docs/ARCHITECTURE.md §10/§13.A). Output.Address
-		// stays empty — Store rejects an output_addresses row for a
-		// multisig output. Duplicate pubkeys are preserved positionally
-		// here; Store applies identity-set deduplication at persistence.
+		if addr != nil {
+			return chain.Output{}, fmt.Errorf("multisig output unexpectedly has a Core-reported address %q", *addr)
+		}
 		if len(classified.PubKeys) == 0 {
 			return chain.Output{}, fmt.Errorf("multisig output classified with no pubkeys")
 		}
 		participants := make([]string, len(classified.PubKeys))
 		for i, pk := range classified.PubKeys {
-			addr, err := resolver.ResolvePubKeyAddress(ctx, hex.EncodeToString(pk))
+			resolved, err := resolvePubKey(ctx, resolver, pk)
 			if err != nil {
 				return chain.Output{}, fmt.Errorf("resolve multisig participant %d address: %w", i, err)
 			}
-			participants[i] = addr
+			participants[i] = resolved
 		}
 		out.ParticipantAddresses = participants
 
 	case script.TypeP2PK:
-		// Core deliberately omits an address for bare P2PK; resolve via
-		// getdescriptorinfo("pkh(<pubkey>)") + deriveaddresses (the
-		// Core-validated fallback — docs/ARCHITECTURE.md §7/§9). ScriptType
-		// remains p2pk; this output is never relabeled as p2pkh.
+		if addr != nil {
+			return chain.Output{}, fmt.Errorf("p2pk output unexpectedly has a Core-reported address %q (Core's ScriptToUniv suppresses \"address\" for PUBKEY)", *addr)
+		}
 		if len(classified.PubKeys) != 1 {
 			return chain.Output{}, fmt.Errorf("p2pk output classified with %d pubkeys, want exactly 1", len(classified.PubKeys))
 		}
-		addr, err := resolver.ResolvePubKeyAddress(ctx, hex.EncodeToString(classified.PubKeys[0]))
+		resolved, err := resolvePubKey(ctx, resolver, classified.PubKeys[0])
 		if err != nil {
 			return chain.Output{}, fmt.Errorf("resolve p2pk address: %w", err)
 		}
-		out.Address = addr
+		out.Address = resolved
+
+	case script.TypeNullData, script.TypeUnknown:
+		if addr != nil && *addr != "" {
+			return chain.Output{}, fmt.Errorf("%s output unexpectedly has a Core-reported address %q (Core's ExtractDestination fails for this type)", classified.Type, *addr)
+		}
 
 	default:
-		// Every other type — including a structural P2QPK output, which
-		// Core itself only ever reports as generic "witness_unknown" — is
-		// handled uniformly: Core's own reported address, exactly as
-		// given, or empty if Core gave none. Never invented, never
-		// derived (docs/ARCHITECTURE.md §8/§9/§11): TypeNullData/
-		// TypeUnknown/TypeUnknownWitness outputs simply inherit whatever
-		// Core did (or, in practice, did not) report.
-		out.Address = raw.ScriptPubKey.Address
+		// P2PKH, P2SH, P2WPKH, P2WSH, P2TR, P2QPK, TypeUnknownWitness:
+		// Core's ExtractDestination succeeds and ScriptToUniv always
+		// includes a non-empty address for these.
+		if addr == nil || *addr == "" {
+			return chain.Output{}, fmt.Errorf("%s output missing Core-reported address (Core's ExtractDestination succeeds for this type)", classified.Type)
+		}
+		out.Address = *addr
 	}
 
 	return out, nil
+}
+
+// resolvePubKey resolves pubKey through resolver, rejecting rather than
+// panicking on a nil resolver, and rejecting an ("", nil) result even from
+// a custom/fake AddressResolver implementation that doesn't itself treat
+// that as an error.
+func resolvePubKey(ctx context.Context, resolver AddressResolver, pubKey []byte) (string, error) {
+	if resolver == nil {
+		return "", fmt.Errorf("no AddressResolver configured (nil)")
+	}
+	pubKeyHex := hex.EncodeToString(pubKey)
+	addr, err := resolver.ResolvePubKeyAddress(ctx, pubKeyHex)
+	if err != nil {
+		return "", err
+	}
+	if addr == "" {
+		return "", fmt.Errorf("resolver returned an empty address for pubkey %s", pubKeyHex)
+	}
+	return addr, nil
 }
 
 // validateHash requires s to be exactly 64 lowercase hex characters — the
@@ -308,6 +517,20 @@ func validateHash(s string) error {
 	for _, c := range s {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
 			return fmt.Errorf("invalid hash %q: not lowercase hex", s)
+		}
+	}
+	return nil
+}
+
+// validateBits requires s to be exactly 8 lowercase hex characters — the
+// shape of Core's compact-target "bits" field.
+func validateBits(s string) error {
+	if len(s) != 8 {
+		return fmt.Errorf("invalid bits %q: want 8 hex characters, got %d", s, len(s))
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return fmt.Errorf("invalid bits %q: not lowercase hex", s)
 		}
 	}
 	return nil

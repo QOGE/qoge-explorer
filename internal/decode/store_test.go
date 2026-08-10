@@ -110,17 +110,37 @@ func TestDecodeBlock_ThroughStore_PipelineTest(t *testing.T) {
 	p2pkScriptHex := "21" + p2pkPubKeyHex + "ac"
 	resolver := newFakeResolver(map[string]string{p2pkPubKeyHex: "qPipelineP2PKAddress"})
 
-	// ─── Block 1 (height 100): a coinbase with a P2PK output (Core omits
-	// an address; the resolver supplies one) and an OP_RETURN output. ───
+	// ─── Block 0 (real genesis, height 0): a trivial anchor block. Its
+	// output is intentionally NOT the one this test exercises spendability
+	// against — Store's genesis-height UTXO exclusion (§16) would make it
+	// a poor vector for that — this block exists only so block 1 below can
+	// carry a real, FK-satisfying previousblockhash (the decoder's new
+	// genesis/previousblockhash relation, task item 4 this round, requires
+	// a genuine parent hash for any height > 0). ───
+
+	rawAnchor := rawBlockFixture(rawHash("pipelineAnchor"), 0, "", rawCoinbaseTx(rawHash("pipelineAnchorTx"), rawP2PKHVout(0, "1", "qPipelineAnchor")))
+	anchorBlock, err := DecodeBlock(ctx, rawAnchor, resolver)
+	if err != nil {
+		t.Fatalf("DecodeBlock (anchor genesis block): %v", err)
+	}
+	if err := s.ApplyBlock(ctx, anchorBlock); err != nil {
+		t.Fatalf("ApplyBlock (anchor genesis block): %v", err)
+	}
+
+	// ─── Block 1 (height 1, non-genesis): a coinbase with a P2PK output
+	// (Core omits an address; the resolver supplies one), an OP_RETURN
+	// output, and a present-but-empty scriptPubKey output (legitimate Core
+	// data — task item 2). ───
 
 	genTxID := rawHash("pipelineGenTx")
-	rawGen := rawBlockFixture(rawHash("pipelineGen"), 100, "", rpc.RawTransaction{
-		TxID: genTxID, Hash: genTxID,
-		Version: 2, Size: 100, VSize: 100, Weight: 400,
-		Vin: []rpc.RawVin{{Coinbase: strPtr("51"), Sequence: 4294967295}},
+	rawGen := rawBlockFixture(rawHash("pipelineGen"), 1, *rawAnchor.Hash, rpc.RawTransaction{
+		TxID: strPtr(genTxID), Hash: strPtr(genTxID),
+		Version: uint32Ptr(2), Size: intPtr(100), VSize: intPtr(100), Weight: intPtr(400), LockTime: uint32Ptr(0),
+		Vin: []rpc.RawVin{{Coinbase: strPtr("51"), Sequence: uint32Ptr(4294967295)}},
 		Vout: []rpc.RawVout{
-			{Value: "10", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: p2pkScriptHex}},
-			{Value: "0", N: 1, ScriptPubKey: rpc.RawScriptPubKey{Hex: "6a04deadbeef", Type: "nulldata"}},
+			{Value: "10", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(p2pkScriptHex)}},
+			{Value: "0", N: uint32Ptr(1), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr("6a04deadbeef"), Type: "nulldata"}},
+			{Value: "0.5", N: uint32Ptr(2), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr("")}}, // present, legitimately empty
 		},
 	})
 
@@ -183,8 +203,36 @@ func TestDecodeBlock_ThroughStore_PipelineTest(t *testing.T) {
 		t.Errorf("GetUTXO for the OP_RETURN output = %+v, want nil", opReturnUTXO)
 	}
 
-	// ─── Block 2 (height 101): spends the P2PK output with a
-	// 17,088-byte + 32-byte P2QPK-shaped witness. ───
+	// Present-but-empty scriptPubKey: transaction_outputs row persists
+	// with a zero-length script, and — since an empty script is not
+	// IsUnspendable (it doesn't start with OP_RETURN, and isn't
+	// oversized) and this isn't the genesis height — it gets an ordinary
+	// utxo_state row, exactly like any other spendable output. This is
+	// Store's existing, unmodified UTXO semantics; the decoder changes
+	// nothing here, it just correctly refrains from rejecting a
+	// legitimately empty script as "missing."
+	var emptyScript []byte
+	var emptyScriptType string
+	if err := pool.QueryRow(ctx, `SELECT script_pubkey, script_type FROM transaction_outputs WHERE txid = $1 AND vout_index = 2`, genTxID).
+		Scan(&emptyScript, &emptyScriptType); err != nil {
+		t.Fatalf("read back empty-scriptPubKey output: %v", err)
+	}
+	if len(emptyScript) != 0 {
+		t.Errorf("empty-scriptPubKey output script_pubkey = %x, want zero-length", emptyScript)
+	}
+	if emptyScriptType != "unknown" {
+		t.Errorf("empty-scriptPubKey output script_type = %s, want unknown", emptyScriptType)
+	}
+	emptyScriptUTXO, err := s.GetUTXO(ctx, genTxID, 2)
+	if err != nil {
+		t.Fatalf("GetUTXO (empty scriptPubKey): %v", err)
+	}
+	if emptyScriptUTXO == nil {
+		t.Error("expected a UTXO for the present-but-empty-script output (not genesis, not IsUnspendable), got nil")
+	}
+
+	// ─── Block 2 (height 2): spends the P2PK output with a 17,088-byte +
+	// 32-byte P2QPK-shaped witness. ───
 
 	childCoinbaseTxID := rawHash("pipelineChildCB")
 	spendTxID := rawHash("pipelineSpendTxID")
@@ -192,20 +240,20 @@ func TestDecodeBlock_ThroughStore_PipelineTest(t *testing.T) {
 	sigHex := strings.Repeat("ab", 17088)
 	pubHex := strings.Repeat("ef", 32)
 
-	rawChild := rawBlockFixture(rawHash("pipelineChild"), 101, rawGen.Hash,
+	rawChild := rawBlockFixture(rawHash("pipelineChild"), 2, *rawGen.Hash,
 		rpc.RawTransaction{
-			TxID: childCoinbaseTxID, Hash: childCoinbaseTxID,
-			Version: 2, Size: 100, VSize: 100, Weight: 400,
-			Vin:  []rpc.RawVin{{Coinbase: strPtr("52"), Sequence: 4294967295}},
+			TxID: strPtr(childCoinbaseTxID), Hash: strPtr(childCoinbaseTxID),
+			Version: uint32Ptr(2), Size: intPtr(100), VSize: intPtr(100), Weight: intPtr(400), LockTime: uint32Ptr(0),
+			Vin:  []rpc.RawVin{{Coinbase: strPtr("52"), Sequence: uint32Ptr(4294967295)}},
 			Vout: []rpc.RawVout{rawP2PKHVout(0, "1", "qPipelineMiner")},
 		},
 		rpc.RawTransaction{
-			TxID: spendTxID, Hash: spendWTxID,
-			Version: 2, Size: 17300, VSize: 4400, Weight: 17700,
+			TxID: strPtr(spendTxID), Hash: strPtr(spendWTxID),
+			Version: uint32Ptr(2), Size: intPtr(17300), VSize: intPtr(4400), Weight: intPtr(17700), LockTime: uint32Ptr(0),
 			Vin: []rpc.RawVin{{
-				TxID: genTxID, Vout: 0,
-				ScriptSig:   &rpc.RawScriptSig{Hex: ""},
-				Sequence:    4294967295,
+				TxID: strPtr(genTxID), Vout: uint32Ptr(0),
+				ScriptSig:   &rpc.RawScriptSig{Hex: strPtr("")},
+				Sequence:    uint32Ptr(4294967295),
 				TxInWitness: []string{sigHex, pubHex},
 			}},
 			Vout: []rpc.RawVout{rawP2PKHVout(0, "9.99", "qPipelineSpendDest")},
@@ -256,7 +304,7 @@ func TestDecodeBlock_ThroughStore_PipelineTest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Tip: %v", err)
 	}
-	if tip.Hash != rawChild.Hash || tip.Height != 101 {
-		t.Errorf("Tip = %+v, want hash=%s height=101", tip, rawChild.Hash)
+	if tip.Hash != *rawChild.Hash || tip.Height != 2 {
+		t.Errorf("Tip = %+v, want hash=%s height=2", tip, *rawChild.Hash)
 	}
 }

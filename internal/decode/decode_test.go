@@ -18,7 +18,8 @@ import (
 // ─── test fixtures / helpers ─────────────────────────────────────────────
 
 // fakeResolver is a deterministic AddressResolver test double — decoder
-// unit tests must never require a running qogecoind (task item 9).
+// unit tests must never require a running qogecoind (task item 9, prior
+// round).
 type fakeResolver struct {
 	mu    sync.Mutex
 	addrs map[string]string
@@ -46,6 +47,15 @@ func (f *fakeResolver) callCount(pubKeyHex string) int {
 	return f.calls[pubKeyHex]
 }
 
+// emptyResolver always resolves to ("", nil) — used to prove the decoder
+// rejects that result itself rather than trusting a resolver
+// implementation that doesn't already treat it as an error (task item 6).
+type emptyResolver struct{}
+
+func (emptyResolver) ResolvePubKeyAddress(_ context.Context, _ string) (string, error) {
+	return "", nil
+}
+
 // rawHash turns a short readable label into a syntactically valid
 // 64-lowercase-hex-char hash, mirroring internal/store's own hash64 test
 // helper so fixtures stay easy to read.
@@ -57,19 +67,44 @@ func rawHash(label string) string {
 	return h + strings.Repeat("0", 64-len(h))
 }
 
+// ─── pointer helpers ──────────────────────────────────────────────────────
+//
+// rpc's raw DTOs use pointers for every field Core always emits, so a
+// missing key (nil) is distinguishable from a legitimate Go zero value
+// (0, "") that Core actually reported (task item 1, this review round).
+// These convert plain test-fixture literals into that pointer shape;
+// optStrPtr specifically preserves this test suite's existing convention
+// of using "" to mean "field intentionally absent" in fixture builders
+// (distinct from a hex field that is legitimately present-but-empty,
+// which individual tests construct explicitly rather than through these
+// helpers).
+
+func strPtr(s string) *string       { return &s }
+func intPtr(i int) *int             { return &i }
+func int64Ptr(i int64) *int64       { return &i }
+func uint32Ptr(u uint32) *uint32    { return &u }
+func float64Ptr(f float64) *float64 { return &f }
+
+func optStrPtr(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return strPtr(s)
+}
+
 func rawBlockFixture(hash string, height int64, prevHash string, txs ...rpc.RawTransaction) rpc.RawBlock {
 	return rpc.RawBlock{
-		Hash:              hash,
-		Height:            height,
-		PreviousBlockHash: prevHash,
-		MerkleRoot:        hash,
-		Time:              1_700_000_000 + height,
-		Bits:              "1d00ffff",
-		Difficulty:        1.0,
-		Nonce:             uint32(height),
-		Size:              100,
-		Weight:            400,
-		NTx:               len(txs),
+		Hash:              strPtr(hash),
+		Height:            int64Ptr(height),
+		PreviousBlockHash: optStrPtr(prevHash),
+		MerkleRoot:        strPtr(hash),
+		Time:              int64Ptr(1_700_000_000 + height),
+		Bits:              strPtr("1d00ffff"),
+		Difficulty:        float64Ptr(1.0),
+		Nonce:             uint32Ptr(uint32(height)),
+		Size:              intPtr(100),
+		Weight:            intPtr(400),
+		NTx:               intPtr(len(txs)),
 		Tx:                txs,
 	}
 }
@@ -77,28 +112,36 @@ func rawBlockFixture(hash string, height int64, prevHash string, txs ...rpc.RawT
 func rawCoinbaseTx(txid string, vout ...rpc.RawVout) rpc.RawTransaction {
 	cb := "51"
 	return rpc.RawTransaction{
-		TxID: txid, Hash: txid, // no witness data: hash == txid
-		Version: 2, Size: 100, VSize: 100, Weight: 400, LockTime: 0,
-		Vin:  []rpc.RawVin{{Coinbase: &cb, Sequence: 4294967295}},
+		TxID: optStrPtr(txid), Hash: optStrPtr(txid), // no witness data: hash == txid
+		Version: uint32Ptr(2), Size: intPtr(100), VSize: intPtr(100), Weight: intPtr(400), LockTime: uint32Ptr(0),
+		Vin:  []rpc.RawVin{{Coinbase: &cb, Sequence: uint32Ptr(4294967295)}},
 		Vout: vout,
 	}
 }
 
 func rawSpendTx(txid, wtxid string, vin []rpc.RawVin, vout []rpc.RawVout) rpc.RawTransaction {
 	return rpc.RawTransaction{
-		TxID: txid, Hash: wtxid,
-		Version: 2, Size: 200, VSize: 200, Weight: 800, LockTime: 0,
+		TxID: optStrPtr(txid), Hash: optStrPtr(wtxid),
+		Version: uint32Ptr(2), Size: intPtr(200), VSize: intPtr(200), Weight: intPtr(800), LockTime: uint32Ptr(0),
 		Vin: vin, Vout: vout,
 	}
 }
 
+// rawSpendVin always supplies every required ordinary-vin field —
+// scriptSigHex is passed through as the (always-present) scriptSig.hex
+// value, so "" here legitimately means "present but empty" (a pure
+// witness spend), never "absent".
 func rawSpendVin(prevTxid string, prevVout uint32, scriptSigHex string, witness ...string) rpc.RawVin {
 	return rpc.RawVin{
-		TxID: prevTxid, Vout: prevVout,
-		ScriptSig:   &rpc.RawScriptSig{Hex: scriptSigHex},
-		Sequence:    4294967295,
+		TxID: strPtr(prevTxid), Vout: uint32Ptr(prevVout),
+		ScriptSig:   &rpc.RawScriptSig{Hex: strPtr(scriptSigHex)},
+		Sequence:    uint32Ptr(4294967295),
 		TxInWitness: witness,
 	}
+}
+
+func rawCoinbaseVin(coinbaseHex string) rpc.RawVin {
+	return rpc.RawVin{Coinbase: strPtr(coinbaseHex), Sequence: uint32Ptr(4294967295)}
 }
 
 func rawP2PKHVout(n uint32, valueQOGE, address string) rpc.RawVout {
@@ -106,8 +149,8 @@ func rawP2PKHVout(n uint32, valueQOGE, address string) rpc.RawVout {
 	scriptHex := "76a914" + strings.Repeat("ab", 20) + "88ac"
 	return rpc.RawVout{
 		Value:        json.Number(valueQOGE),
-		N:            n,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "pubkeyhash", Address: address},
+		N:            uint32Ptr(n),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "pubkeyhash", Address: optStrPtr(address)},
 	}
 }
 
@@ -125,28 +168,28 @@ func mustHexDecode(t *testing.T, s string) []byte {
 func TestDecodeBlock_MapsAllFields(t *testing.T) {
 	ctx := context.Background()
 	raw := rpc.RawBlock{
-		Hash:              rawHash("blockA"),
-		Height:            12345,
-		PreviousBlockHash: rawHash("blockAparent"),
-		MerkleRoot:        rawHash("blockAmerkle"),
-		Time:              1_700_000_123,
-		Bits:              "1d00ffff",
-		Difficulty:        1.5,
-		Nonce:             999,
-		Size:              321,
-		Weight:            1284,
-		NTx:               1,
+		Hash:              strPtr(rawHash("blockA")),
+		Height:            int64Ptr(12345),
+		PreviousBlockHash: strPtr(rawHash("blockAparent")),
+		MerkleRoot:        strPtr(rawHash("blockAmerkle")),
+		Time:              int64Ptr(1_700_000_123),
+		Bits:              strPtr("1d00ffff"),
+		Difficulty:        float64Ptr(1.5),
+		Nonce:             uint32Ptr(999),
+		Size:              intPtr(321),
+		Weight:            intPtr(1284),
+		NTx:               intPtr(1),
 		Tx:                []rpc.RawTransaction{rawCoinbaseTx(rawHash("blockAtx"), rawP2PKHVout(0, "5", "qAlice"))},
 	}
 	block, err := DecodeBlock(ctx, raw, newFakeResolver(nil))
 	if err != nil {
 		t.Fatalf("DecodeBlock: %v", err)
 	}
-	if block.Hash != raw.Hash || block.Height != raw.Height || block.PreviousHash != raw.PreviousBlockHash ||
-		block.MerkleRoot != raw.MerkleRoot || block.Time != raw.Time || block.Bits != raw.Bits ||
-		block.Difficulty != raw.Difficulty || block.Nonce != raw.Nonce || block.Size != raw.Size ||
-		block.Weight != raw.Weight || block.TxCount != raw.NTx {
-		t.Errorf("field mapping mismatch: got %+v from raw %+v", block, raw)
+	if block.Hash != *raw.Hash || block.Height != *raw.Height || block.PreviousHash != *raw.PreviousBlockHash ||
+		block.MerkleRoot != *raw.MerkleRoot || block.Time != *raw.Time || block.Bits != *raw.Bits ||
+		block.Difficulty != *raw.Difficulty || block.Nonce != *raw.Nonce || block.Size != *raw.Size ||
+		block.Weight != *raw.Weight || block.TxCount != *raw.NTx {
+		t.Errorf("field mapping mismatch: got %+v", block)
 	}
 	if len(block.Transactions) != 1 {
 		t.Fatalf("Transactions length = %d, want 1", len(block.Transactions))
@@ -168,7 +211,7 @@ func TestDecodeBlock_GenesisPreviousHashEmpty(t *testing.T) {
 func TestDecodeBlock_NTxMismatchRejected(t *testing.T) {
 	ctx := context.Background()
 	raw := rawBlockFixture(rawHash("blockB"), 100, rawHash("blockBparent"), rawCoinbaseTx(rawHash("blockBtx"), rawP2PKHVout(0, "5", "qAlice")))
-	raw.NTx = 2 // claims 2 transactions but only 1 supplied
+	raw.NTx = intPtr(2) // claims 2 transactions but only 1 supplied
 	_, err := DecodeBlock(ctx, raw, newFakeResolver(nil))
 	if err == nil {
 		t.Fatal("expected an nTx/tx-list mismatch to be rejected")
@@ -184,11 +227,10 @@ func TestDecodeBlock_MalformedHashRejected(t *testing.T) {
 		{"too short", "abcd"},
 		{"uppercase", strings.ToUpper(rawHash("blockC"))},
 		{"non-hex characters", strings.Repeat("z", 64)},
-		{"empty", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			raw := rawBlockFixture(tt.hash, 100, "", rawCoinbaseTx(rawHash("blockCtx"), rawP2PKHVout(0, "5", "qAlice")))
+			raw := rawBlockFixture(tt.hash, 100, rawHash("blockCparent"), rawCoinbaseTx(rawHash("blockCtx"), rawP2PKHVout(0, "5", "qAlice")))
 			if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
 				t.Fatalf("expected a malformed block hash (%s) to be rejected", tt.name)
 			}
@@ -198,8 +240,8 @@ func TestDecodeBlock_MalformedHashRejected(t *testing.T) {
 
 func TestDecodeBlock_MalformedMerkleRootRejected(t *testing.T) {
 	ctx := context.Background()
-	raw := rawBlockFixture(rawHash("blockD"), 100, "", rawCoinbaseTx(rawHash("blockDtx"), rawP2PKHVout(0, "5", "qAlice")))
-	raw.MerkleRoot = "not-a-hash"
+	raw := rawBlockFixture(rawHash("blockD"), 100, rawHash("blockDparent"), rawCoinbaseTx(rawHash("blockDtx"), rawP2PKHVout(0, "5", "qAlice")))
+	raw.MerkleRoot = strPtr("not-a-hash")
 	if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
 		t.Fatal("expected a malformed merkleroot to be rejected")
 	}
@@ -210,6 +252,105 @@ func TestDecodeBlock_MalformedPreviousBlockHashRejected(t *testing.T) {
 	raw := rawBlockFixture(rawHash("blockE"), 101, "not-a-hash", rawCoinbaseTx(rawHash("blockEtx"), rawP2PKHVout(0, "5", "qAlice")))
 	if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
 		t.Fatal("expected a malformed (non-empty) previousblockhash to be rejected")
+	}
+}
+
+// ─── review round: required-field presence, not zero-value inference ────
+// (task item 1)
+
+func TestDecodeBlock_MissingRequiredFieldsRejected(t *testing.T) {
+	ctx := context.Background()
+	base := func() rpc.RawBlock {
+		return rawBlockFixture(rawHash("reqblock"), 100, rawHash("reqblockparent"), rawCoinbaseTx(rawHash("reqblocktx"), rawP2PKHVout(0, "5", "qAlice")))
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*rpc.RawBlock)
+	}{
+		{"missing hash", func(b *rpc.RawBlock) { b.Hash = nil }},
+		{"missing height (would otherwise look like legitimate genesis 0)", func(b *rpc.RawBlock) { b.Height = nil }},
+		{"missing merkleroot", func(b *rpc.RawBlock) { b.MerkleRoot = nil }},
+		{"missing time", func(b *rpc.RawBlock) { b.Time = nil }},
+		{"missing bits", func(b *rpc.RawBlock) { b.Bits = nil }},
+		{"missing difficulty", func(b *rpc.RawBlock) { b.Difficulty = nil }},
+		{"missing nonce (would otherwise look like a legitimate zero nonce)", func(b *rpc.RawBlock) { b.Nonce = nil }},
+		{"missing size", func(b *rpc.RawBlock) { b.Size = nil }},
+		{"missing weight", func(b *rpc.RawBlock) { b.Weight = nil }},
+		{"missing nTx", func(b *rpc.RawBlock) { b.NTx = nil }},
+		{"missing tx", func(b *rpc.RawBlock) { b.Tx = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := base()
+			tt.mutate(&raw)
+			if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+				t.Fatalf("expected %s to be rejected", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodeTransaction_MissingRequiredFieldsRejected(t *testing.T) {
+	ctx := context.Background()
+	base := func() rpc.RawTransaction {
+		return rawSpendTx(rawHash("reqtx"), rawHash("reqtx"),
+			[]rpc.RawVin{rawSpendVin(rawHash("reqtxprev"), 0, "aabb")},
+			[]rpc.RawVout{rawP2PKHVout(0, "1", "qBob")},
+		)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*rpc.RawTransaction)
+	}{
+		{"missing txid", func(tx *rpc.RawTransaction) { tx.TxID = nil }},
+		{"missing hash", func(tx *rpc.RawTransaction) { tx.Hash = nil }},
+		{"missing version (would otherwise look like a legitimate version 0)", func(tx *rpc.RawTransaction) { tx.Version = nil }},
+		{"missing size", func(tx *rpc.RawTransaction) { tx.Size = nil }},
+		{"missing vsize", func(tx *rpc.RawTransaction) { tx.VSize = nil }},
+		{"missing weight", func(tx *rpc.RawTransaction) { tx.Weight = nil }},
+		{"missing locktime (would otherwise look like a legitimate locktime 0)", func(tx *rpc.RawTransaction) { tx.LockTime = nil }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := base()
+			tt.mutate(&raw)
+			if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
+				t.Fatalf("expected %s to be rejected", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodeInput_MissingRequiredFieldsRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		vin  rpc.RawVin
+	}{
+		{"ordinary vin missing vout (would otherwise look like a legitimate vout 0)",
+			rpc.RawVin{TxID: strPtr(rawHash("reqvinprev")), ScriptSig: &rpc.RawScriptSig{Hex: strPtr("aa")}, Sequence: uint32Ptr(0)}},
+		{"ordinary vin missing sequence (would otherwise look like a legitimate sequence 0)",
+			rpc.RawVin{TxID: strPtr(rawHash("reqvinprev")), Vout: uint32Ptr(0), ScriptSig: &rpc.RawScriptSig{Hex: strPtr("aa")}}},
+		{"coinbase vin missing sequence",
+			rpc.RawVin{Coinbase: strPtr("51")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeInput(0, tt.vin); err == nil {
+				t.Fatalf("expected %s to be rejected", tt.name)
+			}
+		})
+	}
+}
+
+func TestDecodeOutput_MissingNRejected(t *testing.T) {
+	ctx := context.Background()
+	raw := rpc.RawVout{
+		Value:        "1",
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr("76a914" + strings.Repeat("ab", 20) + "88ac"), Address: strPtr("qAlice")},
+	}
+	if _, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil)); err == nil {
+		t.Fatal("expected a vout missing n (at output index 0, where n=0 would otherwise look legitimate) to be rejected")
 	}
 }
 
@@ -241,11 +382,11 @@ func TestDecodeTransaction_VersionLockTimeSizeFields(t *testing.T) {
 		[]rpc.RawVin{rawSpendVin(rawHash("prevtxv"), 3, "aabb")},
 		[]rpc.RawVout{rawP2PKHVout(0, "1", "qBob")},
 	)
-	raw.Version = 7
-	raw.LockTime = 500000
-	raw.Size = 250
-	raw.VSize = 200
-	raw.Weight = 998
+	raw.Version = uint32Ptr(7)
+	raw.LockTime = uint32Ptr(500000)
+	raw.Size = intPtr(250)
+	raw.VSize = intPtr(200)
+	raw.Weight = intPtr(998)
 	txn, err := DecodeTransaction(ctx, raw, newFakeResolver(nil))
 	if err != nil {
 		t.Fatalf("DecodeTransaction: %v", err)
@@ -295,16 +436,8 @@ func TestDecodeTransaction_NoOutputsRejected(t *testing.T) {
 
 func TestDecodeTransaction_MultipleCoinbaseShapedInputsRejected(t *testing.T) {
 	ctx := context.Background()
-	cb1, cb2 := "51", "52"
-	raw := rpc.RawTransaction{
-		TxID: rawHash("txmc"), Hash: rawHash("txmc"),
-		Version: 2, Size: 100, VSize: 100, Weight: 400,
-		Vin: []rpc.RawVin{
-			{Coinbase: &cb1, Sequence: 4294967295},
-			{Coinbase: &cb2, Sequence: 4294967295},
-		},
-		Vout: []rpc.RawVout{rawP2PKHVout(0, "1", "qBob")},
-	}
+	raw := rawSpendTx(rawHash("txmc"), rawHash("txmc"), nil, []rpc.RawVout{rawP2PKHVout(0, "1", "qBob")})
+	raw.Vin = []rpc.RawVin{rawCoinbaseVin("51"), rawCoinbaseVin("52")}
 	if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
 		t.Fatal("expected two coinbase-shaped inputs to be rejected")
 	}
@@ -312,16 +445,8 @@ func TestDecodeTransaction_MultipleCoinbaseShapedInputsRejected(t *testing.T) {
 
 func TestDecodeTransaction_CoinbaseMixedWithRealInputRejected(t *testing.T) {
 	ctx := context.Background()
-	cb := "51"
-	raw := rpc.RawTransaction{
-		TxID: rawHash("txcm"), Hash: rawHash("txcm"),
-		Version: 2, Size: 100, VSize: 100, Weight: 400,
-		Vin: []rpc.RawVin{
-			{Coinbase: &cb, Sequence: 4294967295},
-			rawSpendVin(rawHash("prevtxcm"), 0, "aabb"),
-		},
-		Vout: []rpc.RawVout{rawP2PKHVout(0, "1", "qBob")},
-	}
+	raw := rawSpendTx(rawHash("txcm"), rawHash("txcm"), nil, []rpc.RawVout{rawP2PKHVout(0, "1", "qBob")})
+	raw.Vin = []rpc.RawVin{rawCoinbaseVin("51"), rawSpendVin(rawHash("prevtxcm"), 0, "aabb")}
 	if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
 		t.Fatal("expected a coinbase input mixed with a real input to be rejected")
 	}
@@ -331,7 +456,7 @@ func TestDecodeTransaction_CoinbaseMixedWithRealInputRejected(t *testing.T) {
 
 func TestDecodeInput_Coinbase(t *testing.T) {
 	cb := "0301020304ffff"
-	raw := rpc.RawVin{Coinbase: &cb, Sequence: 4294967295}
+	raw := rpc.RawVin{Coinbase: &cb, Sequence: uint32Ptr(4294967295)}
 	in, err := decodeInput(0, raw)
 	if err != nil {
 		t.Fatalf("decodeInput: %v", err)
@@ -353,7 +478,7 @@ func TestDecodeInput_Coinbase(t *testing.T) {
 
 func TestDecodeInput_CoinbaseInvalidHexRejected(t *testing.T) {
 	cb := "not-hex"
-	_, err := decodeInput(0, rpc.RawVin{Coinbase: &cb, Sequence: 0})
+	_, err := decodeInput(0, rpc.RawVin{Coinbase: &cb, Sequence: uint32Ptr(0)})
 	if err == nil {
 		t.Fatal("expected invalid coinbase hex to be rejected")
 	}
@@ -361,7 +486,7 @@ func TestDecodeInput_CoinbaseInvalidHexRejected(t *testing.T) {
 
 func TestDecodeInput_CoinbaseEmptyBytesRejected(t *testing.T) {
 	cb := ""
-	_, err := decodeInput(0, rpc.RawVin{Coinbase: &cb, Sequence: 0})
+	_, err := decodeInput(0, rpc.RawVin{Coinbase: &cb, Sequence: uint32Ptr(0)})
 	if err == nil {
 		t.Fatal("expected empty coinbase script bytes to be rejected")
 	}
@@ -370,9 +495,9 @@ func TestDecodeInput_CoinbaseEmptyBytesRejected(t *testing.T) {
 func TestDecodeInput_Ordinary(t *testing.T) {
 	prevTxid := rawHash("prevord")
 	raw := rpc.RawVin{
-		TxID: prevTxid, Vout: 3,
-		ScriptSig: &rpc.RawScriptSig{Hex: "483045022100"},
-		Sequence:  4294967294,
+		TxID: strPtr(prevTxid), Vout: uint32Ptr(3),
+		ScriptSig: &rpc.RawScriptSig{Hex: strPtr("483045022100")},
+		Sequence:  uint32Ptr(4294967294),
 	}
 	in, err := decodeInput(2, raw)
 	if err != nil {
@@ -395,9 +520,9 @@ func TestDecodeInput_Ordinary(t *testing.T) {
 
 func TestDecodeInput_OrdinaryPureWitnessEmptyScriptSigPreserved(t *testing.T) {
 	raw := rpc.RawVin{
-		TxID: rawHash("prevpw"), Vout: 0,
-		ScriptSig:   &rpc.RawScriptSig{Hex: ""},
-		Sequence:    4294967295,
+		TxID: strPtr(rawHash("prevpw")), Vout: uint32Ptr(0),
+		ScriptSig:   &rpc.RawScriptSig{Hex: strPtr("")}, // present, legitimately empty
+		Sequence:    uint32Ptr(4294967295),
 		TxInWitness: []string{"aabb"},
 	}
 	in, err := decodeInput(0, raw)
@@ -416,7 +541,7 @@ func TestDecodeInput_OrdinaryPureWitnessEmptyScriptSigPreserved(t *testing.T) {
 }
 
 func TestDecodeInput_OrdinaryMissingTxIDRejected(t *testing.T) {
-	raw := rpc.RawVin{Vout: 0, ScriptSig: &rpc.RawScriptSig{Hex: "aa"}, Sequence: 0}
+	raw := rpc.RawVin{Vout: uint32Ptr(0), ScriptSig: &rpc.RawScriptSig{Hex: strPtr("aa")}, Sequence: uint32Ptr(0)}
 	if _, err := decodeInput(0, raw); err == nil {
 		t.Fatal("expected an ordinary input with no txid and no coinbase field to be rejected")
 	}
@@ -424,9 +549,9 @@ func TestDecodeInput_OrdinaryMissingTxIDRejected(t *testing.T) {
 
 func TestDecodeInput_InvalidScriptSigHexRejected(t *testing.T) {
 	raw := rpc.RawVin{
-		TxID: rawHash("prevbadsig"), Vout: 0,
-		ScriptSig: &rpc.RawScriptSig{Hex: "zzzz"},
-		Sequence:  0,
+		TxID: strPtr(rawHash("prevbadsig")), Vout: uint32Ptr(0),
+		ScriptSig: &rpc.RawScriptSig{Hex: strPtr("zzzz")},
+		Sequence:  uint32Ptr(0),
 	}
 	if _, err := decodeInput(0, raw); err == nil {
 		t.Fatal("expected invalid scriptSig hex to be rejected")
@@ -435,9 +560,9 @@ func TestDecodeInput_InvalidScriptSigHexRejected(t *testing.T) {
 
 func TestDecodeInput_InvalidPrevTxIDRejected(t *testing.T) {
 	raw := rpc.RawVin{
-		TxID: "not-a-hash", Vout: 0,
-		ScriptSig: &rpc.RawScriptSig{Hex: "aa"},
-		Sequence:  0,
+		TxID: strPtr("not-a-hash"), Vout: uint32Ptr(0),
+		ScriptSig: &rpc.RawScriptSig{Hex: strPtr("aa")},
+		Sequence:  uint32Ptr(0),
 	}
 	if _, err := decodeInput(0, raw); err == nil {
 		t.Fatal("expected a malformed prevout txid to be rejected")
@@ -480,6 +605,87 @@ func TestDecodeWitness_EmptyOrNilInputIsEmptyWitnessStack(t *testing.T) {
 	}
 }
 
+// ─── review round: raw vin wire-shape exclusivity (task item 3) ─────────
+
+func TestDecodeInput_ContradictoryWireShapesRejected(t *testing.T) {
+	tests := []struct {
+		name string
+		vin  rpc.RawVin
+	}{
+		{"coinbase + txid", rpc.RawVin{
+			Coinbase: strPtr("51"), TxID: strPtr(rawHash("contraprev")), Sequence: uint32Ptr(0),
+		}},
+		{"coinbase + vout", rpc.RawVin{
+			Coinbase: strPtr("51"), Vout: uint32Ptr(0), Sequence: uint32Ptr(0),
+		}},
+		{"coinbase + scriptSig", rpc.RawVin{
+			Coinbase: strPtr("51"), ScriptSig: &rpc.RawScriptSig{Hex: strPtr("")}, Sequence: uint32Ptr(0),
+		}},
+		{"ordinary txid present but vout missing", rpc.RawVin{
+			TxID: strPtr(rawHash("contraprev")), ScriptSig: &rpc.RawScriptSig{Hex: strPtr("")}, Sequence: uint32Ptr(0),
+		}},
+		{"ordinary vin missing scriptSig entirely", rpc.RawVin{
+			TxID: strPtr(rawHash("contraprev")), Vout: uint32Ptr(0), Sequence: uint32Ptr(0),
+		}},
+		{"scriptSig object present but hex member missing", rpc.RawVin{
+			TxID: strPtr(rawHash("contraprev")), Vout: uint32Ptr(0), ScriptSig: &rpc.RawScriptSig{}, Sequence: uint32Ptr(0),
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := decodeInput(0, tt.vin); err == nil {
+				t.Fatalf("expected %s to be rejected", tt.name)
+			}
+		})
+	}
+}
+
+// ─── review round: genesis / previousblockhash relation (task item 4) ───
+
+func TestDecodeBlock_GenesisRelation(t *testing.T) {
+	ctx := context.Background()
+	coinbase := func(label string) rpc.RawTransaction {
+		return rawCoinbaseTx(rawHash(label), rawP2PKHVout(0, "5", "qAlice"))
+	}
+
+	t.Run("height 0 with previousblockhash present rejected", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("genrelA"), 0, "", coinbase("genrelAtx"))
+		raw.PreviousBlockHash = strPtr(rawHash("genrelAparent"))
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected height 0 with a present previousblockhash to be rejected")
+		}
+	})
+
+	t.Run("height > 0 without previousblockhash rejected", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("genrelB"), 1, "", coinbase("genrelBtx"))
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a non-genesis height missing previousblockhash to be rejected")
+		}
+	})
+
+	t.Run("negative height rejected", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("genrelC"), 1, rawHash("genrelCparent"), coinbase("genrelCtx"))
+		raw.Height = int64Ptr(-1)
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative height to be rejected")
+		}
+	})
+
+	t.Run("height 0 without previousblockhash accepted", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("genrelD"), 0, "", coinbase("genrelDtx"))
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err != nil {
+			t.Fatalf("expected genesis to be accepted: %v", err)
+		}
+	})
+
+	t.Run("height > 0 with valid previousblockhash accepted", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("genrelE"), 1, rawHash("genrelEparent"), coinbase("genrelEtx"))
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err != nil {
+			t.Fatalf("expected a normal non-genesis block to be accepted: %v", err)
+		}
+	})
+}
+
 // ─── output decoding: value, script classification, address rules ──────
 
 func TestDecodeOutput_ValueAndPositionalIndex(t *testing.T) {
@@ -507,17 +713,48 @@ func TestDecodeOutput_NMismatchRejected(t *testing.T) {
 
 func TestDecodeOutput_InvalidScriptHexRejected(t *testing.T) {
 	ctx := context.Background()
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: "zz"}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr("zz")}}
 	if _, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil)); err == nil {
 		t.Fatal("expected invalid scriptPubKey hex to be rejected")
 	}
 }
 
-func TestDecodeOutput_MissingScriptRejected(t *testing.T) {
+// ─── review round: empty scriptPubKey is valid data (task item 2) ───────
+
+func TestDecodeOutput_EmptyScriptPubKeyHexAccepted(t *testing.T) {
 	ctx := context.Background()
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: ""}}
+	raw := rpc.RawVout{Value: "0", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr("")}}
+	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
+	if err != nil {
+		t.Fatalf("expected a present-but-empty scriptPubKey.hex to be accepted: %v", err)
+	}
+	if len(out.ScriptPubKey) != 0 {
+		t.Errorf("ScriptPubKey = %x, want zero-length", out.ScriptPubKey)
+	}
+	if out.ScriptPubKey == nil {
+		t.Error("ScriptPubKey is nil, want a non-nil zero-length []byte (raw bytes preserved, not invented)")
+	}
+	if out.ScriptType != script.TypeUnknown {
+		t.Errorf("ScriptType = %s, want %s", out.ScriptType, script.TypeUnknown)
+	}
+	if out.Address != "" {
+		t.Errorf("Address = %q, want empty", out.Address)
+	}
+}
+
+func TestDecodeOutput_MissingScriptPubKeyObjectRejected(t *testing.T) {
+	ctx := context.Background()
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: nil}
 	if _, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil)); err == nil {
-		t.Fatal("expected a missing scriptPubKey to be rejected")
+		t.Fatal("expected a missing scriptPubKey object to be rejected")
+	}
+}
+
+func TestDecodeOutput_ScriptPubKeyMissingHexMemberRejected(t *testing.T) {
+	ctx := context.Background()
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{}}
+	if _, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil)); err == nil {
+		t.Fatal("expected a scriptPubKey object with a missing hex member to be rejected")
 	}
 }
 
@@ -544,8 +781,8 @@ func TestDecodeOutput_RPCTypeNeverDrivesClassification(t *testing.T) {
 	// follow the bytes, never the RPC-reported type string.
 	scriptHex := "0014" + strings.Repeat("ab", 20)
 	raw := rpc.RawVout{
-		Value: "1", N: 0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "pubkeyhash", Address: "qLies"},
+		Value: "1", N: uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "pubkeyhash", Address: strPtr("qLies")},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -568,38 +805,16 @@ func TestDecodeOutput_OrdinaryAddressCopiedFromCore(t *testing.T) {
 	}
 }
 
-func TestDecodeOutput_NullDataNeverInventsAddress(t *testing.T) {
-	ctx := context.Background()
-	raw := rpc.RawVout{
-		Value: "0", N: 0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: "6a04deadbeef", Type: "nulldata"}, // no Address field
-	}
-	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
-	if err != nil {
-		t.Fatalf("decodeOutput: %v", err)
-	}
-	if out.ScriptType != script.TypeNullData {
-		t.Fatalf("ScriptType = %s, want %s", out.ScriptType, script.TypeNullData)
-	}
-	if out.Address != "" {
-		t.Errorf("Address = %q, want empty for OP_RETURN (never invented)", out.Address)
-	}
-	if out.Value != 0 {
-		t.Errorf("Value = %d, want 0", out.Value)
-	}
-}
-
 func TestDecodeOutput_UnknownWitnessNeverUpgradedToP2QPK(t *testing.T) {
 	ctx := context.Background()
 	// witness version 3 (not 0/1/2), 32-byte program: structurally
 	// TypeUnknownWitness, must NOT be upgraded to P2QPK just because it's
 	// witness_unknown-shaped in some generic sense.
 	prog := strings.Repeat("cd", 32)
-	scriptHex := "6120" + prog // OP_16? no: version 3 push opcode is 0x53
-	scriptHex = "5320" + prog
+	scriptHex := "5320" + prog // version-3 push opcode is 0x53
 	raw := rpc.RawVout{
-		Value: "1", N: 0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Type: "witness_unknown", Address: "qWitnessUnknown"},
+		Value: "1", N: uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Type: "witness_unknown", Address: strPtr("qWitnessUnknown")},
 	}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
@@ -616,15 +831,222 @@ func TestDecodeOutput_UnknownWitnessNeverUpgradedToP2QPK(t *testing.T) {
 	}
 }
 
-// ─── P2PK address resolution (task item 9) ───────────────────────────────
+// ─── review round: Core address presence by structural type (item 5) ────
+
+func TestDecodeOutput_AddressPresenceByType(t *testing.T) {
+	ctx := context.Background()
+	p2pkhScript := "76a914" + strings.Repeat("ab", 20) + "88ac"
+	p2trScript := "5120" + strings.Repeat("cd", 32)
+	p2qpkScript := "5220" + strings.Repeat("ef", 32)
+	unknownWitnessScript := "5320" + strings.Repeat("11", 32) // v3/32
+	nullDataScript := "6a04deadbeef"
+	nonstandardScript := "006301020304" // OP_0 OP_IF <push> ...: not a recognized standard type
+
+	tests := []struct {
+		name      string
+		scriptHex string
+		address   *string
+		wantErr   bool
+	}{
+		{"P2PKH with address -> accepted", p2pkhScript, strPtr("qPKH"), false},
+		{"P2PKH missing address -> rejected", p2pkhScript, nil, true},
+		{"P2TR missing address -> rejected", p2trScript, nil, true},
+		{"P2TR with address -> accepted", p2trScript, strPtr("bq1pTaproot"), false},
+		{"P2QPK v2/32 missing address -> rejected", p2qpkScript, nil, true},
+		{"P2QPK v2/32 with address -> accepted", p2qpkScript, strPtr("qP2QPKWitnessUnknown"), false},
+		{"unknown_witness with address -> accepted", unknownWitnessScript, strPtr("qUnknownWitness"), false},
+		{"unknown_witness missing address -> rejected", unknownWitnessScript, nil, true},
+		{"nulldata with no address -> accepted", nullDataScript, nil, false},
+		{"nulldata with fabricated address -> rejected", nullDataScript, strPtr("qFabricated"), true},
+		{"nonstandard/unknown with fabricated address -> rejected", nonstandardScript, strPtr("qFabricated"), true},
+		{"nonstandard/unknown with no address -> accepted", nonstandardScript, nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			raw := rpc.RawVout{
+				Value:        "1",
+				N:            uint32Ptr(0),
+				ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(tt.scriptHex), Address: tt.address},
+			}
+			out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("expected rejection, got output %+v", out)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected acceptance, got error: %v", err)
+			}
+			if tt.address != nil {
+				if out.Address != *tt.address {
+					t.Errorf("Address = %q, want %q", out.Address, *tt.address)
+				}
+			} else if out.Address != "" {
+				t.Errorf("Address = %q, want empty", out.Address)
+			}
+		})
+	}
+}
+
+func TestDecodeOutput_P2PKUnexpectedAddressRejected(t *testing.T) {
+	ctx := context.Background()
+	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
+	scriptHex := "21" + pubKeyHex + "ac"
+	raw := rpc.RawVout{
+		Value: "1", N: uint32Ptr(0),
+		// Core's ScriptToUniv never emits "address" for PUBKEY — a present
+		// one here is contradictory RPC data.
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Address: strPtr("qUnexpected")},
+	}
+	resolver := newFakeResolver(map[string]string{pubKeyHex: "qResolved"})
+	if _, err := decodeOutput(ctx, 0, raw, resolver); err == nil {
+		t.Fatal("expected a P2PK output with an unexpected Core-reported address to be rejected")
+	}
+}
+
+func TestDecodeOutput_MultisigUnexpectedAddressRejected(t *testing.T) {
+	ctx := context.Background()
+	pub1 := "02" + strings.Repeat("11", 32)
+	scriptHex := "51" + "21" + pub1 + "51ae" // 1-of-1
+	raw := rpc.RawVout{
+		Value: "1", N: uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Address: strPtr("qUnexpected")},
+	}
+	resolver := newFakeResolver(map[string]string{pub1: "qResolved"})
+	if _, err := decodeOutput(ctx, 0, raw, resolver); err == nil {
+		t.Fatal("expected a multisig output with an unexpected Core-reported address to be rejected")
+	}
+}
+
+// ─── review round: resolver must never panic (task item 6) ──────────────
+
+func TestDecodeOutput_P2PKNilResolverErrorsNotPanics(t *testing.T) {
+	ctx := context.Background()
+	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
+	scriptHex := "21" + pubKeyHex + "ac"
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("decodeOutput panicked with a nil resolver: %v", r)
+		}
+	}()
+	if _, err := decodeOutput(ctx, 0, raw, nil); err == nil {
+		t.Fatal("expected a nil resolver on a P2PK output to produce an error")
+	}
+}
+
+func TestDecodeOutput_MultisigNilResolverErrorsNotPanics(t *testing.T) {
+	ctx := context.Background()
+	pub1 := "02" + strings.Repeat("11", 32)
+	scriptHex := "51" + "21" + pub1 + "51ae"
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
+
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("decodeOutput panicked with a nil resolver: %v", r)
+		}
+	}()
+	if _, err := decodeOutput(ctx, 0, raw, nil); err == nil {
+		t.Fatal("expected a nil resolver on a multisig output to produce an error")
+	}
+}
+
+func TestDecodeOutput_ResolverEmptyAddressRejected(t *testing.T) {
+	ctx := context.Background()
+	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
+	scriptHex := "21" + pubKeyHex + "ac"
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
+	if _, err := decodeOutput(ctx, 0, raw, emptyResolver{}); err == nil {
+		t.Fatal("expected a resolver returning (\"\", nil) to be rejected at the decoder boundary")
+	}
+}
+
+func TestCoreAddressResolver_NilClientErrorsNotPanics(t *testing.T) {
+	ctx := context.Background()
+	resolver := NewCoreAddressResolver(nil)
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("ResolvePubKeyAddress panicked with a nil client: %v", r)
+		}
+	}()
+	if _, err := resolver.ResolvePubKeyAddress(ctx, "02"+strings.Repeat("11", 32)); err == nil {
+		t.Fatal("expected a nil-client resolver to produce an error")
+	}
+}
+
+// ─── review round: basic raw metric sanity (task item 7) ────────────────
+
+func TestDecodeBlock_NegativeSizeWeightRejected(t *testing.T) {
+	ctx := context.Background()
+	coinbase := rawCoinbaseTx(rawHash("negmetrictx"), rawP2PKHVout(0, "5", "qAlice"))
+
+	t.Run("negative size", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("negsizeblk"), 100, rawHash("negsizeparent"), coinbase)
+		raw.Size = intPtr(-1)
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative block size to be rejected")
+		}
+	})
+	t.Run("negative weight", func(t *testing.T) {
+		raw := rawBlockFixture(rawHash("negweightblk"), 100, rawHash("negweightparent"), coinbase)
+		raw.Weight = intPtr(-1)
+		if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative block weight to be rejected")
+		}
+	})
+}
+
+func TestDecodeTransaction_NegativeSizeVSizeWeightRejected(t *testing.T) {
+	ctx := context.Background()
+	build := func() rpc.RawTransaction {
+		return rawSpendTx(rawHash("negtxmetric"), rawHash("negtxmetric"),
+			[]rpc.RawVin{rawSpendVin(rawHash("negtxmetricprev"), 0, "aabb")},
+			[]rpc.RawVout{rawP2PKHVout(0, "1", "qBob")},
+		)
+	}
+	t.Run("negative size", func(t *testing.T) {
+		raw := build()
+		raw.Size = intPtr(-1)
+		if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative transaction size to be rejected")
+		}
+	})
+	t.Run("negative vsize", func(t *testing.T) {
+		raw := build()
+		raw.VSize = intPtr(-1)
+		if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative transaction vsize to be rejected")
+		}
+	})
+	t.Run("negative weight", func(t *testing.T) {
+		raw := build()
+		raw.Weight = intPtr(-1)
+		if _, err := DecodeTransaction(ctx, raw, newFakeResolver(nil)); err == nil {
+			t.Fatal("expected a negative transaction weight to be rejected")
+		}
+	})
+}
+
+func TestDecodeBlock_MalformedBitsRejected(t *testing.T) {
+	ctx := context.Background()
+	raw := rawBlockFixture(rawHash("badbitsblk"), 100, rawHash("badbitsparent"), rawCoinbaseTx(rawHash("badbitstx"), rawP2PKHVout(0, "5", "qAlice")))
+	raw.Bits = strPtr("not8chars")
+	if _, err := DecodeBlock(ctx, raw, newFakeResolver(nil)); err == nil {
+		t.Fatal("expected malformed bits (not exactly 8 lowercase hex characters) to be rejected")
+	}
+}
+
+// ─── P2PK address resolution (prior round) ───────────────────────────────
 
 func TestDecodeOutput_P2PKResolvesAddressViaResolver(t *testing.T) {
 	ctx := context.Background()
 	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
 	scriptHex := "21" + pubKeyHex + "ac" // <push 33><pubkey> OP_CHECKSIG
 	raw := rpc.RawVout{
-		Value: "1", N: 0,
-		ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}, // no Address: Core omits it for bare P2PK
+		Value: "1", N: uint32Ptr(0),
+		ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}, // no Address: Core omits it for bare P2PK
 	}
 	resolver := newFakeResolver(map[string]string{pubKeyHex: "qResolvedP2PKAddress"})
 	out, err := decodeOutput(ctx, 0, raw, resolver)
@@ -646,14 +1068,14 @@ func TestDecodeOutput_P2PKResolutionFailureRejected(t *testing.T) {
 	ctx := context.Background()
 	pubKeyHex := "029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cd"
 	scriptHex := "21" + pubKeyHex + "ac"
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
 	resolver := newFakeResolver(nil) // no addresses configured -> always errors
 	if _, err := decodeOutput(ctx, 0, raw, resolver); err == nil {
 		t.Fatal("expected a P2PK resolution failure to reject the whole output")
 	}
 }
 
-// ─── bare multisig participant resolution (task item 10) ────────────────
+// ─── bare multisig participant resolution (prior round) ─────────────────
 
 func TestDecodeOutput_MultisigResolvesEveryParticipant(t *testing.T) {
 	ctx := context.Background()
@@ -661,7 +1083,7 @@ func TestDecodeOutput_MultisigResolvesEveryParticipant(t *testing.T) {
 	pub2 := strings.Repeat("03", 1) + strings.Repeat("22", 32)
 	// 1-of-2 bare multisig: OP_1 <pub1> <pub2> OP_2 OP_CHECKMULTISIG
 	scriptHex := "51" + "21" + pub1 + "21" + pub2 + "52ae"
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
 	resolver := newFakeResolver(map[string]string{
 		pub1: "qParticipant1",
 		pub2: "qParticipant2",
@@ -691,7 +1113,7 @@ func TestDecodeOutput_MultisigDuplicatePubkeyPreservedPositionally(t *testing.T)
 	// script preserves the duplication; the decoder must NOT deduplicate
 	// (Store applies identity-set deduplication at persistence instead).
 	scriptHex := "52" + "21" + pub1 + "21" + pub1 + "52ae"
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
 	resolver := newFakeResolver(map[string]string{pub1: "qDupParticipant"})
 	out, err := decodeOutput(ctx, 0, raw, resolver)
 	if err != nil {
@@ -710,7 +1132,7 @@ func TestDecodeOutput_MultisigOneParticipantUnresolvableRejected(t *testing.T) {
 	pub1 := strings.Repeat("02", 1) + strings.Repeat("44", 32)
 	pub2 := strings.Repeat("03", 1) + strings.Repeat("55", 32)
 	scriptHex := "51" + "21" + pub1 + "21" + pub2 + "52ae"
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex)}}
 	// Only pub1 resolvable — pub2 is not, so the whole output must fail
 	// rather than silently shortening ParticipantAddresses.
 	resolver := newFakeResolver(map[string]string{pub1: "qOnlyOne"})
@@ -719,7 +1141,7 @@ func TestDecodeOutput_MultisigOneParticipantUnresolvableRejected(t *testing.T) {
 	}
 }
 
-// ─── resolver memoization ────────────────────────────────────────────────
+// ─── resolver memoization (prior round) ──────────────────────────────────
 
 func TestCoreAddressResolver_MemoizesPerPubKey(t *testing.T) {
 	ctx := context.Background()
@@ -806,7 +1228,7 @@ func TestDecodeOutput_WitnessProgramPopulatedForWitnessTypes(t *testing.T) {
 	ctx := context.Background()
 	prog := strings.Repeat("ab", 20)
 	scriptHex := "0014" + prog
-	raw := rpc.RawVout{Value: "1", N: 0, ScriptPubKey: rpc.RawScriptPubKey{Hex: scriptHex, Address: "qP2WPKH"}}
+	raw := rpc.RawVout{Value: "1", N: uint32Ptr(0), ScriptPubKey: &rpc.RawScriptPubKey{Hex: strPtr(scriptHex), Address: strPtr("qP2WPKH")}}
 	out, err := decodeOutput(ctx, 0, raw, newFakeResolver(nil))
 	if err != nil {
 		t.Fatalf("decodeOutput: %v", err)

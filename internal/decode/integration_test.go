@@ -149,10 +149,11 @@ func TestLiveRPC_KnownVectorsMatchLiveNode(t *testing.T) {
 			var found *rpc.RawVout
 			var foundTx *rpc.RawTransaction
 			for i := range raw.Tx {
-				if raw.Tx[i].TxID == tt.txid {
+				if raw.Tx[i].TxID != nil && *raw.Tx[i].TxID == tt.txid {
 					foundTx = &raw.Tx[i]
 					for j := range raw.Tx[i].Vout {
-						if raw.Tx[i].Vout[j].ScriptPubKey.Hex == tt.scriptHex {
+						spk := raw.Tx[i].Vout[j].ScriptPubKey
+						if spk != nil && spk.Hex != nil && *spk.Hex == tt.scriptHex {
 							found = &raw.Tx[i].Vout[j]
 						}
 					}
