@@ -1,8 +1,9 @@
 // Command qoge-explorer is the entry point for the QOGE block explorer
 // service. It implements RPC connectivity verification, schema migrations,
-// a loopback health endpoint, and — as of Phase 2C.2 — historical/live
-// chain indexing (`index`). A public explorer API/web UI does not exist
-// yet.
+// historical/live chain indexing (`index`), and — as of Phase 2D.1 — a
+// read-only JSON API (`serve`) over the already-indexed PostgreSQL
+// database. `index` and `serve` are deliberately separate processes; a
+// public HTML web UI does not exist yet.
 package main
 
 import (
@@ -16,10 +17,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/QOGE/qoge-explorer/internal/api"
 	"github.com/QOGE/qoge-explorer/internal/config"
 	"github.com/QOGE/qoge-explorer/internal/decode"
 	"github.com/QOGE/qoge-explorer/internal/indexer"
 	"github.com/QOGE/qoge-explorer/internal/logging"
+	"github.com/QOGE/qoge-explorer/internal/query"
 	"github.com/QOGE/qoge-explorer/internal/rpc"
 	"github.com/QOGE/qoge-explorer/internal/store"
 )
@@ -57,12 +60,15 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2C.2: historical sync + live reorg orchestration)
+	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2D.1: read-only query layer + JSON API)
 
 Usage:
   qoge-explorer check-rpc          Connect to the configured Qogecoin Core node
                                     and print non-secret status information.
-  qoge-explorer serve               Start the loopback-only health endpoint.
+  qoge-explorer serve               Start the read-only JSON API server over
+                                     the already-indexed PostgreSQL database
+                                     (loopback by default). Does not index;
+                                     does not require Core RPC credentials.
   qoge-explorer migrate up          Apply every not-yet-applied migration.
   qoge-explorer migrate down [n]    Roll back the n most recent migrations
                                      (default 1).
@@ -71,7 +77,8 @@ Usage:
                                      then historically sync from genesis (or
                                      resume from the last checkpoint) and
                                      poll for new blocks/reorgs until
-                                     SIGINT/SIGTERM. No public API/UI.
+                                     SIGINT/SIGTERM. No API/UI. Run this as a
+                                     separate process from serve.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -80,12 +87,12 @@ Configuration is read from environment variables:
   QOGE_RPC_PASSWORD         required for check-rpc, index
   QOGE_RPC_TLS              default false     (check-rpc, index)
   QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc, index)
-  QOGE_DATABASE_URL         required for migrate/index, e.g. postgres://user:pass@host:5432/dbname
+  QOGE_DATABASE_URL         required for migrate/index/serve, e.g. postgres://user:pass@host:5432/dbname
   QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
   QOGE_NETWORK              required for index; must exactly match Core's
                              getblockchaininfo "chain" (e.g. main/test/regtest)
   QOGE_INDEX_POLL_SECONDS   default 10 (index; live-loop wait once caught up)
-  QOGE_HTTP_ADDR            default 127.0.0.1:8532
+  QOGE_HTTP_ADDR            default 127.0.0.1:8532 (serve)
   QOGE_LOG_LEVEL            default info
   QOGE_LOG_JSON             default false`)
 }
@@ -151,29 +158,59 @@ func runCheckRPC(cfg config.Config, log interface {
 	return 0
 }
 
-func runServe(cfg config.Config, log interface {
-	Info(msg string, args ...any)
-	Error(msg string, args ...any)
-}) int {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok","phase":"1-recon-only","indexing":false}`))
-	})
+// runServe starts the Phase 2D.1 read-only JSON API server over the
+// already-indexed PostgreSQL database. It never starts indexing and never
+// requires Core RPC credentials — see cmd/qoge-explorer's package doc
+// comment and docs/ARCHITECTURE.md §19 "index and serve remain separate".
+func runServe(cfg config.Config, log *slog.Logger) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
 
-	log.Info("starting loopback health server (no indexing, no public exposure)", "addr", cfg.HTTPAddr)
+	connectCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pool, err := store.Connect(connectCtx, cfg.DatabaseURL)
+	cancel()
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	handler := api.New(query.New(pool), log)
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
 	}
 
-	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Error("http server failed", "error", err)
-		return 1
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	log.Info("starting read-only API server (index and serve remain separate processes)", "addr", cfg.HTTPAddr)
+
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.ListenAndServe() }()
+
+	select {
+	case err := <-serveErr:
+		if err != nil && err != http.ErrServerClosed {
+			log.Error("http server failed", "error", err)
+			return 1
+		}
+	case <-ctx.Done():
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer shutdownCancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Error("http server shutdown failed", "error", err)
+			return 1
+		}
 	}
+	log.Info("http server stopped")
 	return 0
 }
 

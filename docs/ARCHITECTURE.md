@@ -2113,3 +2113,229 @@ small height via a test-only RPC wrapper — normal `go test ./...` never
 needs `qogecoind`, RPC credentials, or network access.
 
 This phase does not implement a public explorer API or web UI.
+
+## 19. Read-only query layer + JSON API (Phase 2D.1)
+
+Phase 2D.1 exposes the already-indexed PostgreSQL state read-only. It adds
+two new packages and upgrades `qoge-explorer serve` from a placeholder
+health endpoint into a real process — nothing in `migrations/`, `Store`'s
+write path (`ApplyBlock`/`RollbackTo`), `internal/decode`,
+`internal/script`, `internal/chain`, or `internal/indexer` changes.
+**PostgreSQL is the sole source of truth for every explorer read** — this
+phase never calls Qogecoin Core RPC to reconstruct indexed data.
+
+### Two packages, one direction of dependency
+
+`internal/query` wraps the same `*pgxpool.Pool` `Store` writes through in
+a second, read-only `query.Store` — every method it exposes issues
+`SELECT` only (see `internal/query/doc.go`). `internal/api` is a thin
+`net/http` layer (`internal/api/server.go` + `handlers_*.go`) that calls
+`internal/query` and nothing else: no handler contains SQL, and no
+handler reconstructs accounting logic Store/query.Store didn't already
+compute. This mirrors the existing `decode → chain → store → indexer`
+layering: each package only reaches into the layer directly below it
+through its exported API.
+
+### Read-only enforcement
+
+There is no separate read-only database role in this phase (task-scoped
+out; `query.Store` shares `Store`'s pool and its ordinary write
+privileges at the connection level) — the guarantee is structural, not
+credential-based: every query in `internal/query/*.go` is a `SELECT`,
+verified by `internal/query/readonly_test.go`, which snapshots row counts
+across every mutable table (`blocks`, `transactions`,
+`transaction_variants`, `block_transactions`, `transaction_inputs`,
+`transaction_input_witness`, `transaction_outputs`, `addresses`,
+`output_addresses`, `output_participants`, `utxo_state`) plus
+`sync_state.indexed_height`, runs a broad sweep of every exported query
+call (including not-found error paths), and requires exact equality
+before/after. `query.Store` never calls `lockCheckpoint`'s row lock
+(`internal/store/store.go`) — ordinary reads are never serialized behind
+canonical-mutation writers, matching Postgres's default READ COMMITTED
+isolation: each individual `SELECT`/multi-statement handler sees a
+consistent, committed snapshot as of when it runs, and the API is
+expected to tolerate the indexer concurrently advancing canonical state
+between two separate requests (there is no cross-request transaction).
+
+### Canonical vs. orphan semantics
+
+Enforced by construction, not left to callers:
+
+  - Height-based lookups (`RecentBlocks`, `BlockByHeight`) only ever
+    `WHERE canonical` — an orphaned block can never be reached by height,
+    mirroring `blocks_height_canonical_uidx`'s "exactly one canonical
+    block per height" invariant.
+  - Hash-based block lookup (`BlockByHash`) may return an orphaned block
+    (historical/audit data), always explicitly tagged
+    `"canonical": false` in the response — never silently presented as
+    current.
+  - Address balances (`AddressSummary`) and history (`AddressHistory`)
+    are derived exclusively from `utxo_state`/`addresses`/
+    `output_addresses`, which `RollbackTo` already keeps canonical-only
+    (§16, §18) — an orphaned output's creation or spend never contributes
+    to either. `internal/query/reorg_test.go` and `addresses_test.go`
+    exercise a full branch flip (A→B) and flip-back (B→A) through
+    `Store.RollbackTo`, confirming height lookups, recent-block listing,
+    and address balance/history all follow the new canonical branch each
+    time, while the losing branch's blocks remain queryable by hash.
+
+### txid vs. wtxid lookup
+
+`GET /api/v1/tx/{id}` accepts either a txid or a wtxid — `id` must be
+exactly 64 lowercase hex characters; the lookup tries it as a txid first
+(`query.Store.TransactionByTxID`) and only on `ErrNotFound` retries it as
+a wtxid (`TransactionByWTxID`). This never conflates the two identity
+spaces: the response always reports its own `txid` and `wtxid` as
+separate fields, so which space `id` matched is never ambiguous in the
+result. `TransactionByTxID` shows the transaction's CANONICAL witness
+variant when one exists (falling back to the most recently observed
+orphaned variant otherwise — `pickRepresentativeWTxID`,
+`internal/query/transactions.go`); `TransactionByWTxID` always shows
+exactly the variant requested, canonical or not, never silently
+substituted. `Occurrences` on the response lists every block (canonical
+and orphaned) the transaction has ever appeared in, each tagged with its
+own `wtxid`, height, and `canonical` flag — reflecting the schema's own
+`transactions`/`transaction_variants`/`block_transactions` split (§3a).
+
+### Exact money representation
+
+No JSON monetary value is ever a float. Every amount exposes an exact
+integer `..._sats` field alongside an exact decimal `..._qoge` STRING
+derived via `chain.Amount(sats).String()` (§2's fixed-point integer
+arithmetic, already reviewed in Phase 2A) — `internal/query` never
+reimplements that formatting. `transactions_test.go` items L/M and
+`decoded_vectors_test.go`'s genesis vector (100 QOGE, `"100.00000000"`)
+pin this down directly against known integer satoshi values.
+
+### P2QPK large-witness response policy
+
+A P2QPK signature witness item is exactly 17,088 bytes
+(`script.P2QPKSignatureLength`, §8). Ordinary transaction-detail responses
+never embed it: `InputDetail.Witness` is `[]query.WitnessItem{ItemIndex,
+SizeBytes}` by default — metadata only, fetched via a `SELECT
+octet_length(data)`, never pulling the `BYTEA` column itself
+(`witnessByVin`, `internal/query/transactions.go`). Raw bytes are an
+explicit opt-in: `GET /api/v1/tx/{id}?include_witness=true` sets
+`DataHex` on every witness item, byte-exact after hex decoding. One route
+with a query flag was chosen over a separate `/witness` endpoint to keep
+the "one clean design" the task called for; `internal/query`'s
+`TransactionByTxID`/`TransactionByWTxID` both take an explicit
+`includeRawWitness bool` rather than defaulting to raw. Verified
+end-to-end (`decoded_vectors_test.go`'s `TestDecoded_P2QPKPipeline`,
+`internal/api/api_test.go`'s
+`TestTransactionWitness_DefaultOmitsRaw_OptInIncludesIt`): the default
+response body never contains the signature's hex substring; the opt-in
+response contains it byte-exact, and item-1 (the 32-byte SLH-DSA public
+key) is likewise byte-exact. The API/query layers never re-verify or
+reinterpret the signature — exactly as before, this project never treats
+witness bytes as anything but opaque data to persist and later return
+unchanged.
+
+### P2QPK output presentation vs. P2TR negative control
+
+A structural P2QPK output is presented as `script_type: "p2qpk"`,
+`witness_version: 2`, a 32-byte `witness_program`, and the address
+`Store` already persisted (from Core's own RPC-reported destination) —
+`internal/query` never re-derives the address and never treats the
+witness program as the SLH-DSA public key itself (that key lives in the
+SPENDING input's witness stack, item 1, not the output). Real P2TR stays
+`script_type: "p2tr"`, `witness_version: 1` — structurally identical in
+shape (both v/32-byte programs) but classified distinctly by
+`script.Classify` (§7, §9) long before `internal/query` ever sees the
+row; `decoded_vectors_test.go`'s `TestDecoded_P2TRDistinctFromP2QPK`
+builds both outputs in the same transaction and asserts the returned
+`script_type`/`witness_version` differ.
+
+### Address balance vs. multisig participant semantics
+
+`AddressSummary` reads only the `addresses` cache (`Store`'s
+`recomputeAddress`, §16/§4) — the same canonical, spend-aware balance the
+indexer already maintains; `internal/query` never recomputes it
+independently. An address with no `addresses` row (never received a
+canonical output, or every output that ever named it was rolled back) is
+not `ErrNotFound`: it returns an all-zero `AddressSummary`, because the
+schema has no address-validity concept to distinguish "malformed
+address" from "syntactically fine, never used" — `AddressSummary`'s doc
+comment in `internal/query/addresses.go` states this explicitly.
+`output_participants` (bare-multisig co-signer identities, §7/§13.A)
+never contributes to `AddressSummary` or `AddressHistory` — both are
+built exclusively from `output_addresses`/`utxo_state`. A multisig
+output's participants ARE surfaced, but only as `OutputDetail.
+Participants []string` on the owning TRANSACTION's output list
+(`attachParticipants`, `internal/query/transactions.go`) — structurally
+separate from `Address` (the sole balance-accounting field) on the same
+struct, so a caller can never mistake "who could sign this" for "who
+owns this."
+
+### API routes and versioning
+
+Every route is under `/api/v1/`, plus process-level `/healthz`
+(liveness, no database dependency) and `/readyz` (confirms the
+configured PostgreSQL database is reachable and holds the expected
+`sync_state` checkpoint row — never Core RPC):
+
+```
+GET /healthz
+GET /readyz
+GET /api/v1/status
+GET /api/v1/blocks
+GET /api/v1/block/{height-or-hash}
+GET /api/v1/tx/{txid-or-wtxid}
+GET /api/v1/tx/{txid-or-wtxid}?include_witness=true
+GET /api/v1/address/{address}
+GET /api/v1/address/{address}/transactions
+```
+
+No mutation endpoint exists (`internal/api/api_test.go`'s
+`TestNoMutationEndpoints` confirms `POST`/`PUT`/`PATCH`/`DELETE` never
+return 200 on an existing route). Errors use a consistent JSON envelope
+(`{"error":{"code":...,"message":...}}`, `internal/api/errors.go`) for
+every 400/404/500 a handler itself produces; a wrong HTTP method on a
+real route or a truly unregistered path falls through to
+`net/http.ServeMux`'s own automatic 405/404 (confirmed empirically that
+registering a catch-all `"/"` pattern would silently defeat the stdlib's
+built-in method-mismatch 405 detection — see `server.go`'s `routes()`
+doc comment — so no catch-all is registered; those two specific cases get
+the stdlib's plain-text body rather than the JSON envelope, still with
+the correct status code). List endpoints are keyset-paginated
+(`before`/`before_txid` cursors, never raw `OFFSET`) with a hard maximum
+page size (`query.MaxPageSize = 100`) enforced in the query layer
+regardless of what a caller requests. Identifier validation happens
+before any database call: block/tx hashes must be exactly 64 lowercase
+hex characters (uppercase is rejected, never silently normalized —
+`internal/api/validate.go`); heights must be non-negative decimal
+integers; addresses get a length/character-shape bound only — this phase
+never re-implements full consensus address validation.
+
+### `index` and `serve` remain separate processes
+
+`qoge-explorer serve` requires `QOGE_DATABASE_URL` but no Core RPC
+credentials at all — it never dials Qogecoin Core. `qoge-explorer index`
+is unchanged and remains the only process that writes. Composing the two
+(e.g. exposing Core's live tip/sync-lag via the API) is explicitly
+deferred — `query.Status` reports only the INDEXED DATABASE's checkpoint
+(`sync_state('main')`), never a live RPC-derived height. The default bind
+address remains loopback-only (`127.0.0.1:8532`); public exposure through
+a reverse proxy, and authentication, are both out of scope for this
+read-only phase. `http.Server` sets explicit `ReadHeaderTimeout`,
+`ReadTimeout`, `WriteTimeout`, and `IdleTimeout` (`cmd/qoge-explorer/
+main.go`'s `runServe`), and the process shuts down cleanly on
+SIGINT/SIGTERM via `http.Server.Shutdown`, mirroring `index`'s existing
+signal handling.
+
+### Testing
+
+`internal/query`'s tests (A–T in the phase task list) build every fixture
+through the real `Store.ApplyBlock`/`RollbackTo` — never ad-hoc SQL —
+using either plain `chain.Block` literals or, for the P2QPK/P2TR/real
+script-type vectors, the actual `decode.DecodeBlock` pipeline
+(`decoded_vectors_test.go`), so the query layer is always tested against
+data that passed through the same decoder/classifier every other phase
+already reviewed. `internal/api`'s tests exercise the same fixtures one
+layer up, through `Server.ServeHTTP` via `httptest`, confirming HTTP
+status codes, JSON shapes, and the witness opt-in behavior end-to-end.
+Both packages skip their PostgreSQL-backed tests (never fail `go test
+./...`) when `QOGE_TEST_DATABASE_URL` is unset, matching every prior
+phase's convention.
+
+This phase does not implement a public explorer HTML web UI.
