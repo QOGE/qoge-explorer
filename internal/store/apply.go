@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -83,6 +84,28 @@ import (
 // transaction's inputs may only reference outputs created earlier in this
 // same block or in an already-applied block, never later in this block.
 // This is guaranteed by any block Qogecoin Core itself considers valid.
+//
+// # Core UTXO semantics
+//
+// transaction_outputs preserves every output that ever existed on-chain,
+// 1:1, forever — including outputs Core itself never treats as spendable
+// coins. utxo_state is NOT a mirror of transaction_outputs; it is the
+// Core-equivalent canonical coin set, and is deliberately missing a row for
+// two categories applyOutput excludes on purpose (mirroring
+// CCoinsViewCache::AddCoin's "if (coin.out.scriptPubKey.IsUnspendable())
+// return;", and ConnectBlock's genesis special case):
+//
+//   - every output of block height 0 (the genesis coinbase is documented,
+//     in both Core and QOGE's own chainparams, as never having existed in
+//     the coins database at all), and
+//   - any output whose scriptPubKey is script.IsUnspendable (OP_RETURN, or
+//     larger than script.MaxScriptSize), at any height.
+//
+// Neither exclusion drops or alters the immutable transaction_outputs row,
+// its destination/participant metadata, or its presence in query results —
+// only its presence in utxo_state (and therefore its eligibility to ever be
+// spent, and its contribution to any address's cached balance, which is
+// derived exclusively from utxo_state via recomputeAddress).
 func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -116,9 +139,15 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 		}
 	}
 
+	// Height 0 is Core's genesis special case: ConnectBlock skips connecting
+	// the genesis block's transactions at all ("its coinbase is unspendable"
+	// — src/validation.cpp), and QOGE's chainparams document the same for
+	// the genesis output specifically. See applyOutput.
+	isGenesis := block.Height == 0
+
 	touched := map[string]struct{}{}
 	for i, txn := range block.Transactions {
-		if err := applyTransaction(ctx, tx, block.Hash, i, txn, touched); err != nil {
+		if err := applyTransaction(ctx, tx, block.Hash, i, txn, isGenesis, touched); err != nil {
 			return fmt.Errorf("store: apply block %s tx %d (txid %s): %w", block.Hash, i, txn.TxID, err)
 		}
 	}
@@ -154,21 +183,26 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 // validateBlockShape checks block is internally self-consistent, before
 // any database access: block.TxCount must match len(block.Transactions)
 // exactly (ApplyBlock represents a fully indexed block, never a
-// header-only one — see ErrIncompleteBlock), and every transaction's
+// header-only one — see ErrIncompleteBlock), every transaction's
 // inputs/outputs must use the canonical positional index Core's own
 // vin/vout array semantics guarantee (chain.Input.Index/chain.Output.Index
 // documented as "this input/output's position within its transaction's
-// vin/vout list" — internal/chain/input.go, output.go). Enforcing this
-// up front makes an "index moved to another slot" attack structurally
-// impossible to even express, which is what lets the completeness checks
-// in applyInput/applyOutput/applyTransaction rely on a simple count
+// vin/vout list" — internal/chain/input.go, output.go), and the
+// transaction list must have Core-valid coinbase shape/positioning (see
+// below). Enforcing the positional-index rule up front makes an "index
+// moved to another slot" attack structurally impossible to even express,
+// which is what lets the completeness checks in
+// applyInput/applyOutput/applyTransaction rely on a simple count
 // comparison rather than a full index-set comparison.
 func validateBlockShape(block chain.Block) error {
 	if len(block.Transactions) != block.TxCount {
 		return fmt.Errorf("%w: block %s has TxCount=%d but %d transactions supplied",
 			ErrIncompleteBlock, block.Hash, block.TxCount, len(block.Transactions))
 	}
-	for _, txn := range block.Transactions {
+	if len(block.Transactions) == 0 {
+		return fmt.Errorf("%w: block %s has no transactions", ErrInvalidTransactionShape, block.Hash)
+	}
+	for idx, txn := range block.Transactions {
 		for i, in := range txn.Inputs {
 			if in.Index != uint32(i) {
 				return fmt.Errorf("%w: tx %s input %d has Index=%d, want %d (canonical positional index)",
@@ -180,6 +214,30 @@ func validateBlockShape(block chain.Block) error {
 				return fmt.Errorf("%w: tx %s output %d has Index=%d, want %d (canonical positional index)",
 					ErrImmutableConflict, txn.TxID, i, out.Index, i)
 			}
+		}
+
+		// Mirrors Core's IsCoinBase() (src/primitives/transaction.h):
+		// vin.size() == 1 && vin[0].prevout.IsNull(). txn.IsCoinbase is only
+		// a flag on the already-parsed model — Store uses it to decide
+		// whether to compute a fee and mark a prevout spent, so it must be
+		// proven to agree with the actual input shape before either of
+		// those monetary decisions is made, rather than trusted
+		// independently (task item 3: a mismatched flag could otherwise
+		// corrupt monetary state — e.g. IsCoinbase=true with a real
+		// prevout would silently skip that prevout's spend marking).
+		structurallyCoinbase := len(txn.Inputs) == 1 && txn.Inputs[0].PreviousOut == nil
+		if txn.IsCoinbase != structurallyCoinbase {
+			return fmt.Errorf("%w: tx %s IsCoinbase=%t but structurally %t (%d input(s))",
+				ErrInvalidTransactionShape, txn.TxID, txn.IsCoinbase, structurallyCoinbase, len(txn.Inputs))
+		}
+		// Every real Core block has exactly one coinbase transaction, and
+		// it is always transaction 0 — this is canonical block shape, not
+		// merely a per-transaction property.
+		if idx == 0 && !txn.IsCoinbase {
+			return fmt.Errorf("%w: block %s: transaction 0 (%s) is not coinbase", ErrInvalidTransactionShape, block.Hash, txn.TxID)
+		}
+		if idx > 0 && txn.IsCoinbase {
+			return fmt.Errorf("%w: block %s: transaction %d (%s) is coinbase but not transaction 0", ErrInvalidTransactionShape, block.Hash, idx, txn.TxID)
 		}
 	}
 	return nil
@@ -264,8 +322,9 @@ func addChecked(a, b int64) (int64, bool) {
 // UTXO creation), and marks every prevout it spends as spent — in that
 // order, so every foreign key the schema requires is already satisfied by
 // the time each statement runs. Addresses this transaction created an
-// output for or spent a UTXO from are added to touched.
-func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex int, txn chain.Transaction, touched map[string]struct{}) error {
+// output for or spent a UTXO from are added to touched. isGenesis is
+// ApplyBlock's block.Height == 0 — see "Core UTXO semantics" on ApplyBlock.
+func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex int, txn chain.Transaction, isGenesis bool, touched map[string]struct{}) error {
 	hasWitness := false
 	for _, in := range txn.Inputs {
 		if !in.Witness.IsEmpty() {
@@ -360,7 +419,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 	}
 
 	for _, out := range txn.Outputs {
-		addr, err := applyOutput(ctx, tx, blockHash, txn.TxID, out)
+		addr, err := applyOutput(ctx, tx, blockHash, txn.TxID, out, isGenesis)
 		if err != nil {
 			return err
 		}
@@ -513,10 +572,11 @@ func applyInput(ctx context.Context, tx pgx.Tx, txid, wtxid string, in chain.Inp
 }
 
 // applyOutput persists one output's body, its destination address (if
-// any), its bare-multisig participants (if any), and creates its
-// utxo_state row. Returns the destination address, if any, for
-// address-cache touch-tracking.
-func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out chain.Output) (string, error) {
+// any), its bare-multisig participants (if any), and — unless isGenesis or
+// the output is script.IsUnspendable, see ApplyBlock's "Core UTXO
+// semantics" — creates its utxo_state row. Returns the destination
+// address, if any, for address-cache touch-tracking.
+func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out chain.Output, isGenesis bool) (string, error) {
 	outputFresh, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("transaction_output %s:%d", txid, out.Index),
 		`INSERT INTO transaction_outputs (txid, vout_index, value_satoshis, script_pubkey, script_type, witness_version, witness_program)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (txid, vout_index) DO NOTHING`,
@@ -564,28 +624,50 @@ func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out cha
 	// parallel to PubKeys (chain.Output) — that relationship is required
 	// explicitly here, not silently tolerated: a shape mismatch, or any
 	// empty address, is rejected rather than quietly skipping the
-	// offending entries, and (on replay) the persisted participant count
-	// must exactly match what's supplied, same as every other child set.
+	// offending entries.
+	//
+	// output_participants is a SET of (address, pubkey) participant
+	// identities, keyed by (txid, vout_index, address) — a bare multisig
+	// script can structurally list the same pubkey more than once (its raw
+	// scriptPubKey bytes preserve that duplication exactly, unaffected by
+	// any of this); two identical (address, pubkey) entries are the SAME
+	// participant identity, not two, and are deduplicated here before
+	// persistence/completeness counting so an exact replay of a
+	// duplicate-participant output remains idempotent. The same address
+	// claimed with two DIFFERENT pubkeys is a genuine identity conflict,
+	// not a duplicate, and is rejected.
 	if out.ScriptType == script.TypeMultisig {
 		if len(out.ParticipantAddresses) != len(out.PubKeys) {
 			return "", fmt.Errorf("%w: output %s:%d is multisig with %d pubkeys but %d participant addresses",
 				ErrImmutableConflict, txid, out.Index, len(out.PubKeys), len(out.ParticipantAddresses))
 		}
+		participants := make(map[string][]byte, len(out.PubKeys))
+		order := make([]string, 0, len(out.PubKeys))
 		for i, addr := range out.ParticipantAddresses {
 			if addr == "" {
 				return "", fmt.Errorf("%w: output %s:%d participant %d has an empty address", ErrImmutableConflict, txid, out.Index, i)
 			}
+			pubkey := out.PubKeys[i]
+			if existing, ok := participants[addr]; ok {
+				if !bytes.Equal(existing, pubkey) {
+					return "", fmt.Errorf("%w: output %s:%d address %s claimed with two different pubkeys",
+						ErrImmutableConflict, txid, out.Index, addr)
+				}
+				continue // exact duplicate identity: same participant, not a new one
+			}
+			participants[addr] = pubkey
+			order = append(order, addr)
 		}
 		if !outputFresh {
 			if err := verifyExactCount(ctx, tx, fmt.Sprintf("output_participants for %s:%d", txid, out.Index),
 				`SELECT count(*) FROM output_participants WHERE txid = $1 AND vout_index = $2`,
-				[]any{txid, int64(out.Index)}, len(out.PubKeys),
+				[]any{txid, int64(out.Index)}, len(order),
 			); err != nil {
 				return "", err
 			}
 		}
-		for i, pubkey := range out.PubKeys {
-			addr := out.ParticipantAddresses[i]
+		for _, addr := range order {
+			pubkey := participants[addr]
 			if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("output_participant %s:%d:%s", txid, out.Index, addr),
 				`INSERT INTO output_participants (txid, vout_index, address, pubkey) VALUES ($1,$2,$3,$4) ON CONFLICT (txid, vout_index, address) DO NOTHING`,
 				`SELECT pubkey = $4 FROM output_participants WHERE txid = $1 AND vout_index = $2 AND address = $3`,
@@ -596,16 +678,24 @@ func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out cha
 		}
 	}
 
-	// Canonical UTXO creation. spent defaults false; the idempotent-verify
-	// SQL only compares creation_block_hash, never spent/spending_* — a
-	// conflict check here must never disturb a row's current mutable spend
-	// status (see docs/ARCHITECTURE.md §16).
-	if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("utxo_state creation %s:%d", txid, out.Index),
-		`INSERT INTO utxo_state (txid, vout_index, creation_block_hash) VALUES ($1,$2,$3) ON CONFLICT (txid, vout_index) DO NOTHING`,
-		`SELECT creation_block_hash = $3 FROM utxo_state WHERE txid = $1 AND vout_index = $2`,
-		txid, int64(out.Index), blockHash,
-	); err != nil {
-		return "", err
+	// Canonical UTXO creation — mirrors Core's CCoinsViewCache::AddCoin,
+	// which never adds an unspendable output to the coins view at all, and
+	// ConnectBlock's genesis special case, which skips connecting the
+	// genesis block's transactions entirely (see ApplyBlock's "Core UTXO
+	// semantics"). transaction_outputs above is written unconditionally
+	// either way — this only controls whether a canonical, spendable coin
+	// exists for it. spent defaults false; the idempotent-verify SQL only
+	// compares creation_block_hash, never spent/spending_* — a conflict
+	// check here must never disturb a row's current mutable spend status
+	// (see docs/ARCHITECTURE.md §16).
+	if !isGenesis && !script.IsUnspendable(out.ScriptPubKey) {
+		if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("utxo_state creation %s:%d", txid, out.Index),
+			`INSERT INTO utxo_state (txid, vout_index, creation_block_hash) VALUES ($1,$2,$3) ON CONFLICT (txid, vout_index) DO NOTHING`,
+			`SELECT creation_block_hash = $3 FROM utxo_state WHERE txid = $1 AND vout_index = $2`,
+			txid, int64(out.Index), blockHash,
+		); err != nil {
+			return "", err
+		}
 	}
 
 	return out.Address, nil

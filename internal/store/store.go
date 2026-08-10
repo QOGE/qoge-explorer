@@ -85,6 +85,17 @@ var (
 	// mainnet values are far below this, but silent wraparound is kept
 	// structurally impossible rather than merely improbable.
 	ErrAmountOverflow = errors.New("store: satoshi amount accumulator overflow")
+
+	// ErrInvalidTransactionShape means a transaction's IsCoinbase flag
+	// contradicts its structural shape (Core's own IsCoinBase() ==
+	// len(vin) == 1 && vin[0].prevout.IsNull()), or a block's transaction
+	// list violates canonical coinbase positioning: at least one
+	// transaction, transaction 0 is coinbase, and no other transaction is.
+	// This does not replace Core consensus validation — it only ensures the
+	// already-parsed canonical Go model is internally self-consistent
+	// before Store trusts IsCoinbase to skip fee computation and prevout
+	// spend marking (see validateBlockShape).
+	ErrInvalidTransactionShape = errors.New("store: transaction or block shape is not internally self-consistent")
 )
 
 // Checkpoint is the durable sync_state('main') row: the block the store

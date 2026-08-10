@@ -54,6 +54,15 @@ func coinbaseTx(txid string, outputs ...chain.Output) chain.Transaction {
 	}
 }
 
+// minerCoinbase returns a trivial coinbase transaction satisfying the
+// block-level "transaction 0 must be coinbase" structural requirement
+// (task item 3, Core-facing review round) for test blocks whose real
+// subject under test is a later spend transaction. Pays a throwaway,
+// per-block address no assertion in this package ever checks.
+func minerCoinbase(label string) chain.Transaction {
+	return coinbaseTx(hash64(label+"cb"), out(0, 1, "qMiner"+label))
+}
+
 func spendTx(txid, wtxid string, size int, inputs []chain.Input, outputs []chain.Output) chain.Transaction {
 	return chain.Transaction{
 		TxID:       txid,
@@ -344,6 +353,16 @@ func TestApplyBlock_ZeroValueNullData(t *testing.T) {
 	if scriptType != "nulldata" {
 		t.Errorf("script_type = %s, want nulldata", scriptType)
 	}
+
+	// Core never adds an unspendable (OP_RETURN) output to its coins view —
+	// see script.IsUnspendable and ApplyBlock's "Core UTXO semantics".
+	utxo, err := s.GetUTXO(ctx, hash64("txG"), 1)
+	if err != nil {
+		t.Fatalf("GetUTXO: %v", err)
+	}
+	if utxo != nil {
+		t.Errorf("GetUTXO for a nulldata output = %+v, want nil (never a canonical coin)", utxo)
+	}
 }
 
 // ─── H: 17,088-byte P2QPK witness survives through ApplyBlock ──────────
@@ -364,7 +383,7 @@ func TestApplyBlock_P2QPKWitnessPreservation(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txH1"), 0, chain.WitnessStack{sig, pub})},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	a := testBlock(hash64("blockH2"), 101, hash64("blockH1"), spend)
+	a := testBlock(hash64("blockH2"), 101, hash64("blockH1"), minerCoinbase("blockH2"), spend)
 	mustApply(t, ctx, s, a)
 
 	var data []byte
@@ -407,7 +426,7 @@ func TestApplyBlock_WtxidVariantsRemainDistinct(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txI0"), 0, chain.WitnessStack{w1data})},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	blockA := testBlock(hash64("blockI1"), 101, hash64("blockI0"), spendA)
+	blockA := testBlock(hash64("blockI1"), 101, hash64("blockI0"), minerCoinbase("blockI1"), spendA)
 	mustApply(t, ctx, s, blockA)
 
 	if err := s.RollbackTo(ctx, hash64("blockI0")); err != nil {
@@ -419,7 +438,7 @@ func TestApplyBlock_WtxidVariantsRemainDistinct(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txI0"), 0, chain.WitnessStack{w2data})},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	blockA2 := testBlock(hash64("blockI2"), 101, hash64("blockI0"), spendA2)
+	blockA2 := testBlock(hash64("blockI2"), 101, hash64("blockI0"), minerCoinbase("blockI2"), spendA2)
 	mustApply(t, ctx, s, blockA2)
 
 	var occurrences int
@@ -460,7 +479,7 @@ func TestApplyBlock_SpendMarksExactUTXO(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txJ0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	a := testBlock(hash64("blockJ1"), 101, hash64("blockJ0"), spend)
+	a := testBlock(hash64("blockJ1"), 101, hash64("blockJ0"), minerCoinbase("blockJ1"), spend)
 	mustApply(t, ctx, s, a)
 
 	utxo, err := s.GetUTXO(ctx, hash64("txJ0"), 0)
@@ -493,7 +512,7 @@ func TestApplyBlock_DoubleSpendRejectsWholeBlock(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txK0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	a := testBlock(hash64("blockK1"), 101, hash64("blockK0"), spend1)
+	a := testBlock(hash64("blockK1"), 101, hash64("blockK0"), minerCoinbase("blockK1"), spend1)
 	mustApply(t, ctx, s, a)
 
 	// K: a second block attempting to spend the SAME already-spent UTXO
@@ -502,7 +521,7 @@ func TestApplyBlock_DoubleSpendRejectsWholeBlock(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txK0"), 0, nil)},
 		[]chain.Output{out(0, 4_998_000_000, "qCarol")},
 	)
-	b := testBlock(hash64("blockK2"), 102, hash64("blockK1"), spend2)
+	b := testBlock(hash64("blockK2"), 102, hash64("blockK1"), minerCoinbase("blockK2"), spend2)
 	err := s.ApplyBlock(ctx, b)
 	if err == nil {
 		t.Fatal("expected double-spend to reject the whole block, got nil")
@@ -555,7 +574,7 @@ func TestApplyBlock_MissingPrevoutRejectsWholeBlock(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("nosuchtx"), 0, nil)},
 		[]chain.Output{out(0, 1_000_000_000, "qBob")},
 	)
-	block := testBlock(hash64("blockL1"), 100, "", spend)
+	block := testBlock(hash64("blockL1"), 100, "", minerCoinbase("blockL1"), spend)
 
 	err := s.ApplyBlock(ctx, block)
 	if err == nil {
@@ -589,7 +608,7 @@ func TestApplyBlock_FeeComputation(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txM0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	a := testBlock(hash64("blockM1"), 101, hash64("blockM0"), spend)
+	a := testBlock(hash64("blockM1"), 101, hash64("blockM0"), minerCoinbase("blockM1"), spend)
 	mustApply(t, ctx, s, a)
 
 	var fee *int64
@@ -664,7 +683,7 @@ func TestRollbackTo_SimpleOneBlockReorg(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txS0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	a := testBlock(hash64("blockS1"), 101, hash64("blockS0"), spend)
+	a := testBlock(hash64("blockS1"), 101, hash64("blockS0"), minerCoinbase("blockS1"), spend)
 	mustApply(t, ctx, s, a)
 
 	utxo, err := s.GetUTXO(ctx, hash64("txS0"), 0)
@@ -706,14 +725,14 @@ func TestRollbackTo_MultiBlockReorg(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txT0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBob")},
 	)
-	blockA := testBlock(hash64("blockT1"), 101, hash64("blockT0"), spendA)
+	blockA := testBlock(hash64("blockT1"), 101, hash64("blockT0"), minerCoinbase("blockT1"), spendA)
 	mustApply(t, ctx, s, blockA)
 
 	spendB := spendTx(hash64("txT2"), hash64("txT2"), 200,
 		[]chain.Input{spendInput(0, hash64("txT1"), 0, nil)},
 		[]chain.Output{out(0, 4_998_000_000, "qCarol")},
 	)
-	blockB := testBlock(hash64("blockT2"), 102, hash64("blockT1"), spendB)
+	blockB := testBlock(hash64("blockT2"), 102, hash64("blockT1"), minerCoinbase("blockT2"), spendB)
 	mustApply(t, ctx, s, blockB)
 
 	if err := s.RollbackTo(ctx, hash64("blockT0")); err != nil {
@@ -793,7 +812,7 @@ func TestRollbackTo_ReplacementBranchAndAddressRecompute(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txW0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_000_000, "qBobOld")},
 	)
-	blockOld := testBlock(hash64("blockW1old"), 101, hash64("blockW0"), spendOld)
+	blockOld := testBlock(hash64("blockW1old"), 101, hash64("blockW0"), minerCoinbase("blockW1old"), spendOld)
 	mustApply(t, ctx, s, blockOld)
 
 	if err := s.RollbackTo(ctx, hash64("blockW0")); err != nil {
@@ -805,7 +824,7 @@ func TestRollbackTo_ReplacementBranchAndAddressRecompute(t *testing.T) {
 		[]chain.Input{spendInput(0, hash64("txW0"), 0, nil)},
 		[]chain.Output{out(0, 4_999_500_000, "qBobNew")},
 	)
-	blockNew := testBlock(hash64("blockW1new"), 101, hash64("blockW0"), spendNew)
+	blockNew := testBlock(hash64("blockW1new"), 101, hash64("blockW0"), minerCoinbase("blockW1new"), spendNew)
 	if err := s.ApplyBlock(ctx, blockNew); err != nil {
 		t.Fatalf("apply replacement block: %v", err)
 	}

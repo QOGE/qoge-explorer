@@ -327,6 +327,18 @@ each other in storage.
 
 ### 3b. Immutable output body vs. canonical UTXO state
 
+`transaction_outputs` = **every** output that ever existed on-chain,
+preserved 1:1, forever. `utxo_state` = the Core-*equivalent* canonical coin
+state, **not** a mirror of `transaction_outputs` — `Store.ApplyBlock`
+deliberately never creates a `utxo_state` row for a genesis-block (height 0)
+output, or for any output `script.IsUnspendable` (Core's own
+`CCoinsViewCache::AddCoin`/`CScript::IsUnspendable` semantics: an
+`OP_RETURN`-prefixed script, or one longer than 10,000 bytes). See §16
+"Core UTXO semantics" for the full detail and the tests proving it —
+`transaction_outputs` is written unconditionally either way; only its
+`utxo_state` row (spendability, and address-balance contribution) is
+excluded.
+
 ```sql
 -- Immutable output body: value, script, classification — as the output
 -- was created, forever.
@@ -1257,9 +1269,12 @@ as §3's invariant tests) — single-block atomicity, idempotent replay, every
 immutable-conflict shape (including child-set completeness, below), UTXO
 spend/double-spend/missing-prevout, fee computation, multisig
 non-aggregation, reorg down to multi-block depth, canonical tip continuity,
-safe orphan re-promotion, and canonical-mutation concurrency — plus a
-real-mainnet-vector exercise reusing the P2PK/P2PKH/OP_RETURN/P2WPKH/P2TR
-scriptPubKeys already documented in `internal/script/classify_test.go`.
+safe orphan re-promotion, canonical-mutation concurrency, Core-equivalent
+UTXO semantics (genesis and `IsUnspendable` exclusion, below), and coinbase
+structural consistency — plus a real-mainnet-vector exercise reusing the
+P2PK/P2PKH/OP_RETURN/P2WPKH/P2TR scriptPubKeys already documented in
+`internal/script/classify_test.go`, and the real QOGE mainnet genesis
+block hash/txid for the genesis exclusion specifically.
 
 ### Canonical tip continuity, and safe orphan re-promotion
 
@@ -1353,6 +1368,90 @@ rather than silently treating zero affected rows as success
 `ErrAmountOverflow` rather than silently wrapping — real QOGE values never
 approach this range, but the possibility is kept structurally impossible
 rather than merely improbable.
+
+### Core UTXO semantics: `transaction_outputs` vs. `utxo_state`
+
+**Added in a second, Core-facing independent review round**, after the
+continuity/completeness round above. §3b already documents that
+`transaction_outputs` and `utxo_state` are deliberately separate tables;
+this round closes a gap in *which* outputs `utxo_state` gets a row for at
+all:
+
+- `transaction_outputs` = **every** output that ever existed on-chain,
+  preserved 1:1, forever — unconditionally, regardless of anything below.
+- `utxo_state` = the Core-*equivalent* canonical coin state — a row exists
+  **only** for an output Core's own `CCoinsViewCache::AddCoin` would
+  actually add to its coins view. It is not, and was never intended to be,
+  a mirror of `transaction_outputs`.
+
+`applyOutput` (`apply.go`) skips `utxo_state` row creation — but still
+writes `transaction_outputs` (and any destination/participant metadata)
+unconditionally — for exactly two categories, both taken directly from
+Qogecoin Core source:
+
+1. **Genesis (block height 0).** Core's `ConnectBlock` special-cases the
+   genesis block, skipping connection of its transactions entirely ("its
+   coinbase is unspendable"); QOGE's own chainparams document the same for
+   the genesis output specifically — it never existed in the coins database
+   at all. `ApplyBlock` derives `isGenesis := block.Height == 0` and threads
+   it down to `applyOutput`. `TestApplyBlock_GenesisCoinbaseUnspendable`
+   proves this against the real QOGE mainnet genesis block hash/txid: the
+   transaction and its output persist exactly, but `GetUTXO` is `nil` and no
+   `addresses` cache row is created from it.
+2. **`script.IsUnspendable`.** Mirrors Core's `CScript::IsUnspendable()`
+   (`src/script/script.h`) exactly: `(len(script) > 0 && script[0] ==
+   OP_RETURN) || len(script) > script.MaxScriptSize` (10,000, Core's
+   `MAX_SCRIPT_SIZE`) — a structural, byte-level check on the raw
+   `scriptPubKey`, deliberately independent of `script.Type`/`Classify`: a
+   non-`nulldata` script larger than `MaxScriptSize` is unspendable too,
+   even though `Classify` has no dedicated "too large" type for it. Applies
+   at every height, not just genesis. `TestApplyBlock_UnspendableOutputs`
+   covers an ordinary spendable output (UTXO created), an `OP_RETURN`
+   script (output persisted, no UTXO), an oversized script (output
+   persisted, no UTXO), the exact `MaxScriptSize`-byte boundary for a
+   non-`OP_RETURN` script (still spendable — hitting the boundary alone
+   must not reject it), and that safe orphan re-promotion's rebuild path
+   respects the exclusion too, not just plain tip replay.
+
+Neither exclusion touches `transaction_outputs`, `output_addresses`, or
+`output_participants` — an excluded output remains fully queryable audit
+history. The exclusion only ever affects `utxo_state` (so it can never be
+spent — attempting to reference it as a prevout is `ErrMissingPrevout`,
+exactly as if it didn't exist, which is structurally correct: Core would
+reject spending it too) and, transitively, `recomputeAddress` (which reads
+`utxo_state` via an inner join — an address whose only activity is an
+excluded output gets no `addresses` cache row at all, not a zero-value one).
+
+### Coinbase structural consistency
+
+**Also added in that review round.** `Store` uses `chain.Transaction
+.IsCoinbase` to make two monetary decisions: skip fee computation, and skip
+prevout spend marking. Previously this flag was trusted independently of
+the transaction's actual input shape — a caller-constructed
+`IsCoinbase = true` transaction carrying a real `PreviousOut` would silently
+skip marking that prevout spent while still creating the transaction's
+outputs, corrupting canonical UTXO state without any error.
+`validateBlockShape` now requires, for every transaction, before any
+database access:
+
+```
+structurallyCoinbase := len(txn.Inputs) == 1 && txn.Inputs[0].PreviousOut == nil
+txn.IsCoinbase == structurallyCoinbase
+```
+
+mirroring Core's `IsCoinBase()` (`src/primitives/transaction.h`) exactly. It
+also requires canonical block-level shape — at least one transaction,
+transaction 0 is coinbase, no other transaction is — matching the fact that
+every real Core block has exactly one coinbase transaction, always at
+position 0. Any violation is `ErrInvalidTransactionShape`, rejected before
+any write. This does not replace Core consensus validation; it only ensures
+the already-parsed canonical Go model is internally self-consistent before
+`Store` trusts `IsCoinbase`. `TestApplyBlock_CoinbaseStructuralConsistency`
+covers: a normal one-input coinbase (accepted); `IsCoinbase = true` with a
+real prevout (rejected, zero writes); `IsCoinbase = false` with a null
+prevout (rejected); a two-input coinbase (rejected); a block whose first
+transaction isn't coinbase (rejected); a block whose second transaction is
+coinbase (rejected); and a zero-transaction block (rejected).
 
 ### Block transaction ordering
 
@@ -1506,3 +1605,22 @@ exactly as `Output.Address` is already "taken as-is" for every other type.
 `Store` never derives or invents an address itself. `recomputeAddress`
 never reads `output_participants` — see "Address cache" above — so writing
 these rows can never affect any address's balance, by construction.
+
+**`output_participants` is a SET of `(address, pubkey)` participant
+identities, keyed by `(txid, vout_index, address)`** — added in the
+Core-facing review round. A bare multisig script can structurally list the
+same pubkey more than once; the raw `scriptPubKey` bytes preserve that
+duplication exactly regardless of anything below. Two identical
+`(address, pubkey)` entries in `ParticipantAddresses`/`PubKeys` are the
+*same* participant identity, not two — `applyOutput` deduplicates them
+before persistence and before completeness counting (`verifyExactCount`
+now compares against the deduplicated count, not `len(PubKeys)`), so an
+exact replay of a duplicate-participant output remains idempotent
+(previously it did not: a fresh apply persisted 1 row via the second
+insert's harmless idempotent no-op against the same natural key, while a
+replay's completeness check compared the persisted count against the
+un-deduplicated `len(PubKeys)`, spuriously failing —
+`TestApplyBlock_MultisigDuplicateParticipantReplay`). The *same* address
+claimed with two *different* pubkeys is a genuine identity conflict, not a
+duplicate, and remains `ErrImmutableConflict`
+(`TestApplyBlock_MultisigSameAddressDifferentPubkeyConflict`).
