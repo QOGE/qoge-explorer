@@ -707,12 +707,27 @@ Mechanisms:
    gap at all. `sync_state_validate_checkpoint_trigger` (§3c) fires on this
    final `UPDATE` too, so an `ApplyBlock` call can never commit a checkpoint
    pointing at a hash that isn't a real, canonical block — a second,
-   independent correctness gate right before `COMMIT`. The checkpoint is
-   also only ever advanced, never rewound: `ApplyBlock` reads the current
-   `indexed_height` at the start of the transaction and only issues the
-   checkpoint `UPDATE` if `block.Height >= indexed_height`, so replaying an
-   old, already-superseded block (a deliberate historical re-index run,
-   say) cannot accidentally move the checkpoint backward.
+   independent correctness gate right before `COMMIT`. The checkpoint can
+   only ever be re-affirmed or advanced by exactly one block, never rewound
+   or skipped ahead: `ApplyBlock`'s first statement is `lockCheckpoint`, a
+   `SELECT ... FOR UPDATE` against `sync_state('main')` that both reads the
+   current checkpoint and serializes every concurrent `ApplyBlock`/
+   `RollbackTo` call against it (across goroutines and separate `Store`
+   instances/processes alike). For an already-initialized store, `block`
+   must then be either an exact replay of that checkpoint (same hash and
+   height — a harmless no-op re-affirmation) or its immediate canonical
+   child (height = checkpoint height + 1, `PreviousHash` = checkpoint
+   hash); every other relationship — a height jump, a mismatched
+   `PreviousHash`, or any block, canonical or orphaned, below the current
+   tip — is rejected as `ErrNonSequentialBlock` before any write, so a
+   stale historical or orphaned block can never move the checkpoint
+   backward or sideways merely because `ApplyBlock` was called on it. Once
+   that relationship is proven, the checkpoint update is unconditional — no
+   further height comparison is needed, since continuity already performed
+   the only comparison that matters. See §16 "Canonical tip continuity, and
+   safe orphan re-promotion" for the full detail, including the one
+   deliberate exception (an uninitialized store accepts any block as its
+   bootstrap point) and safe orphan re-promotion.
 4. **Balances are `SET`, not incremented** (see §3c's `addresses` table).
    Because the value written is always "the fresh aggregate over canonical
    outputs right now," writing it twice is identical to writing it once.
@@ -914,10 +929,13 @@ implicit cost of an ordinary block or transaction *listing* call.
 Design:
 
 - **Storage:** `transaction_input_witness` (§3) is a separate table keyed by
-  `(txid, vin_index, item_index)`, `data BYTEA`. No JSON/array column on
-  `transaction_inputs` itself — a block-listing or tx-listing query that
-  joins/selects from `transactions`/`transaction_inputs` never touches this
-  table.
+  `(wtxid, vin_index, item_index)` — witness-*variant*-specific, since
+  witness data is exactly what differs between two variants of the same
+  txid (§3a/§3b) — with `txid` retained as a plain column (not part of the
+  key) for the non-witness-body relation. `data BYTEA`. No JSON/array
+  column on `transaction_inputs` itself — a block-listing or tx-listing
+  query that joins/selects from `transactions`/`transaction_inputs` never
+  touches this table.
 - **Raw storage, no truncation.** `BYTEA` has no practical length limit
   relevant here (Postgres row/TOAST limits are far above 17KB); the full
   signature and pubkey are stored byte-for-byte. Consensus data is never
@@ -1260,9 +1278,11 @@ Phase 2B.2, documented next in §16.
 small and explicit — `New`, `ApplyBlock`, `Tip`, `RollbackTo`, `GetUTXO` —
 not an ORM or generic repository, and knows nothing about Qogecoin Core RPC
 or historical synchronization: it consumes canonical `chain.*` values only,
-never a raw `map[string]any` RPC object. RPC decoding (translating Core's
-JSON into `chain.Block`/`chain.Transaction`) and the continuous block-fetch
-loop are the next phase, built on top of this one. Proven by
+never a raw `map[string]any` RPC object. Translating Core's own JSON into
+`chain.Block`/`chain.Transaction` is `internal/decode`'s job, built on top
+of (never modifying) this package — see §17; the continuous block-fetch
+loop and live reorg detection remain a later phase, built on top of both.
+Proven by
 `internal/store/apply_test.go` and `internal/store/continuity_test.go`
 against a real, per-test-isolated PostgreSQL database (same infrastructure
 as §3's invariant tests) — single-block atomicity, idempotent replay, every
@@ -1666,3 +1686,199 @@ un-deduplicated `len(PubKeys)`, spuriously failing —
 claimed with two *different* pubkeys is a genuine identity conflict, not a
 duplicate, and remains `ErrImmutableConflict`
 (`TestApplyBlock_MultisigSameAddressDifferentPubkeyConflict`).
+
+## 17. RPC decoder: Core JSON-RPC → canonical chain model (Phase 2C.1)
+
+**Status: IMPLEMENTED.** `internal/decode` (`amount.go`, `block.go`,
+`resolver.go`) is the strict boundary between Qogecoin Core's untyped
+JSON-RPC responses (`internal/rpc`'s raw DTOs — `RawBlock`,
+`RawTransaction`, `RawVin`, `RawVout`, `RawScriptPubKey`, `internal/rpc/
+block.go`) and the canonical `chain.Block`/`chain.Transaction` model
+`Store.ApplyBlock` consumes (§16). `internal/rpc` gained exactly the typed
+methods this needs — `GetBlockHash`, `GetBlockVerbose2`,
+`GetRawTransactionVerbose`, `GetDescriptorInfo`, `DeriveAddresses` —
+without growing into a wrapper around every RPC Core exposes; the generic
+`Call`/`CallInto` transport (`client.go`) is unchanged. Neither
+`internal/chain`, `internal/script`, `internal/store`, nor
+`migrations/0001_initial.*` were modified to build this boundary — every
+one of those was already a frozen, independently-reviewed contract by the
+time this phase began, and this decoder was built strictly as their
+consumer.
+
+Proven by `internal/decode/*_test.go` — deterministic, no live node
+required for a normal `go test ./...` run — plus a decoder→`Store`
+pipeline test against real, per-test-isolated PostgreSQL
+(`store_test.go`), and opt-in live-node integration tests
+(`integration_test.go`, `QOGE_RPC_INTEGRATION=1`) exercised against the
+project's own reference node during this phase.
+
+This is a representation boundary, not a second Qogecoin consensus
+validator — the same posture §16 establishes for `Store`, and
+`internal/decode` inherits it exactly: no proof-of-work verification, no
+merkle recomputation, no ECDSA/SLH-DSA signature verification, no script
+execution. The structural checks it does perform exist only to reject a
+partial or malformed RPC response before it becomes a `chain.Block` that
+`Store` would otherwise have to reject with less context (a missing txid,
+an empty vin/vout, a coinbase input mixed with a real one, an `nTx`/
+transaction-count mismatch, and so on).
+
+### Exact decimal amount conversion
+
+`DecodeAmount` (`amount.go`) converts Core's decimal-QOGE JSON number
+(e.g. `"6.25000000"`) into exact integer satoshis without ever passing the
+value through `float64`/`float32`. `internal/rpc.RawVout.Value` is
+`json.Number` — Go's `encoding/json` decodes a JSON number token into
+`json.Number` as its original decimal *text*, not a float, whenever the
+destination field has that type — and `DecodeAmount` parses that text with
+pure integer/string arithmetic: an optional sign, an integer part, an
+optional `.` and up to 8 fractional digits, padded to exactly 8 and
+concatenated into a satoshi integer via `strconv.ParseInt`. Rejected
+outright, never rounded or silently substituted: a malformed number, a
+negative value, more than 8 fractional digits (unrepresentable exactly in
+satoshis — this package never rounds), and `int64` overflow.
+`amount_test.go` covers the required boundary/precision cases directly:
+`0` → `0`, `0.00000001` → `1`, `1` → `100000000`, `6.25` → `625000000`,
+`100` → `10000000000`, plus malformed/negative/9-fractional-digit/overflow
+rejection.
+
+### txid vs. RPC hash (wtxid)
+
+Core's verbose transaction JSON uses `"txid"` for the non-witness
+transaction id and, confusingly, `"hash"` for the *witness* transaction id
+(`internal/rpc.RawTransaction.Hash` — not a block hash). `DecodeTransaction`
+maps these straight across — `raw.TxID` → `chain.Transaction.TxID`,
+`raw.Hash` → `chain.Transaction.WTxID` — never deriving, recomputing, or
+swapping either one; `Store` already independently enforces that
+`WTxID == TxID` iff the transaction carries no witness data (§16), so the
+decoder's only job is preserving Core's own reported values exactly. Both
+are validated as syntactically well-formed (64 lowercase hex characters,
+matching every hash-shaped column's schema `CHECK` constraint — §3) before
+being handed to `Store`; uppercase is deliberately *rejected*, not
+normalized — there is no confirmed case of Core legitimately emitting it
+for these fields, and silently accepting it would risk masking genuinely
+malformed data.
+
+### Coinbase and ordinary input mapping
+
+Core reports exactly one of two mutually exclusive vin shapes;
+`internal/rpc.RawVin.Coinbase` is a `*string` specifically so the decoder
+can tell "field present" (coinbase) from "field absent" (ordinary) by
+presence, matching Core's own discriminator, rather than guessing from
+content. A coinbase input decodes to `PreviousOut = nil`,
+`Coinbase = <hex-decoded bytes>`, `ScriptSig = nil` — Core's coinbase bytes
+are never placed into `ScriptSig`. An ordinary input decodes to
+`PreviousOut = {TxID, Index}` from `vin.txid`/`vin.vout`, `Coinbase = nil`,
+`ScriptSig = <hex-decoded scriptSig.hex>` (legitimately empty for a pure
+witness spend — preserved as empty, never rejected or synthesized).
+`DecodeTransaction` additionally requires at most one coinbase-shaped input
+per transaction and, if present, that it be the transaction's *only*
+input — catching a malformed RPC object here rather than deferring to
+`Store`'s own, later structural-coinbase check (§16 "Coinbase structural
+consistency").
+
+### Witness mapping
+
+Every `txinwitness` hex string is hex-decoded independently into
+`chain.WitnessStack`, preserving item order, zero-length items (an empty
+hex string decodes to a genuine zero-length `[]byte`, not a dropped entry),
+and arbitrary length — up to and including a full 17,088-byte P2QPK
+signature, verified byte-exact end to end by
+`TestDecodeInput_P2QPKWitnessSpendVector` and, through a real
+`Store.ApplyBlock` call, `TestDecodeBlock_ThroughStore_PipelineTest`.
+Witness items are never concatenated or truncated.
+
+### Structural classification precedence over RPC type
+
+`decodeOutput` calls `script.Classify` on the raw, hex-decoded
+`scriptPubKey` bytes and uses *only* that result for
+`chain.Output.ScriptType`/`WitnessVersion`/`WitnessProgram`/`PubKeys`.
+Core's own `scriptPubKey.type` string (`internal/rpc.RawScriptPubKey.Type`)
+is retained on the raw DTO for diagnostics/tests only and is never read by
+the decoder — confirmed directly by
+`TestDecodeOutput_RPCTypeNeverDrivesClassification` (a script whose RPC
+type lies is still classified from its real bytes) and
+`TestDecodeOutput_UnknownWitnessNeverUpgradedToP2QPK`/
+`TestDecodeOutput_RealVector_P2TR` (neither a generic witness-unknown
+program nor a real Taproot output is ever misclassified as P2QPK). This is
+exactly what correctly turns Core's own generic `"witness_unknown"` report
+for a real P2QPK (witness v2, 32-byte program) output into
+`script.TypeP2QPK`.
+
+### Core-reported address handling
+
+For every script type except bare P2PK and bare multisig,
+`chain.Output.Address` is Core's own `scriptPubKey.address` field, copied
+as-is — including the generic witness-unknown address Core reports for a
+structurally-P2QPK output. No Bech32m encoder, no address derivation from
+the public key: the P2QPK witness program is `HASH256(pubkey)`, not the raw
+key, so nothing here could derive it correctly even if it tried.
+`TypeNullData`/`TypeUnknown`/unrecognized-witness outputs simply inherit
+whatever Core did (in practice, did not) report for them — never invented.
+
+### P2PK / multisig descriptor resolution
+
+Core deliberately omits an address for bare P2PK and bare multisig outputs.
+`AddressResolver` (`resolver.go`) is the abstraction the decoder uses
+instead — `CoreAddressResolver` calls
+`getdescriptorinfo("pkh(<pubkey hex>)")` for the canonical,
+checksum-appended descriptor, then `deriveaddresses(<canonical
+descriptor>)`, requiring exactly one address back; resolved
+`(pubkey → address)` pairs are memoized in-memory for the resolver's
+lifetime (`TestCoreAddressResolver_MemoizesPerPubKey` proves repeated
+resolutions of the same pubkey issue the descriptor RPC round-trip once).
+For a P2PK output, the resolved address is stored in `Output.Address` while
+`ScriptType` stays `p2pk` — never relabeled `p2pkh`. For a multisig output,
+every participant pubkey is resolved the same way into
+`Output.ParticipantAddresses`, positionally parallel to `PubKeys`
+(duplicate pubkeys preserved here, never deduplicated — `Store` already
+applies identity-set deduplication at persistence, §16 "Multisig
+participants"); if any single participant fails to resolve, the whole
+output is rejected rather than silently shortening `ParticipantAddresses`
+into a shape `Store` would reject. Decoder unit tests use a deterministic
+in-memory fake (`decode_test.go`'s `fakeResolver`) and never require a
+running `qogecoind`; `CoreAddressResolver` itself is exercised against an
+in-process fake JSON-RPC server (`fakerpc_test.go`) and, opt-in, against
+the project's real reference node. QOGE's Base58/Bech32 address version
+bytes are never hardcoded anywhere in this package — Core's own descriptor
+machinery remains the sole authority on what an address derives to, exactly
+as it already is for every address the decoder just copies from Core's RPC
+output.
+
+### Real mainnet vectors
+
+`vectors_test.go` exercises the real QOGE genesis block hash/txid/reward/
+version/scriptPubKey (P2PK; cross-checked against a locally-running
+reference node during this phase — see `integration_test.go`'s
+`TestLiveRPC_GenesisBlockDecodesAgainstRealNode`), plus block 1 (P2PK),
+block 8,000 (P2PKH), block 38,393 (OP_RETURN), height 494,289 (P2WPKH), and
+height 1,284,510 (P2TR) — the same documented vectors
+`internal/script/classify_test.go` and `internal/store/apply_test.go`'s
+`TestApplyBlock_RealMainnetFixtures` already establish, with scriptPubKey
+hex, txid, and decimal value all cross-checked live against the reference
+node during this phase (`TestLiveRPC_KnownVectorsMatchLiveNode` re-verifies
+this on demand, opt-in). No real P2QPK spend exists on-chain yet; the P2QPK
+vector is explicitly synthetic — a structurally exact `OP_2 <push 32>
+<32-byte program>` output and a 17,088-byte + 32-byte witness spend — never
+presented as a captured real transaction.
+
+### Live RPC integration tests (opt-in)
+
+`integration_test.go` exercises a real, currently-running Qogecoin Core
+node — genesis decode, P2PK descriptor resolution, a repeatable re-check of
+every hardcoded real-mainnet vector against live chain data, and a decode
+of whatever the live tip block currently is. Every test there calls
+`requireRPCIntegration` first, which skips unless `QOGE_RPC_INTEGRATION` is
+set — a normal `go test ./...` run therefore never needs a running node,
+RPC credentials, or network access. The RPC username/password/Authorization
+header are never printed anywhere in this file; only
+`config.RPCConfig.Redacted()`'s fixed placeholder is ever logged.
+
+### What Phase 2C.1 does NOT include
+
+This phase ends at `chain.Block`/`chain.Transaction` in memory. There is no
+continuous historical sync loop, no live fork/reorg detection against a
+moving chain tip, and nothing here calls `Store.ApplyBlock` from a
+production fetch loop — `TestDecodeBlock_ThroughStore_PipelineTest` is a
+one-shot pipeline proof (decode → apply → assert), not a poller. Those
+remain a later phase, built on top of this decoder once it has been
+independently reviewed.
