@@ -1,14 +1,15 @@
 # QOGE Go Explorer — Architecture
 
-Status: Phase 2B.1 — canonical chain model and script classification are
+Status: Phase 2B.2 — canonical chain model and script classification are
 implemented (`internal/chain`, `internal/script`); the PostgreSQL schema,
 migrations, and migration tooling are implemented (`migrations/`,
-`internal/store`). No block-indexing write path, historical
-synchronization, RPC→chain translation, public API, or web UI exists yet —
-that is Phase 2B.2, built on top of the schema this phase locks down.
-Qogecoin Core is the sole authoritative source of chain truth; this document
-describes how the explorer observes and represents that truth, never how it
-decides it.
+`internal/store`, §3/§15); the atomic block-application/reorg store engine
+is implemented (`internal/store.Store`, §16). No historical
+synchronization, RPC→chain translation, continuous block-fetch loop,
+public API, or web UI exists yet — that is the next phase, built on top of
+the store engine this phase locks down. Qogecoin Core is the sole
+authoritative source of chain truth; this document describes how the
+explorer observes and represents that truth, never how it decides it.
 
 ## 1. Component overview
 
@@ -21,9 +22,9 @@ internal/logging/         structured slog setup
 internal/rpc/             Qogecoin Core JSON-RPC client (generic Call + typed helpers)
 internal/chain/           canonical block/tx/output domain model (Core-shape-independent) — implemented
 internal/script/          script classification (P2PK/P2PKH/.../P2QPK/UNKNOWN) — implemented
-internal/indexer/         sync loop: fetch from rpc, classify via script, write via store — Phase 2B.2
-internal/store/           PostgreSQL connection + migration runner (implemented, §15);
-                          block-indexing write API is Phase 2B.2
+internal/indexer/         sync loop: fetch from rpc, classify via script, write via store — next phase
+internal/store/           PostgreSQL connection + migration runner (§15) and the atomic
+                          block-application/reorg store engine (§16) — both implemented
 internal/api/             HTTP/JSON API (not wired to a public port yet)
 internal/web/             HTML presentation layer (not built yet)
 migrations/               versioned SQL schema (§3, §15) — implemented
@@ -325,6 +326,18 @@ txid/wtxid split, to keep two variants of the same txid from overwriting
 each other in storage.
 
 ### 3b. Immutable output body vs. canonical UTXO state
+
+`transaction_outputs` = **every** output that ever existed on-chain,
+preserved 1:1, forever. `utxo_state` = the Core-*equivalent* canonical coin
+state, **not** a mirror of `transaction_outputs` — `Store.ApplyBlock`
+deliberately never creates a `utxo_state` row for a genesis-block (height 0)
+output, or for any output `script.IsUnspendable` (Core's own
+`CCoinsViewCache::AddCoin`/`CScript::IsUnspendable` semantics: an
+`OP_RETURN`-prefixed script, or one longer than 10,000 bytes). See §16
+"Core UTXO semantics" for the full detail and the tests proving it —
+`transaction_outputs` is written unconditionally either way; only its
+`utxo_state` row (spendability, and address-balance contribution) is
+excluded.
 
 ```sql
 -- Immutable output body: value, script, classification — as the output
@@ -633,29 +646,55 @@ policy choice.
 
 ## 4. Idempotency model
 
+**Status: IMPLEMENTED in Phase 2B.2** — this section described the intended
+design before any Go code existed; `internal/store.Store.ApplyBlock`
+(`internal/store/apply.go`) now implements exactly this, and
+`internal/store/apply_test.go` proves it against a real PostgreSQL database.
+See §16 for the implementation-level detail (immutable conflict semantics,
+fee computation, block ordering assumptions) this section doesn't repeat.
+
 **Core guarantee:** re-indexing the same block, any number of times, in any
 order relative to a crash, produces byte-identical database state to
-indexing it exactly once.
+indexing it exactly once — as long as the replayed data is *identical* to
+what's already stored. Replaying *contradictory* data for an already-stored
+identity (same txid/wtxid/block hash, different body) is a distinct case —
+an error, not a silent overwrite — see §16 "Immutable conflict semantics."
 
 Mechanisms:
 
 1. **Natural-key uniqueness everywhere.** `blocks.hash`, `transactions.txid`,
-   `(block_hash, tx_index)`/`(block_hash, txid)` on `block_transactions`,
-   `(txid, vin_index)`, `(txid, vout_index)` on both `transaction_outputs`
-   and `utxo_state` — all real primary/unique keys. All inserts during
-   indexing use `INSERT ... ON CONFLICT DO NOTHING` (or `DO UPDATE` only
-   where the update is itself idempotent, e.g. re-setting `spent = true` on
-   a `utxo_state` row that's already spent by the same `spending_txid` is a
-   no-op in effect). Replaying a block's inserts is always safe.
+   `transaction_variants.wtxid`, `(block_hash, tx_index)`/`(block_hash, txid)`
+   on `block_transactions`, `(txid, vin_index)`, `(txid, vout_index)` on both
+   `transaction_outputs` and `utxo_state` — all real primary/unique keys.
+   Every immutable-identity insert uses `INSERT ... ON CONFLICT (<key>) DO
+   NOTHING`, immediately followed — only if the row already existed — by a
+   verification `SELECT` proving the existing row's data matches what this
+   call intended to insert. A match is a safe no-op (replaying a block's
+   inserts is always safe); a mismatch is `ErrImmutableConflict`, never a
+   silent overwrite. See §16 "Immutable conflict semantics." The one
+   genuinely mutable write, `utxo_state`'s spend marker, uses a plain
+   `UPDATE ... WHERE spent = false`, which is naturally idempotent: it's a
+   no-op if the row is already spent by exactly the input attempting to
+   spend it again (checked before this UPDATE ever runs — see §16), and
+   never reached at all if it's already spent by a *different* input
+   (`ErrDoubleSpend` at the check).
 2. **One SQL transaction per block.** All work for block N — inserting the
    block row, its transactions (`ON CONFLICT DO NOTHING` — the same txid may
-   already exist from an earlier block), its `block_transactions` links,
-   inputs, outputs, witness data, `utxo_state` rows (new unspent outputs
-   inserted, spent outputs updated), recomputing the `addresses` rows
-   touched by this block, and finally updating `sync_state` — happens
-   inside a single `BEGIN...COMMIT`. Postgres transactions are
+   already exist from an earlier block), their `transaction_variants` rows,
+   `block_transactions` links, inputs, outputs, witness data, `utxo_state`
+   rows (new unspent outputs inserted, spent outputs updated), recomputing
+   the `addresses` rows touched by this block, and finally updating
+   `sync_state` — happens inside a single `BEGIN...COMMIT`
+   (`Store.ApplyBlock` calls `pool.Begin` exactly once and passes the same
+   `pgx.Tx` to every helper it calls). Postgres transactions are
    all-or-nothing and durable only on `COMMIT`; there is no way for "half of
-   block N" to survive a crash.
+   block N" to survive a crash. `ApplyBlock` processes `block.Transactions`
+   in the given order and assumes it is already valid: an input may only
+   reference an output created earlier in the same block or in an
+   already-applied block, never later in this same block. Any block Core
+   itself considers valid satisfies this; `ApplyBlock` does not re-derive or
+   re-sort the order itself, and a transaction referencing a not-yet-applied
+   output fails as `ErrMissingPrevout` (see §16), not a reorder.
 3. **Checkpoint update is the last statement inside that same transaction,**
    not a separate one issued afterward. This directly closes the exact gap
    that corrupted eIquidus: there, the checkpoint (`coinstats.last`) and the
@@ -665,7 +704,15 @@ Mechanisms:
    (correctly, given its own assumptions) replayed the block — which was
    only safe if the writes were idempotent, and they weren't. Making
    checkpoint-and-data one atomic unit removes the need to reason about that
-   gap at all.
+   gap at all. `sync_state_validate_checkpoint_trigger` (§3c) fires on this
+   final `UPDATE` too, so an `ApplyBlock` call can never commit a checkpoint
+   pointing at a hash that isn't a real, canonical block — a second,
+   independent correctness gate right before `COMMIT`. The checkpoint is
+   also only ever advanced, never rewound: `ApplyBlock` reads the current
+   `indexed_height` at the start of the transaction and only issues the
+   checkpoint `UPDATE` if `block.Height >= indexed_height`, so replaying an
+   old, already-superseded block (a deliberate historical re-index run,
+   say) cannot accidentally move the checkpoint backward.
 4. **Balances are `SET`, not incremented** (see §3c's `addresses` table).
    Because the value written is always "the fresh aggregate over canonical
    outputs right now," writing it twice is identical to writing it once.
@@ -683,6 +730,15 @@ Row C is eliminated by design rather than handled — that is the point.
 
 ## 5. Reorg strategy
 
+**Status: step 3 (the rollback itself) is IMPLEMENTED in Phase 2B.2** as
+`Store.RollbackTo` (`internal/store/reorg.go`), proven against synthetic
+already-persisted fork data by `internal/store/apply_test.go`'s
+`TestRollbackTo_*` tests. Steps 1, 2, and 4 — detecting a fork against live
+Core RPC output, walking backward to find the common ancestor, and driving
+the resulting sequence of `RollbackTo` + `ApplyBlock` calls — are indexer
+work, deliberately not built in this phase (no RPC translator or historical
+sync loop exists yet — see §16).
+
 Every stored block carries `hash`, `prev_hash`, and `height`, which is
 sufficient for correctness-first reorg handling (no deep-reorg optimizations
 yet):
@@ -697,46 +753,65 @@ yet):
    `blocks.prev_hash`, height by height, until the hashes agree at some
    height H. Because our local chain is exactly as long as what we've
    indexed, this terminates in at most `our_tip_height - H` steps.
-3. **Roll back, in one transaction.** This is the reorg invariant this
-   phase exists to get right: **only canonical *derived* state is rolled
-   back or rebuilt — `utxo_state`, `addresses`, `sync_state`.
-   Immutable bodies (`blocks`, `transactions`, `block_transactions`,
-   `transaction_inputs`, `transaction_input_witness`,
-   `transaction_outputs`) are never deleted.** For every locally canonical
-   block above H (highest height first):
-   - Mark it `canonical = false`, `orphaned_at = now()`. The row stays —
-     this is the audit trail.
-   - `transactions`, `transaction_inputs`, `transaction_input_witness`,
-     and `transaction_outputs` for that block's transactions are left
-     completely alone. `block_transactions` is left alone too — it's the
-     historical record of "this txid was once in this (now-orphaned)
-     block," which remains true forever.
-   - For every output *created* in that block (found via
-     `utxo_state.creation_block_hash`): **delete its `utxo_state` row** —
+3. **Roll back, in one transaction — `Store.RollbackTo(ctx, ancestorHash)`.**
+   This is the reorg invariant this phase exists to get right: **only
+   canonical *derived* state is rolled back or rebuilt — `utxo_state`,
+   `addresses`, `sync_state`. Immutable bodies (`blocks`, `transactions`,
+   `transaction_variants`, `block_transactions`, `transaction_inputs`,
+   `transaction_input_witness`, `transaction_outputs`) are never deleted.**
+   `RollbackTo` finds every currently-canonical block above the ancestor's
+   height in one query — the schema's "exactly one canonical block per
+   height" invariant (`blocks_height_canonical_uidx`) guarantees this set IS
+   the orphaned range, no `prev_hash` walk needed inside the store itself —
+   then, for that whole set at once:
+   - Marks every block in it `canonical = false`, `orphaned_at = now()`.
+     The row stays — this is the audit trail.
+   - `transactions`, `transaction_variants`, `transaction_inputs`,
+     `transaction_input_witness`, and `transaction_outputs` for those
+     blocks' transactions are left completely alone. `block_transactions`
+     is left alone too — it's the historical record of "this exact
+     (txid, wtxid) variant was once in this (now-orphaned) block," which
+     remains true forever, and is exactly what lets a later replacement
+     block reuse the same txid under a *different* wtxid without either
+     occurrence overwriting the other (§3a, §16).
+   - For every output *created* in that set (found via
+     `utxo_state.creation_block_hash`): **deletes its `utxo_state` row** —
      an output whose creating block isn't canonical doesn't currently exist
      on the canonical chain, so there is no canonical spend state left to
      describe. Its `transaction_outputs` row is untouched.
-   - For every output *spent* by a transaction in that block (found via
-     `utxo_state.spending_block_hash`): restore it (`spent = false`,
+   - For every output *spent* by a transaction in that set (found via
+     `utxo_state.spending_block_hash`): restores it (`spent = false`,
      `spending_txid = NULL`, `spending_vin_index = NULL`,
-     `spending_block_hash = NULL`, `spending_block_height = NULL`) —
-     unless that same output's row was itself just deleted in the previous
-     step (i.e. it was also created within the orphaned range).
-   - Recompute `addresses` rows for every address touched by the
-     rolled-back block, using the same set-based aggregate (now querying
-     `utxo_state` for spent/unspent status) as normal indexing — safe and
-     correct by the same idempotency argument as §4.
-   - Set `sync_state` to height H / the common-ancestor hash.
+     `spending_block_hash = NULL`, `spending_block_height = NULL`) — a
+     no-op for a row already deleted in the previous step (i.e. it was also
+     created within the orphaned range).
+   - Recomputes `addresses` rows for every address touched by either
+     change above, using the exact same set-based aggregate (§16) normal
+     `ApplyBlock` indexing uses — safe and correct by the same idempotency
+     argument as §4. An address left with zero remaining canonical activity
+     has its cache row deleted rather than left as a phantom zero entry.
+   - Sets `sync_state` to the ancestor's hash as the final write; the
+     `sync_state_validate_checkpoint_trigger` re-verifies it's canonical
+     (it always is — it was never in the orphaned set) and re-derives
+     `indexed_height`.
 4. **Resume** normal linear indexing from H+1 using Core's now-canonical
-   chain. If a block being (re-)indexed here contains a transaction whose
-   `txid` already has a `transactions` row (because it also appeared in the
-   orphaned branch), that row is reused as-is via `ON CONFLICT DO NOTHING`
-   — only a new `block_transactions` link and fresh `utxo_state` row are
-   needed, not a re-parse.
+   chain, via ordinary `ApplyBlock` calls. If a block being (re-)applied
+   here contains a transaction whose `txid` already has a `transactions`
+   row (because it also appeared in the orphaned branch), that row is
+   reused as-is via the idempotent-insert path — only a new
+   `transaction_variants` row (if the witness differs — a new wtxid),
+   `block_transactions` link, and fresh `utxo_state` row are needed, not a
+   re-parse.
 
 **Depth safety valve (resolved — see §13.B):** reorgs of depth ≤ 100 blocks
 roll back automatically via the procedure above; a detected reorg deeper than
 100 blocks halts indexing before any rollback and requires manual review.
+`RollbackTo` itself has no depth limit or opinion on this policy — it rolls
+back to whatever ancestor it's given, of any depth. The 100-block threshold
+is enforced by the future indexer, which can compute depth as
+`Tip().Height - ancestorHeight` before deciding whether to call
+`RollbackTo` at all; `Store` deliberately exposes just enough (`Tip`) for
+that decision without owning the policy loop itself.
 
 ## 6. Supply model
 
@@ -1171,8 +1246,423 @@ finding pointed out that a silently-edited `DownSQL` was just as dangerous
 (a future `Down()` would run the wrong rollback) and went completely
 undetected. Both directions are covered now.
 
-Only the minimal connection/migration plumbing was added in this phase
+Only the minimal connection/migration plumbing was added in Phase 2B.1
 (`store.Connect`, `store.Up`/`Down`/`LoadMigrations`/`CurrentVersion`/
-`VerifyChecksums`) — no block-indexing write API (`INSERT ... ON CONFLICT`
-per block, UTXO/address maintenance, reorg rollback execution) exists yet.
-That is Phase 2B.2, built on top of the schema this phase locks down.
+`VerifyChecksums`) — the block-indexing write API (`INSERT ... ON CONFLICT`
+per block, UTXO/address maintenance, reorg rollback execution) is
+Phase 2B.2, documented next in §16.
+
+## 16. Store: block-application engine (Phase 2B.2)
+
+**Status: IMPLEMENTED.** `internal/store.Store` (`internal/store/store.go`,
+`apply.go`, `reorg.go`) persists already-parsed `chain.Block`/
+`chain.Transaction` data into the schema §3 locks down. It is deliberately
+small and explicit — `New`, `ApplyBlock`, `Tip`, `RollbackTo`, `GetUTXO` —
+not an ORM or generic repository, and knows nothing about Qogecoin Core RPC
+or historical synchronization: it consumes canonical `chain.*` values only,
+never a raw `map[string]any` RPC object. RPC decoding (translating Core's
+JSON into `chain.Block`/`chain.Transaction`) and the continuous block-fetch
+loop are the next phase, built on top of this one. Proven by
+`internal/store/apply_test.go` and `internal/store/continuity_test.go`
+against a real, per-test-isolated PostgreSQL database (same infrastructure
+as §3's invariant tests) — single-block atomicity, idempotent replay, every
+immutable-conflict shape (including child-set completeness, below), UTXO
+spend/double-spend/missing-prevout, fee computation, multisig
+non-aggregation, reorg down to multi-block depth, canonical tip continuity,
+safe orphan re-promotion, canonical-mutation concurrency, Core-equivalent
+UTXO semantics (genesis and `IsUnspendable` exclusion, below), and coinbase
+structural consistency — plus a real-mainnet-vector exercise reusing the
+P2PK/P2PKH/OP_RETURN/P2WPKH/P2TR scriptPubKeys already documented in
+`internal/script/classify_test.go`, and a source-derived genesis
+identity/UTXO-semantics fixture (real block hash/txid/reward/version/
+scriptPubKey, synthetic coinbase input script — see the test's doc
+comment) for the genesis exclusion specifically.
+
+### Canonical tip continuity, and safe orphan re-promotion
+
+**Added in an independent review round, after the behavior above was first
+implemented.** `ApplyBlock`'s first statement is `lockCheckpoint`: a
+`SELECT ... FOR UPDATE` against `sync_state('main')`, held for the whole
+transaction. This is the canonical-mutation lock — it fully serializes
+every `ApplyBlock`/`RollbackTo` call against every other one, across
+goroutines and across separate `Store` instances/processes sharing the
+database (`TestApplyBlock_ConcurrentCompetingChildrenSerialize`,
+`TestRollbackTo_SerializesAgainstApplyBlock`).
+
+Once locked, `block` must have an explicit, provable relationship to the
+checkpoint just read (`checkCanonicalContinuity`) — for an initialized
+store, exactly one of **exact tip replay** (same hash and height as the
+checkpoint) or **immediate canonical append** (height = checkpoint height +
+1, `PreviousHash` = checkpoint hash). Anything else — a height jump, a
+mismatched `PreviousHash`, or any block (canonical or orphaned) below the
+current tip — is `ErrNonSequentialBlock`, rejected before any write. A
+lower historical block can never mutate canonical UTXO/address state
+merely because `ApplyBlock` was called on it. For an *uninitialized* store
+(`sync_state` still at its bootstrap `-1`/`NULL` row), any block is
+accepted as this store's bootstrap point — there is no existing tip to
+compare against yet; production historical sync always starts from genesis,
+and this codebase's own tests use arbitrary synthetic "genesis" blocks at
+arbitrary heights, both of which this policy keeps working.
+
+If `block.Hash` refers to an already-persisted block that is currently
+orphaned (`canonical = false`, from an earlier `RollbackTo`) and it passes
+continuity as the immediate child of the current tip, `applyBlockHeader`
+promotes it (`canonical = true`, `orphaned_at = NULL`) instead of treating
+the pre-existing, header-matching row as a plain no-op. Its canonical
+UTXO/address state is then rebuilt by the ordinary per-transaction path —
+`RollbackTo` only ever deleted its `utxo_state` rows, never its
+transactions/inputs/outputs/witness rows, so "rebuild" is just those rows'
+normal idempotent-insert path recreating what was removed
+(`TestApplyBlock_OrphanRePromotion`). An orphan that is *not* the immediate
+child of the current tip is never promoted — it's rejected by the
+continuity check first, before `ApplyBlock` even looks at its `canonical`
+flag.
+
+### Immutable child-set completeness
+
+**Also added in that review round.** `insertOrVerifyIdempotent` alone
+proves an individual row's *content* is immutable, but not that a whole
+child-row *set* is complete: a second observation of an already-known txid
+that supplies an extra output at a previously-unused `vout_index`, or an
+extra witness item at a previously-unused `item_index`, would insert
+cleanly on its own natural key, silently growing what was supposed to be
+an immutable transaction body. `insertOrVerifyIdempotent` now returns
+whether the parent identity (block hash, txid, wtxid, or a specific
+output's `(txid, vout_index)`) was freshly inserted or already existed. A
+freshly-inserted parent guarantees its children are freshly inserted too —
+nothing could have written them before the parent existed — so no further
+check is needed. An *already-existing* parent triggers `verifyExactCount`
+(`store.go`): a `SELECT count(*)` against the child table, which must
+exactly equal the newly-supplied child count, run *before* any child rows
+for this call are touched. Applied to: `transaction_inputs`/
+`transaction_outputs` per txid, `transaction_input_witness` per
+`(wtxid, vin_index)` — checked per-input, not aggregated across the whole
+wtxid, so a witness stack "moved" between two inputs (same total count,
+different distribution) is still caught — `block_transactions` per
+`block_hash`, and `output_participants` per output.
+
+This relies on one more structural rule, checked up front by
+`validateBlockShape` before continuity or any database access at all:
+`chain.Input.Index`/`chain.Output.Index` must equal the element's position
+in its array (Core's own vin/vout array semantics — see
+`internal/chain/input.go`/`output.go`), which makes an "index moved to
+another slot" attempt structurally inexpressible, and reduces the
+completeness check for indexed children to a simple, cheap count
+comparison rather than a full index-set comparison. `applyOutput` closes
+two related shape gaps the same way: a replay that supplies no `Address`
+for an output that previously had one is a conflict, not a silent skip
+(`out.Address == ""` no longer means "say nothing"); and a multisig
+output's `ParticipantAddresses` must have exactly one entry per `PubKeys`
+entry, none empty — never silently tolerating a partial/missing mapping.
+
+None of this computes or validates txid/wtxid cryptographically — that
+remains explicitly out of scope (representation-integrity checking, not
+consensus validation).
+
+`markSpent`'s `UPDATE ... WHERE spent = false` no longer assumes success
+just because `checkPrevout` earlier observed `spent = false`:
+`RowsAffected` is inspected directly, and a zero-row result triggers a
+re-read that distinguishes "already spent by exactly this input"
+(idempotent replay — safe) from any other spender (`ErrDoubleSpend`),
+rather than silently treating zero affected rows as success
+(`TestMarkSpent_ZeroRowUpdateDetectsConflict`). Fee accumulation
+(`addChecked`) uses checked `int64` addition, returning
+`ErrAmountOverflow` rather than silently wrapping — real QOGE values never
+approach this range, but the possibility is kept structurally impossible
+rather than merely improbable.
+
+### Core UTXO semantics: `transaction_outputs` vs. `utxo_state`
+
+**Added in a second, Core-facing independent review round**, after the
+continuity/completeness round above. §3b already documents that
+`transaction_outputs` and `utxo_state` are deliberately separate tables;
+this round closes a gap in *which* outputs `utxo_state` gets a row for at
+all:
+
+- `transaction_outputs` = **every** output that ever existed on-chain,
+  preserved 1:1, forever — unconditionally, regardless of anything below.
+- `utxo_state` = the Core-*equivalent* canonical coin state — a row exists
+  **only** for an output Core's own `CCoinsViewCache::AddCoin` would
+  actually add to its coins view. It is not, and was never intended to be,
+  a mirror of `transaction_outputs`.
+
+`applyOutput` (`apply.go`) skips `utxo_state` row creation — but still
+writes `transaction_outputs` (and any destination/participant metadata)
+unconditionally — for exactly two categories, both taken directly from
+Qogecoin Core source:
+
+1. **Genesis (block height 0).** Core's `ConnectBlock` special-cases the
+   genesis block, skipping connection of its transactions entirely ("its
+   coinbase is unspendable"); QOGE's own chainparams document the same for
+   the genesis output specifically — it never existed in the coins database
+   at all. `ApplyBlock` derives `isGenesis := block.Height == 0` and threads
+   it down to `applyOutput`. `TestApplyBlock_GenesisCoinbaseUnspendable`
+   proves this against a source-derived fixture — the real QOGE mainnet
+   genesis block hash, txid, coinbase reward (100 QOGE), transaction
+   version (1), and genesis output scriptPubKey (bare P2PK; the coinbase
+   input's raw script is a synthetic placeholder, not reproduced from
+   source — see the test's doc comment): the transaction and its output
+   persist exactly (including the real scriptPubKey round-tripping through
+   `script.Classify` as `TypeP2PK`), but `GetUTXO` is `nil` and no
+   `addresses` cache row is created from it.
+2. **`script.IsUnspendable`.** Mirrors Core's `CScript::IsUnspendable()`
+   (`src/script/script.h`) exactly: `(len(script) > 0 && script[0] ==
+   OP_RETURN) || len(script) > script.MaxScriptSize` (10,000, Core's
+   `MAX_SCRIPT_SIZE`) — a structural, byte-level check on the raw
+   `scriptPubKey`, deliberately independent of `script.Type`/`Classify`: a
+   non-`nulldata` script larger than `MaxScriptSize` is unspendable too,
+   even though `Classify` has no dedicated "too large" type for it. Applies
+   at every height, not just genesis. `TestApplyBlock_UnspendableOutputs`
+   covers an ordinary spendable output (UTXO created), an `OP_RETURN`
+   script (output persisted, no UTXO), an oversized script (output
+   persisted, no UTXO), the exact `MaxScriptSize`-byte boundary for a
+   non-`OP_RETURN` script (still spendable — hitting the boundary alone
+   must not reject it), and that safe orphan re-promotion's rebuild path
+   respects the exclusion too, not just plain tip replay.
+
+Neither exclusion touches `transaction_outputs`, `output_addresses`, or
+`output_participants` — an excluded output remains fully queryable audit
+history. The exclusion only ever affects `utxo_state` (so it can never be
+spent — attempting to reference it as a prevout is `ErrMissingPrevout`,
+exactly as if it didn't exist, which is structurally correct: Core would
+reject spending it too) and, transitively, `recomputeAddress` (which reads
+`utxo_state` via an inner join — an address whose only activity is an
+excluded output gets no `addresses` cache row at all, not a zero-value one).
+
+### Transaction completeness and input field exclusivity
+
+**Added in a third, final review round.** Two more `validateBlockShape`
+checks, run before any database access, alongside the ones above:
+
+1. **Every transaction must have at least one input and one output.**
+   `ApplyBlock` claims to persist a fully decoded transaction, so an empty
+   `vin`/`vout` must never be silently accepted as a possibly-partial RPC
+   translation — the same completeness concern as `ErrIncompleteBlock`
+   above, applied one level down. This mirrors the *shape* (not the
+   reachability) of Core's `CheckTransaction` `bad-txns-vin-empty`/
+   `bad-txns-vout-empty` checks; `Store` is not becoming a consensus
+   validator. `ErrInvalidTransactionShape`.
+2. **`chain.Input`'s `PreviousOut`/`Coinbase`/`ScriptSig` fields are
+   mutually exclusive by construction** (`internal/chain/input.go`):
+   `Coinbase` is set only when `PreviousOut` is `nil`; `ScriptSig` is empty
+   for a coinbase input. Previously `applyInput` silently ignored
+   `Input.Coinbase` whenever `PreviousOut != nil` — a raw-preservation gap
+   if a future RPC decoder ever constructed an inconsistent model.
+   `validateBlockShape` now requires, per input: if `PreviousOut == nil`,
+   `Coinbase` must be non-empty and `ScriptSig` must be empty; if
+   `PreviousOut != nil`, `Coinbase` must be empty (`ScriptSig` may
+   legitimately be empty *or* non-empty either way — a pure witness spend
+   has no `ScriptSig`, and that alone is never rejected).
+   `ErrInvalidTransactionShape`.
+
+`TestApplyBlock_TransactionCompleteness` covers: a coinbase with zero
+outputs (rejected, zero writes); a non-coinbase with zero inputs (rejected,
+zero writes, checkpoint unmoved); a transaction with normal vin/vout
+(accepted). `TestApplyBlock_InputFieldExclusivity` covers: a normal
+coinbase representation (accepted); a coinbase with a non-empty `ScriptSig`
+(rejected); a coinbase with missing/empty `Coinbase` bytes (rejected); a
+non-coinbase with `Coinbase` bytes populated (rejected); and a pure-witness
+non-coinbase with an empty `ScriptSig` (accepted).
+
+### Coinbase structural consistency
+
+**Also added in that review round.** `Store` uses `chain.Transaction
+.IsCoinbase` to make two monetary decisions: skip fee computation, and skip
+prevout spend marking. Previously this flag was trusted independently of
+the transaction's actual input shape — a caller-constructed
+`IsCoinbase = true` transaction carrying a real `PreviousOut` would silently
+skip marking that prevout spent while still creating the transaction's
+outputs, corrupting canonical UTXO state without any error.
+`validateBlockShape` now requires, for every transaction, before any
+database access:
+
+```
+structurallyCoinbase := len(txn.Inputs) == 1 && txn.Inputs[0].PreviousOut == nil
+txn.IsCoinbase == structurallyCoinbase
+```
+
+mirroring Core's `IsCoinBase()` (`src/primitives/transaction.h`) exactly. It
+also requires canonical block-level shape — at least one transaction,
+transaction 0 is coinbase, no other transaction is — matching the fact that
+every real Core block has exactly one coinbase transaction, always at
+position 0. Any violation is `ErrInvalidTransactionShape`, rejected before
+any write. This does not replace Core consensus validation; it only ensures
+the already-parsed canonical Go model is internally self-consistent before
+`Store` trusts `IsCoinbase`. `TestApplyBlock_CoinbaseStructuralConsistency`
+covers: a normal one-input coinbase (accepted); `IsCoinbase = true` with a
+real prevout (rejected, zero writes); `IsCoinbase = false` with a null
+prevout (rejected); a two-input coinbase (rejected); a block whose first
+transaction isn't coinbase (rejected); a block whose second transaction is
+coinbase (rejected); and a zero-transaction block (rejected).
+
+### Block transaction ordering
+
+`ApplyBlock` processes `block.Transactions` strictly in the given slice
+order and does not re-derive or re-sort it. This is safe because it assumes
+— as any block Qogecoin Core itself considers valid guarantees — that every
+input references an output created either in an already-applied block or
+*earlier* in this same block, never later in this same block. A
+transaction that violates this (e.g. a caller-constructed test block with
+inputs out of order) fails with `ErrMissingPrevout` at the point it's
+processed, exactly as if the referenced output didn't exist yet — `Store`
+does not attempt to detect or repair ordering problems, since a real block
+from Core cannot have this problem in the first place.
+
+### Immutable conflict semantics
+
+Every immutable-identity table write goes through
+`insertOrVerifyIdempotent` (`store.go`): `INSERT ... ON CONFLICT (<natural
+key>) DO NOTHING`, and — only if that affected zero rows, meaning the key
+already existed — a follow-up `SELECT` proving the existing row's non-key
+columns exactly match what this call intended to insert (`IS NOT DISTINCT
+FROM` throughout, so `NULL`-vs-`NULL` correctly counts as a match). A
+mismatch returns an error wrapping `ErrImmutableConflict`, naming the
+table/identity, and aborts the whole block (see "Atomicity," below) —
+never a silent overwrite. This applies uniformly to `blocks` (keyed by
+`hash`; canonical/orphaned_at are intentionally excluded from the
+comparison — see §5), `transactions` (`txid`), `transaction_variants`
+(`wtxid`), `block_transactions` (`block_hash, tx_index`),
+`transaction_inputs` (`txid, vin_index`), `transaction_input_witness`
+(`wtxid, vin_index, item_index`), `transaction_outputs` (`txid,
+vout_index`), `output_addresses` (`txid, vout_index`), and
+`output_participants` (`txid, vout_index, address`). `utxo_state`'s
+*creation* row follows the same pattern (comparing only
+`creation_block_hash`, since a genuine identity conflict there should never
+occur in practice given every txid/wtxid conflict above is already caught
+first) — but its *mutable* spend fields are never part of that comparison,
+precisely because they're expected to change over the row's lifetime; see
+"UTXO spend handling" below.
+
+### Idempotent replay
+
+Reapplying the exact same already-applied block calls every
+`insertOrVerifyIdempotent` site with byte-identical arguments, so every one
+resolves to "already exists, and matches" — a safe no-op. The one exception
+requiring explicit handling is `utxo_state`'s spend marker: `checkPrevout`
+(`apply.go`) treats "already spent by exactly this (txid, vin_index)" as
+success (the idempotent case), and only treats "already spent by a
+*different* spender" as `ErrDoubleSpend`. The subsequent `UPDATE ... WHERE
+spent = false` is then a correct no-op in the idempotent case (nothing to
+change) and a correct first-time spend otherwise. Address caches are
+recomputed (see below) regardless of whether anything actually changed,
+which is safe by construction since recomputation is a pure function of
+current source-table state, not a delta.
+
+### Fee computation
+
+For each non-coinbase transaction, before any of its rows are written,
+`applyTransaction` resolves every input's previous output via
+`checkPrevout` (which also enforces the UTXO existence/unspent checks
+below) and sums their `value_satoshis`; it separately sums the
+transaction's own output values. `fee = sum(input values) - sum(output
+values)`, computed and compared entirely in integer satoshis (`int64`) —
+never `float64` anywhere in this path. A negative result is
+`ErrNegativeFee`: an internal indexing inconsistency (inputs worth less
+than outputs is not a state a valid block can produce), not a value this
+codebase infers total issued supply from — see §6, which this does not
+change. Coinbase transactions never go through this path at all;
+`fee_satoshis` is unconditionally `NULL` for them, matching the schema's
+`transactions_coinbase_has_no_fee` `CHECK`.
+
+### UTXO spend handling
+
+`checkPrevout` requires a `utxo_state` row to already exist for the
+referenced `(prev_txid, prev_vout_index)` — `ErrMissingPrevout` otherwise;
+`Store` never invents a missing previous output, consistent with §2's
+"never invent data Core didn't provide." If the row exists but is already
+spent by a different transaction/input, that's `ErrDoubleSpend`. Only once
+every input of a transaction has passed this check, and that transaction's
+own `transaction_inputs`/`block_transactions` rows have been written
+(satisfying `utxo_state`'s occurrence foreign keys — §3b), does
+`markSpent` actually flip `spent = true` on the referenced row.
+
+### Address cache: SET recomputation, exact semantics
+
+`recomputeAddress` (`apply.go`) is the only place `addresses` rows are ever
+written, called for every address `ApplyBlock`/`RollbackTo` touched in this
+call — a receiving `output_addresses` row inserted or verified, or a
+`utxo_state` row this call just spent, deleted, or restored. It always
+computes a fresh absolute value from current source tables and `SET`s it
+(`INSERT ... ON CONFLICT (address) DO UPDATE SET <every column> =
+EXCLUDED.<every column>`) — never `balance = balance + ...` or any other
+increment. Exact semantics, over every `output_addresses` row naming this
+address joined against its `transaction_outputs`/`utxo_state` state:
+
+- `total_received_satoshis` = `SUM(value_satoshis)` over every output ever
+  created to this address, spent or not.
+- `total_sent_satoshis` = `SUM(value_satoshis)` over this address's outputs
+  that are currently spent.
+- `balance_satoshis` = `SUM(value_satoshis)` over this address's currently
+  *unspent* outputs (equivalently `total_received - total_sent`).
+- `tx_count` = count of DISTINCT transactions this address participated in,
+  as either a creation (received an output) or a spend (a previously-
+  received output was later spent by some transaction) — the union of
+  creating txids and spending txids, not just one or the other.
+- `first_seen_height` = `MIN(creation_block_height)` over this address's
+  outputs.
+- `last_seen_height` = `MAX` of, for each output, its creation height or —
+  if spent — its spending height, whichever is higher: the highest block
+  height at which any activity touching this address occurred.
+
+Because this is a pure function of current canonical source-table state,
+it is automatically correct after `ApplyBlock`, after `RollbackTo`, and
+after any sequence of the two — there is no separate "undo" logic for the
+address cache during a reorg, only the same recomputation rerun for
+whatever addresses that reorg touched (`TestRollbackTo_*`'s address-cache
+assertions in `apply_test.go` confirm the cache after a rollback-then-
+replace sequence exactly matches an independent, from-scratch aggregate
+query against the source tables). If recomputation finds zero remaining
+canonical activity for an address (every output that ever named it has
+been rolled back and never replaced), its `addresses` row is deleted
+rather than left behind as a phantom all-zero entry — `output_participants`
+is never part of this computation at all (§7/§13.A): a multisig output's
+participants never gain or lose cache rows from it, by construction, not
+by a special-cased exclusion.
+
+### Atomicity
+
+`ApplyBlock` and `RollbackTo` each open exactly one `pgx.Tx`
+(`pool.Begin`) and pass it to every helper they call; the deferred
+`tx.Rollback` is a safe no-op once `tx.Commit` has already succeeded, and
+the only path to persisting anything is that final `Commit` call after
+every step — including address-cache recomputation — has already
+succeeded without error. Any error at any point, from a genuine
+`ErrImmutableConflict`/`ErrDoubleSpend`/`ErrMissingPrevout`/
+`ErrNegativeFee` down to an unexpected database error, causes the function
+to return before `Commit`, so the deferred `Rollback` discards every
+statement issued so far — including the block header insert itself. Task
+tests P and Q (`apply_test.go`) confirm this directly: a block engineered
+to fail partway through leaves neither its `blocks` row nor any of its
+`transactions` rows behind, and leaves `sync_state` and every `utxo_state`
+row it might have touched completely unchanged.
+
+### Multisig participants
+
+`output_participants` rows are written only for `script_type = 'multisig'`
+outputs, using `chain.Output.ParticipantAddresses` — a caller-supplied,
+parallel array to `PubKeys` (added in this phase; see
+`internal/chain/output.go`) for the per-signer addresses a future RPC
+translator will resolve from Core's own bare-multisig `addresses` array,
+exactly as `Output.Address` is already "taken as-is" for every other type.
+`Store` never derives or invents an address itself. `recomputeAddress`
+never reads `output_participants` — see "Address cache" above — so writing
+these rows can never affect any address's balance, by construction.
+
+**`output_participants` is a SET of `(address, pubkey)` participant
+identities, keyed by `(txid, vout_index, address)`** — added in the
+Core-facing review round. A bare multisig script can structurally list the
+same pubkey more than once; the raw `scriptPubKey` bytes preserve that
+duplication exactly regardless of anything below. Two identical
+`(address, pubkey)` entries in `ParticipantAddresses`/`PubKeys` are the
+*same* participant identity, not two — `applyOutput` deduplicates them
+before persistence and before completeness counting (`verifyExactCount`
+now compares against the deduplicated count, not `len(PubKeys)`), so an
+exact replay of a duplicate-participant output remains idempotent
+(previously it did not: a fresh apply persisted 1 row via the second
+insert's harmless idempotent no-op against the same natural key, while a
+replay's completeness check compared the persisted count against the
+un-deduplicated `len(PubKeys)`, spuriously failing —
+`TestApplyBlock_MultisigDuplicateParticipantReplay`). The *same* address
+claimed with two *different* pubkeys is a genuine identity conflict, not a
+duplicate, and remains `ErrImmutableConflict`
+(`TestApplyBlock_MultisigSameAddressDifferentPubkeyConflict`).
