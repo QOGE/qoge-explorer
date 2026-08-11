@@ -194,6 +194,13 @@ func TestLive_ScriptContract(t *testing.T) {
 		"no-store",
 		"indexed_height",
 		"indexed_block_hash",
+		// The notify-only-page baseline-initialization guard (see the file's
+		// "Two baseline modes" comment): without it, a detail/historical
+		// page's first real status response would show a false "chain
+		// changed" banner immediately, since there is no rendered baseline
+		// to compare against. This pins that the guard exists at all,
+		// without needing a JS runtime to execute the state machine.
+		"hasStatusBaseline",
 	} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("live.js missing required substring %q", want)

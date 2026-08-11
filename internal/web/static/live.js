@@ -45,19 +45,39 @@
     return isNaN(n) ? null : n;
   }
 
-  // baselineHeight/baselineHash describe the tip this PAGE was rendered
-  // from — used only to decide reload-vs-notify for eligible pages, never
-  // rendered or reconstructed into new DOM content.
+  // Two baseline modes, per docs/ARCHITECTURE.md §21 "Baseline tip":
+  //
+  //   AUTO-REFRESH pages ("home"/"blocks"): the server-rendered HTML
+  //   already carries an authoritative baseline tip (data-indexed-height/
+  //   data-indexed-hash, or the first block row's data-block-height/
+  //   data-block-hash). That baseline is valid IMMEDIATELY — even before
+  //   the first poll runs — specifically so the FIRST poll can detect a
+  //   block indexed in the gap between HTML render and that first request.
+  //
+  //   NOTIFY-ONLY pages (every other page: block/tx/address detail, raw
+  //   ?include_witness=true, historical /blocks?before=...): there is no
+  //   rendered global-tip baseline to compare against. Comparing against a
+  //   null baseline would show a false "chain changed" banner on literally
+  //   every notify-only page load, the moment the first real status
+  //   response arrives. Instead, hasStatusBaseline starts false; the FIRST
+  //   SUCCESSFUL status response silently establishes lastKnownHash and
+  //   flips hasStatusBaseline true, producing no banner and no reload. Only
+  //   a SUBSEQUENT response with a different hash counts as a real change.
+  //   A failed request never touches hasStatusBaseline, so it stays
+  //   uninitialized until a later request actually succeeds.
   var baselineHeight = null;
   var baselineHash = null;
+  var hasStatusBaseline = false;
 
   if (refreshMode === "home") {
     baselineHeight = parseIntAttr(refreshEl, "data-indexed-height");
     baselineHash = refreshEl.getAttribute("data-indexed-hash") || null;
+    hasStatusBaseline = true;
   } else if (refreshMode === "blocks") {
     var firstRow = refreshEl.querySelector("[data-block-height]");
     baselineHeight = parseIntAttr(firstRow, "data-block-height");
     baselineHash = firstRow ? (firstRow.getAttribute("data-block-hash") || null) : null;
+    hasStatusBaseline = true;
   }
 
   var lastKnownHash = baselineHash;
@@ -94,6 +114,14 @@
     }
     var height = status.indexed_height;
     var hash = typeof status.indexed_block_hash === "string" ? status.indexed_block_hash : null;
+
+    // Notify-only pages have no rendered baseline: this first SUCCESSFUL
+    // response silently becomes the baseline, never a banner/reload.
+    if (!hasStatusBaseline) {
+      lastKnownHash = hash;
+      hasStatusBaseline = true;
+      return;
+    }
 
     if (hash === lastKnownHash) {
       return;

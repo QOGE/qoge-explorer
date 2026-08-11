@@ -2864,6 +2864,37 @@ poll — this is what lets the FIRST poll detect a block that was indexed
 in the gap between the HTML snapshot being rendered and the script's
 first request actually firing.
 
+### Two baseline modes (post-review correction)
+
+An internal review of the first draft caught that pages with no rendered
+tip — every detail page — initialized their comparison state to `null`,
+so the very first successful `/api/v1/status` response (a real, non-null
+hash on any normally-functioning database) looked like a "change" and
+showed a false "chain updated" banner immediately on page load, even
+though nothing had changed since the page rendered. The fix
+(`live.js`'s `hasStatusBaseline` flag) makes the distinction explicit
+rather than inferring it from a null check:
+
+- **Auto-refresh pages** (`data-live-refresh="home"`/`"blocks"`):
+  `hasStatusBaseline` is `true` from the start — the rendered HTML
+  attributes above already ARE a valid baseline, including the
+  legitimate `null`/`-1` case on an empty database, so the very first
+  poll must be able to detect a change immediately (this is the whole
+  point of exposing the rendered baseline at all).
+- **Notify-only pages** (everything else: block/tx/address detail,
+  `?include_witness=true`, historical `/blocks?before=...`):
+  `hasStatusBaseline` starts `false`. The first SUCCESSFUL status
+  response silently sets `lastKnownHash` and flips the flag, producing no
+  banner and no reload — only a SUBSEQUENT response with a different
+  hash is a real, bannerable change. A failed request never touches the
+  flag, so a transient failure before the first success simply delays
+  when the baseline gets established; it never fabricates one.
+
+This preserves every other invariant unchanged: notify-only pages still
+never auto-reload once their baseline is established, and the
+same/lower-height reorg-safety logic (§21 "Tip-change semantics") applies
+identically once a real change is observed on either kind of page.
+
 ### Auto-refresh is opt-in per page, via one marker attribute
 
 A page is only ever eligible for an automatic reload if it contains an
@@ -2962,6 +2993,17 @@ and the `internal/query` concurrent-reorg snapshot tests
 `BlockDetail`/`TransactionDetail` ones) — continue passing unmodified,
 confirming the live UI doesn't weaken any server-side snapshot guarantee.
 `internal/api`'s existing test suite also runs completely unmodified.
+`TestLive_ScriptContract` additionally pins that the notify-only
+baseline-initialization guard (`hasStatusBaseline`) exists in the shipped
+source, since the earlier `live_test.go` suite — being purely HTML/
+static-contract tests — did not catch the false-banner-on-first-load
+defect the internal review found; the state machine itself (both baseline
+modes, the failure-before-first-success case, and the existing home-page
+reorg-safety behavior) was additionally verified directly by executing
+the actual, unmodified `live.js` against a minimal hand-written DOM/fetch
+shim under Node's built-in `vm` module — a throwaway, uncommitted
+verification harness, not a project dependency (no npm, no jsdom, no
+`package.json` added anywhere in the repo).
 
 ### Explicitly deferred
 
