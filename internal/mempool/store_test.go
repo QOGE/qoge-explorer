@@ -316,6 +316,67 @@ func TestReplaceSnapshot_CoinbaseShapedTransactionRejected(t *testing.T) {
 	requireMempoolTxExists(t, ctx, pool, coinbase.TxID, false)
 }
 
+// TestReplaceSnapshot_DependencyOrderIndependent is the required
+// regression test for the child-before-parent FK ordering bug: a valid
+// mempool dependency graph must commit successfully regardless of where
+// in candidate.Transactions the child (dependent) and parent (depended-
+// upon) transactions fall — txid is an opaque hash with no topological
+// meaning, and sync.go lists candidate transactions in lexicographic
+// txid order, which can and does put a child before its parent.
+func TestReplaceSnapshot_DependencyOrderIndependent(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	st := NewStore(pool)
+
+	// Fixed so lexical order is deterministic: child sorts BEFORE parent.
+	childTxid := "0000000000000000000000000000000000000000000000000000000000000001"
+	parentTxid := "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe"
+	if childTxid >= parentTxid {
+		t.Fatalf("fixture bug: childTxid must sort before parentTxid")
+	}
+
+	child := simpleCandidateTx("OrderChild", fakeHash("prevOrderChild"), 5_00000000, 500, []string{parentTxid})
+	child.TxID = childTxid
+	child.WTxID = childTxid
+
+	parent := simpleCandidateTx("OrderParent", fakeHash("prevOrderParent"), 10_00000000, 1000, nil)
+	parent.TxID = parentTxid
+	parent.WTxID = parentTxid
+
+	// Deliberately passed in child, parent order — the exact order that
+	// broke the old single-pass insertion.
+	gen, err := st.ReplaceSnapshot(ctx, candidateOf(100, fakeHash("order-tip"), child, parent))
+	if err != nil {
+		t.Fatalf("ReplaceSnapshot(child, parent order): %v", err)
+	}
+	if gen != 1 {
+		t.Fatalf("generation = %d, want 1", gen)
+	}
+
+	requireMempoolTxExists(t, ctx, pool, childTxid, true)
+	requireMempoolTxExists(t, ctx, pool, parentTxid, true)
+
+	rows, err := pool.Query(ctx, `SELECT txid, depends_on_txid FROM mempool_dependencies`)
+	if err != nil {
+		t.Fatalf("query mempool_dependencies: %v", err)
+	}
+	defer rows.Close()
+	var deps [][2]string
+	for rows.Next() {
+		var txid, dependsOn string
+		if err := rows.Scan(&txid, &dependsOn); err != nil {
+			t.Fatalf("scan dependency row: %v", err)
+		}
+		deps = append(deps, [2]string{txid, dependsOn})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate dependency rows: %v", err)
+	}
+	if len(deps) != 1 || deps[0][0] != childTxid || deps[0][1] != parentTxid {
+		t.Fatalf("mempool_dependencies = %v, want exactly [[%s %s]]", deps, childTxid, parentTxid)
+	}
+}
+
 // TestReplaceSnapshot_DanglingDependencyRejected: a "depends" reference to
 // a txid outside the candidate snapshot is contradictory data (spec item
 // 33) and must be rejected, not silently stored.

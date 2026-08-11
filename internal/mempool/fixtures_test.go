@@ -155,6 +155,23 @@ func rawMempoolTx(label string, vin []rpc.RawVin, vout []rpc.RawVout) rpc.RawTra
 	}
 }
 
+// rawMempoolTxWithTxID is rawMempoolTx but with an explicit, caller-chosen
+// txid/wtxid rather than one derived from a label — needed for fixtures
+// that must control lexicographic ordering deterministically (e.g. a
+// child transaction whose txid sorts before its parent's).
+func rawMempoolTxWithTxID(txid string, vin []rpc.RawVin, vout []rpc.RawVout) rpc.RawTransaction {
+	wtxid := txid
+	version := uint32(2)
+	lockTime := uint32(0)
+	size, vsize, weight := 250, 200, 800
+	return rpc.RawTransaction{
+		TxID: &txid, Hash: &wtxid,
+		Version: &version, Size: &size, VSize: &vsize, Weight: &weight, LockTime: &lockTime,
+		Vin:  vin,
+		Vout: vout,
+	}
+}
+
 // mempoolEntry builds the getrawmempool-verbose metadata for one
 // transaction, mirroring the live shape confirmed against a real
 // Qogecoin Core node during this phase's manual check.

@@ -31,7 +31,10 @@ func simpleRawMempoolTx(label string, feeSats int64) (rpc.RawTransaction, rpc.Ra
 	vin := []rpc.RawVin{rawSpendVin(prevTxid, 0, "473044")}
 	vout := []rpc.RawVout{rawVout(0, 10_00000000, p2pkhScript(label), "pubkeyhash", &addr)}
 	raw := rawMempoolTx(label, vin, vout)
-	entry := mempoolEntry(150, 600, feeSats, 1_700_000_000, 100, nil, true)
+	// vsize/weight must agree with rawMempoolTx's own hardcoded 200/800 —
+	// fetchAndDecode now cross-checks getrawmempool's vsize/weight against
+	// the strictly decoded getrawtransaction response (spec item 9).
+	entry := mempoolEntry(200, 800, feeSats, 1_700_000_000, 100, nil, true)
 	return raw, entry
 }
 
@@ -344,4 +347,140 @@ func TestRefreshOnce_CoinbaseShapedMempoolTransactionRejected(t *testing.T) {
 		t.Fatalf("refreshOnce with a coinbase-shaped mempool transaction: got nil error, want rejection")
 	}
 	requireNeverPublished(t, ctx, mstore)
+}
+
+// TestRefreshOnce_ChildBeforeParentLexicalOrder is the required
+// synchronizer-level regression test for the dependency-ordering bug:
+// fetchAndDecode itself lexically sorts txids before fetching/decoding
+// them, so this drives the REAL getrawmempool -> lexical sort -> decode
+// -> ReplaceSnapshot pipeline with a child transaction whose txid sorts
+// BEFORE its parent's — exactly the shape that broke the old single-pass
+// Store insertion.
+func TestRefreshOnce_ChildBeforeParentLexicalOrder(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	mstore := NewStore(pool)
+
+	childTxid := "0000000000000000000000000000000000000000000000000000000000000001"
+	parentTxid := "fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe"
+	if childTxid >= parentTxid {
+		t.Fatalf("fixture bug: childTxid must sort before parentTxid")
+	}
+
+	childAddr := "qLexicalChild"
+	parentAddr := "qLexicalParent"
+	childRaw := rawMempoolTxWithTxID(childTxid,
+		[]rpc.RawVin{rawSpendVin(fakeHash("lexical-child-prev"), 0, "473044")},
+		[]rpc.RawVout{rawVout(0, 5_00000000, p2pkhScript("lexical-child"), "pubkeyhash", &childAddr)},
+	)
+	parentRaw := rawMempoolTxWithTxID(parentTxid,
+		[]rpc.RawVin{rawSpendVin(fakeHash("lexical-parent-prev"), 0, "473044")},
+		[]rpc.RawVout{rawVout(0, 10_00000000, p2pkhScript("lexical-parent"), "pubkeyhash", &parentAddr)},
+	)
+	childEntry := mempoolEntry(200, 800, 500, 1_700_000_000, 100, []string{parentTxid}, true)
+	parentEntry := mempoolEntry(200, 800, 1000, 1_700_000_000, 100, nil, true)
+
+	tip := store.Checkpoint{Height: 10, Hash: fakeHash("lexical-order-tip")}
+	confirmed := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+	client := &fakeRPCClient{
+		blockCountSeq: []int64{10},
+		bestHashSeq:   []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{
+			childTxid:  childEntry,
+			parentTxid: parentEntry,
+		},
+		rawTxs: map[string]rpc.RawTransaction{
+			childTxid:  childRaw,
+			parentTxid: parentRaw,
+		},
+	}
+	s := newTestSynchronizer(client, confirmed, mstore)
+
+	if err := s.refreshOnce(ctx); err != nil {
+		t.Fatalf("refreshOnce: %v", err)
+	}
+
+	state, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if !state.Initialized || state.Generation != 1 || state.TxCount != 2 {
+		t.Fatalf("state = %+v, want initialized=true generation=1 tx_count=2", state)
+	}
+
+	var dependsOn string
+	if err := pool.QueryRow(ctx, `SELECT depends_on_txid FROM mempool_dependencies WHERE txid = $1`, childTxid).Scan(&dependsOn); err != nil {
+		t.Fatalf("read mempool_dependencies: %v", err)
+	}
+	if dependsOn != parentTxid {
+		t.Fatalf("child depends_on_txid = %s, want %s", dependsOn, parentTxid)
+	}
+}
+
+// TestRefreshOnce_RPCIdentityMismatchRejected is spec item 8: Core
+// answering a getrawtransaction(A) request with transaction B's data must
+// discard the whole candidate rather than ever attaching mempool entry
+// A's fee/time/dependency metadata to decoded transaction B.
+func TestRefreshOnce_RPCIdentityMismatchRejected(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	mstore := NewStore(pool)
+
+	// First, a real successful publication, to prove it's retained.
+	rawGood, entryGood := simpleRawMempoolTx("IdentityGood", 1000)
+	tip := store.Checkpoint{Height: 10, Hash: fakeHash("identity-tip")}
+	confirmedGood := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+	clientGood := &fakeRPCClient{
+		blockCountSeq:  []int64{10},
+		bestHashSeq:    []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{*rawGood.TxID: entryGood},
+		rawTxs:         map[string]rpc.RawTransaction{*rawGood.TxID: rawGood},
+	}
+	sGood := newTestSynchronizer(clientGood, confirmedGood, mstore)
+	if err := sGood.refreshOnce(ctx); err != nil {
+		t.Fatalf("initial successful refreshOnce: %v", err)
+	}
+	stateBefore, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State before: %v", err)
+	}
+
+	// getrawmempool lists txid A; GetRawTransactionVerbose(A) deliberately
+	// returns a structurally valid transaction that decodes to a
+	// DIFFERENT txid B.
+	requestedTxid := fakeHash("identity-mismatch-requested-A")
+	otherAddr := "qIdentityMismatchB"
+	mismatchedRaw := rawMempoolTx("identity-mismatch-actual-B",
+		[]rpc.RawVin{rawSpendVin(fakeHash("identity-mismatch-prev"), 0, "473044")},
+		[]rpc.RawVout{rawVout(0, 1_00000000, p2pkhScript("identity-mismatch"), "pubkeyhash", &otherAddr)},
+	)
+	if *mismatchedRaw.TxID == requestedTxid {
+		t.Fatalf("fixture bug: mismatchedRaw.TxID must differ from requestedTxid")
+	}
+	entry := mempoolEntry(200, 800, 1000, 1_700_000_000, 100, nil, true)
+
+	confirmedMismatch := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+	clientMismatch := &fakeRPCClient{
+		blockCountSeq:  []int64{10},
+		bestHashSeq:    []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{requestedTxid: entry},
+		rawTxs:         map[string]rpc.RawTransaction{requestedTxid: mismatchedRaw},
+	}
+	sMismatch := newTestSynchronizer(clientMismatch, confirmedMismatch, mstore)
+
+	err = sMismatch.refreshOnce(ctx)
+	if !errors.Is(err, ErrRPCIdentityMismatch) {
+		t.Fatalf("refreshOnce error = %v, want ErrRPCIdentityMismatch", err)
+	}
+
+	stateAfter, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State after: %v", err)
+	}
+	if stateAfter.Generation != stateBefore.Generation || stateAfter.TxCount != stateBefore.TxCount {
+		t.Fatalf("state changed after an identity-mismatch response: before=%+v after=%+v", stateBefore, stateAfter)
+	}
+	requireMempoolTxExists(t, ctx, pool, *rawGood.TxID, true)        // previous snapshot preserved
+	requireMempoolTxExists(t, ctx, pool, *mismatchedRaw.TxID, false) // never substituted in under the requested id or its own
+	requireMempoolTxExists(t, ctx, pool, requestedTxid, false)
 }

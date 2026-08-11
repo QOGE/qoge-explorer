@@ -3129,6 +3129,61 @@ never observable. `generation` increments once per successful commit,
 including a non-empty -> empty transition (an observed empty mempool is
 real synchronized state), and never on a failed or skipped refresh.
 
+### Dependency insertion is a two-pass, order-independent operation
+
+`mempool_dependencies.txid` and `.depends_on_txid` are BOTH immediate
+foreign keys into `mempool_transactions(txid)`. Candidate transactions
+are not, and must not be required to be, topologically sorted by the
+caller — `Synchronizer.fetchAndDecode` lists them in plain lexicographic
+txid order (an opaque hash has no dependency meaning at all), so a
+single "insert transaction, then its dependencies, then the next
+transaction" pass fails the FK whenever a child transaction's txid
+happens to sort before its parent's (a real, unremarkable case: nothing
+about Core's own txid assignment correlates with mempool ancestry).
+
+`ReplaceSnapshot` therefore inserts in two passes, inside the SAME
+transaction: pass 1 inserts every `mempool_transactions` row (and every
+non-dependency child row — inputs, witness, outputs,
+addresses/participants) for the WHOLE candidate; only once every parent
+txid this candidate could possibly reference is guaranteed to already
+exist does pass 2 insert every `mempool_dependencies` row. This makes
+`Store` accept a valid candidate in ANY slice order, proven directly by
+`TestReplaceSnapshot_DependencyOrderIndependent` (a hand-ordered
+child-before-parent PostgreSQL test) and
+`TestRefreshOnce_ChildBeforeParentLexicalOrder` (the same shape driven
+through the real `getrawmempool -> lexical sort -> decode ->
+ReplaceSnapshot` pipeline). A dependency referencing a txid outside the
+candidate entirely is still rejected, unchanged — both the in-memory
+`Candidate.validate()` check and the FK itself still reject a genuinely
+dangling reference; only the FALSE positive (a valid same-snapshot
+reference rejected merely because of insertion order) was the bug.
+
+### RPC response identity and metadata cross-checks
+
+`fetchAndDecode` requires the transaction `decode.DecodeTransaction`
+actually decodes from `GetRawTransactionVerbose(txid)` to have
+`TxID == txid` — the exact txid that was requested. A mismatch
+(`ErrRPCIdentityMismatch`) discards the whole candidate; it is
+deliberately NOT treated as `ErrMempoolRace`: a disappeared or
+newly-confirmed transaction is an expected, ordinary mempool race, but
+Core answering a request for txid A with transaction B's data is a
+wire-level integrity problem, and this project never attaches one
+mempool entry's fee/time/dependency metadata to a different decoded
+transaction merely because they arrived in the same fetch loop.
+
+`getrawmempool`'s verbose per-entry `vsize` and `weight` are documented
+by Core's own `help getrawmempool` (confirmed against the live local
+node during this phase's manual check) as always-present — unlike
+`fee`/`modifiedfee`/`descendantfees`/etc., which Core's help text
+explicitly marks "(numeric, optional)". Because both fields describe the
+same transaction as the strictly decoded `getrawtransaction` response,
+`fetchAndDecode` cross-checks them against `chain.Transaction`'s own
+`VSize`/`Weight` whenever Core supplied them, rejecting the candidate on
+disagreement rather than silently trusting whichever value happened to
+be read first. The check is skipped (not required) when either field is
+literally absent, so an unexpected future Core response shape doesn't
+turn into a spurious hard failure.
+
 ### Confirmed-transaction detection: `getrawtransaction`'s optional `blockhash`
 
 `rpc.RawTransaction` gained one new optional field, `BlockHash`

@@ -103,13 +103,32 @@ func (s *Store) ReplaceSnapshot(ctx context.Context, candidate Candidate) (gener
 	var totalVSize int64
 	var totalFee int64
 
+	// Two-pass insertion, deliberately NOT one pass per candidate
+	// transaction: mempool_dependencies.txid AND .depends_on_txid are both
+	// immediate foreign keys into mempool_transactions(txid). Candidate
+	// transactions are not topologically ordered by the caller (sync.go
+	// lists them in lexicographic txid order, which has no dependency
+	// meaning at all), so a single-pass "insert transaction, then its
+	// dependencies, then the next transaction" loop fails the FK check
+	// whenever any child transaction's txid happens to sort before its
+	// parent's. Pass 1 inserts every mempool_transactions row (and every
+	// non-dependency child row) for the WHOLE candidate; only once every
+	// parent txid is guaranteed to exist does pass 2 insert every
+	// dependency row. Store therefore accepts a valid candidate in ANY
+	// slice order — see TestReplaceSnapshot_DependencyOrderIndependent.
 	for _, ctxn := range candidate.Transactions {
-		if insErr := insertCandidateTransaction(ctx, tx, ctxn); insErr != nil {
+		if insErr := insertCandidateTransactionBody(ctx, tx, ctxn); insErr != nil {
 			err = insErr
 			return 0, err
 		}
 		totalVSize += int64(ctxn.VSize)
 		totalFee += ctxn.FeeSatoshis
+	}
+	for _, ctxn := range candidate.Transactions {
+		if insErr := insertCandidateDependencies(ctx, tx, ctxn); insErr != nil {
+			err = insErr
+			return 0, err
+		}
 	}
 
 	var newGeneration int64
@@ -140,11 +159,13 @@ func (s *Store) ReplaceSnapshot(ctx context.Context, candidate Candidate) (gener
 	return newGeneration, nil
 }
 
-// insertCandidateTransaction inserts one candidate transaction and every
-// child row (inputs, witness, outputs, output_addresses OR
-// output_participants, dependencies) within the caller's already-open
-// transaction.
-func insertCandidateTransaction(ctx context.Context, tx pgx.Tx, ctxn CandidateTransaction) error {
+// insertCandidateTransactionBody inserts one candidate transaction and
+// every child row EXCEPT mempool_dependencies (inputs, witness, outputs,
+// output_addresses OR output_participants) within the caller's
+// already-open transaction. Dependencies are inserted separately, in a
+// later pass over the whole candidate — see ReplaceSnapshot's two-pass
+// comment.
+func insertCandidateTransactionBody(ctx context.Context, tx pgx.Tx, ctxn CandidateTransaction) error {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO mempool_transactions
 			(txid, wtxid, version, locktime, size, vsize, weight, fee_satoshis, entry_time, entry_height, replaceable)
@@ -205,6 +226,17 @@ func insertCandidateTransaction(ctx context.Context, tx pgx.Tx, ctxn CandidateTr
 		}
 	}
 
+	return nil
+}
+
+// insertCandidateDependencies inserts every mempool_dependencies row for
+// one candidate transaction. Called only after insertCandidateTransactionBody
+// has already run for EVERY transaction in the candidate (ReplaceSnapshot's
+// pass 2), so every depends_on_txid this candidate could legally reference
+// (validate() already required it be part of the same candidate) is
+// guaranteed to already exist as a mempool_transactions row — the FK can
+// never spuriously fail due to insertion order.
+func insertCandidateDependencies(ctx context.Context, tx pgx.Tx, ctxn CandidateTransaction) error {
 	for _, dep := range ctxn.Depends {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO mempool_dependencies (txid, depends_on_txid) VALUES ($1,$2)
@@ -212,6 +244,5 @@ func insertCandidateTransaction(ctx context.Context, tx pgx.Tx, ctxn CandidateTr
 			return fmt.Errorf("mempool: insert dependency %s -> %s: %w", ctxn.TxID, dep, err)
 		}
 	}
-
 	return nil
 }

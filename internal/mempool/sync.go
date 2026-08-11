@@ -248,8 +248,38 @@ func (s *Synchronizer) fetchAndDecode(ctx context.Context, entries map[string]rp
 		if err != nil {
 			return nil, fmt.Errorf("mempool: decode transaction %s: %w", txid, err)
 		}
+
+		// Strict RPC response validation, not a mempool race: Core was
+		// asked for txid and must answer with THAT transaction's data.
+		// This never attaches one mempool entry's fee/time/dependency
+		// metadata to a different decoded transaction (spec item 7/8) —
+		// deliberately a distinct error from ErrMempoolRace, since a
+		// txid mismatch is a wire-integrity problem, not an expected
+		// disappeared/now-confirmed race.
+		if txn.TxID != txid {
+			return nil, fmt.Errorf("%w: requested %s, getrawtransaction decoded to %s", ErrRPCIdentityMismatch, txid, txn.TxID)
+		}
+
 		if txn.IsCoinbase {
 			return nil, fmt.Errorf("mempool: transaction %s is coinbase-shaped; Core's mempool must never report a coinbase transaction", txid)
+		}
+
+		// Both vsize and weight are documented as always-present (never
+		// marked "optional") in Core's getrawmempool verbose result,
+		// unlike fee/modifiedfee/descendantfees/etc. — confirmed against
+		// a live Qogecoin Core node's own `help getrawmempool` output
+		// during this phase's manual check (see docs/ARCHITECTURE.md
+		// §22). Both entries describe the SAME transaction, so a
+		// disagreement with the strictly decoded getrawtransaction
+		// response is itself a wire-integrity problem worth rejecting,
+		// not silently tolerating — checked only when Core actually
+		// supplied the field, so an unexpected future omission doesn't
+		// turn into a spurious hard failure here.
+		if entry.VSize != nil && *entry.VSize != txn.VSize {
+			return nil, fmt.Errorf("mempool: transaction %s: getrawmempool vsize=%d disagrees with decoded getrawtransaction vsize=%d", txid, *entry.VSize, txn.VSize)
+		}
+		if entry.Weight != nil && *entry.Weight != txn.Weight {
+			return nil, fmt.Errorf("mempool: transaction %s: getrawmempool weight=%d disagrees with decoded getrawtransaction weight=%d", txid, *entry.Weight, txn.Weight)
 		}
 
 		if entry.Fees == nil {

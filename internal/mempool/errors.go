@@ -20,4 +20,14 @@ var (
 	// candidate and the previously committed snapshot is preserved
 	// untouched; Run retries on the next poll.
 	ErrMempoolRace = errors.New("mempool: core mempool or active chain changed during snapshot acquisition")
+
+	// ErrRPCIdentityMismatch means Core's getrawtransaction response for a
+	// requested txid decoded to a DIFFERENT TxID than what was asked for.
+	// This is deliberately NOT ErrMempoolRace: a disappeared/now-confirmed
+	// transaction is an expected mempool race, but Core answering a
+	// request for txid A with transaction B's data is a wire-level
+	// integrity problem — fetchAndDecode rejects the whole candidate
+	// rather than ever attaching one mempool entry's fee/time/dependency
+	// metadata to a different decoded transaction.
+	ErrRPCIdentityMismatch = errors.New("mempool: getrawtransaction response txid does not match the requested txid")
 )
