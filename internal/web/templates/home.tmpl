@@ -1,0 +1,18 @@
+{{define "body"}}
+<section class="hero">
+  <h1>QOGE Explorer</h1>
+  {{if .Status.IndexedHash}}
+  <p class="status-line">Indexed height <strong>{{.Status.IndexedHeight}}</strong> &mdash; tip
+    <a class="mono wrap" href="/block/{{.Status.IndexedHash}}">{{.Status.IndexedHash}}</a></p>
+  {{else}}
+  <p class="status-line">No blocks indexed yet.</p>
+  {{end}}
+</section>
+<section>
+  <div class="section-header">
+    <h2>Recent Blocks</h2>
+    <a href="/blocks">View all &rarr;</a>
+  </div>
+  {{template "blocktable" .RecentBlocks}}
+</section>
+{{end}}

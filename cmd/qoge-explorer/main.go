@@ -1,9 +1,11 @@
 // Command qoge-explorer is the entry point for the QOGE block explorer
 // service. It implements RPC connectivity verification, schema migrations,
-// historical/live chain indexing (`index`), and — as of Phase 2D.1 — a
-// read-only JSON API (`serve`) over the already-indexed PostgreSQL
-// database. `index` and `serve` are deliberately separate processes; a
-// public HTML web UI does not exist yet.
+// historical/live chain indexing (`index`), and a read-only JSON API plus —
+// as of Phase 2E.1 — a server-rendered HTML explorer UI, both served by
+// `serve` over the already-indexed PostgreSQL database. `index` and `serve`
+// remain deliberately separate processes; internal/api and internal/web are
+// sibling presentation layers over the same internal/query.Store, composed
+// under one HTTP server, never calling one another.
 package main
 
 import (
@@ -25,6 +27,7 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/query"
 	"github.com/QOGE/qoge-explorer/internal/rpc"
 	"github.com/QOGE/qoge-explorer/internal/store"
+	"github.com/QOGE/qoge-explorer/internal/web"
 )
 
 func main() {
@@ -60,15 +63,16 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2D.1: read-only query layer + JSON API)
+	fmt.Fprintln(os.Stderr, `qoge-explorer - QOGE block explorer (Phase 2E.1: read-only query layer + JSON API + HTML explorer UI)
 
 Usage:
   qoge-explorer check-rpc          Connect to the configured Qogecoin Core node
                                     and print non-secret status information.
-  qoge-explorer serve               Start the read-only JSON API server over
-                                     the already-indexed PostgreSQL database
-                                     (loopback by default). Does not index;
-                                     does not require Core RPC credentials.
+  qoge-explorer serve               Start the read-only JSON API and HTML
+                                     explorer UI over the already-indexed
+                                     PostgreSQL database (loopback by
+                                     default). Does not index; does not
+                                     require Core RPC credentials.
   qoge-explorer migrate up          Apply every not-yet-applied migration.
   qoge-explorer migrate down [n]    Roll back the n most recent migrations
                                      (default 1).
@@ -158,10 +162,35 @@ func runCheckRPC(cfg config.Config, log interface {
 	return 0
 }
 
-// runServe starts the Phase 2D.1 read-only JSON API server over the
-// already-indexed PostgreSQL database. It never starts indexing and never
-// requires Core RPC credentials — see cmd/qoge-explorer's package doc
-// comment and docs/ARCHITECTURE.md §19 "index and serve remain separate".
+// newRootHandler composes internal/api and internal/web as sibling
+// handlers over the SAME query.Store: /api/, /healthz, and /readyz go to
+// the JSON API exactly as before Phase 2E.1; everything else goes to the
+// HTML explorer. Neither handler calls the other over HTTP — see
+// runServe's doc comment. Extracted from runServe so the composition
+// itself (which route goes where, and that each side responds in its own
+// content type) can be exercised directly in tests without starting a
+// real listener — see serve_test.go.
+func newRootHandler(q *query.Store, log *slog.Logger) http.Handler {
+	apiHandler := api.New(q, log)
+	webHandler := web.New(q, log)
+
+	rootMux := http.NewServeMux()
+	rootMux.Handle("/api/", apiHandler)
+	rootMux.Handle("/healthz", apiHandler)
+	rootMux.Handle("/readyz", apiHandler)
+	rootMux.Handle("/", webHandler)
+	return rootMux
+}
+
+// runServe starts the Phase 2E.1 read-only JSON API and HTML explorer UI
+// over the already-indexed PostgreSQL database. It never starts indexing
+// and never requires Core RPC credentials — see cmd/qoge-explorer's package
+// doc comment and docs/ARCHITECTURE.md §19 "index and serve remain
+// separate". internal/api and internal/web are wired as sibling handlers
+// over the SAME query.Store — never composed via a loopback HTTP call from
+// one into the other — and are delegated to by path prefix from one root
+// mux, so JSON and HTML routes are served by the one HTTP process/listener
+// this command has always started, per docs/ARCHITECTURE.md §20.
 func runServe(cfg config.Config, log *slog.Logger) int {
 	if cfg.DatabaseURL == "" {
 		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
@@ -177,11 +206,9 @@ func runServe(cfg config.Config, log *slog.Logger) int {
 	}
 	defer pool.Close()
 
-	handler := api.New(query.New(pool), log)
-
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
-		Handler:           handler,
+		Handler:           newRootHandler(query.New(pool), log),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -191,7 +218,7 @@ func runServe(cfg config.Config, log *slog.Logger) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	log.Info("starting read-only API server (index and serve remain separate processes)", "addr", cfg.HTTPAddr)
+	log.Info("starting read-only API + web server (index and serve remain separate processes)", "addr", cfg.HTTPAddr)
 
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.ListenAndServe() }()

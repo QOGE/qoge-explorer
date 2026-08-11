@@ -1,0 +1,17 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QOGE Explorer</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+{{template "header" .}}
+<main class="container">
+{{template "body" .}}
+</main>
+{{template "footer" .}}
+</body>
+</html>
+{{end}}

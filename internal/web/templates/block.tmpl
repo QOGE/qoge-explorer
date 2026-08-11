@@ -1,0 +1,38 @@
+{{define "body"}}
+<h1>Block {{.Height}}</h1>
+{{if not .Canonical}}
+<div class="banner banner-warning">Orphaned block &mdash; retained for historical/audit view.</div>
+{{end}}
+<table class="kv-table">
+<tr><th>Height</th><td>{{.Height}}</td></tr>
+<tr><th>Hash</th><td class="mono wrap">{{.Hash}}</td></tr>
+<tr><th>Status</th><td>{{if .Canonical}}Canonical{{else}}Orphaned{{end}}</td></tr>
+<tr><th>Previous Block</th><td class="mono wrap">{{if .PreviousHash}}<a href="/block/{{.PreviousHash}}">{{.PreviousHash}}</a>{{else}}(genesis){{end}}</td></tr>
+<tr><th>Merkle Root</th><td class="mono wrap">{{.MerkleRoot}}</td></tr>
+<tr><th>Time</th><td>{{formatTimeUTC .Time}}</td></tr>
+<tr><th>Bits</th><td class="mono">{{.Bits}}</td></tr>
+<tr><th>Difficulty</th><td>{{.Difficulty}}</td></tr>
+<tr><th>Nonce</th><td>{{.Nonce}}</td></tr>
+<tr><th>Size</th><td>{{.Size}} bytes</td></tr>
+<tr><th>Weight</th><td>{{.Weight}}</td></tr>
+<tr><th>Transactions</th><td>{{.TxCount}}</td></tr>
+</table>
+
+<h2>Transactions</h2>
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>#</th><th>TxID</th><th>WTxID</th></tr></thead>
+<tbody>
+{{range .Transactions}}
+<tr>
+  <td>{{.Index}}</td>
+  <td class="mono wrap"><a href="/tx/{{.TxID}}">{{.TxID}}</a></td>
+  <td class="mono wrap"><a href="/tx/{{.WTxID}}">{{.WTxID}}</a></td>
+</tr>
+{{else}}
+<tr><td colspan="3">No transactions.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{end}}

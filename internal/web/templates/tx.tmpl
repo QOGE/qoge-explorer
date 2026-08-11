@@ -1,0 +1,92 @@
+{{define "body"}}
+<h1>Transaction</h1>
+<table class="kv-table">
+<tr><th>TxID</th><td class="mono wrap">{{.TxID}}</td></tr>
+<tr><th>WTxID</th><td class="mono wrap">{{.WTxID}}</td></tr>
+<tr><th>Version</th><td>{{.Version}}</td></tr>
+<tr><th>Locktime</th><td>{{.LockTime}}</td></tr>
+<tr><th>Size</th><td>{{.Size}} bytes</td></tr>
+<tr><th>VSize</th><td>{{.VSize}}</td></tr>
+<tr><th>Weight</th><td>{{.Weight}}</td></tr>
+<tr><th>Coinbase</th><td>{{yesNo .IsCoinbase}}</td></tr>
+{{if .FeeQOGE}}<tr><th>Fee</th><td>{{.FeeQOGE}} QOGE <span class="muted">({{.FeeSatoshis}} sats)</span></td></tr>{{end}}
+</table>
+
+<h2>Occurrences</h2>
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>Block Height</th><th>Block Hash</th><th>Tx Index</th><th>Status</th></tr></thead>
+<tbody>
+{{range .Occurrences}}
+<tr>
+  <td><a href="/block/{{.BlockHeight}}">{{.BlockHeight}}</a></td>
+  <td class="mono wrap"><a href="/block/{{.BlockHash}}">{{.BlockHash}}</a></td>
+  <td>{{.TxIndex}}</td>
+  <td>{{if .Canonical}}Canonical{{else}}Orphaned{{end}}</td>
+</tr>
+{{else}}
+<tr><td colspan="4">No recorded occurrence.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+
+<h2>Inputs</h2>
+{{range .Inputs}}
+<div class="io-card">
+  <div class="io-title">Input #{{.VinIndex}}</div>
+  {{if .CoinbaseHex}}
+  <div>Coinbase data: <code class="mono wrap">{{.CoinbaseHex}}</code></div>
+  {{else}}
+  <div>Previous output:
+    {{if .PrevTxID}}<a class="mono wrap" href="/tx/{{.PrevTxID}}">{{.PrevTxID}}</a>:{{.PrevVoutIndex}}{{end}}
+  </div>
+  <div>ScriptSig: <code class="mono wrap">{{.ScriptSigHex}}</code></div>
+  {{end}}
+  <div>Sequence: {{.Sequence}}</div>
+  {{if .Witness}}
+  <div class="witness-block">
+    <div class="witness-heading">Witness ({{len .Witness}} item(s))</div>
+    {{range .Witness}}
+    <div class="witness-item">
+      Item {{.ItemIndex}}: {{.SizeBytes}} bytes
+      {{if .DataHex}}
+      <pre class="raw-hex"><code>{{.DataHex}}</code></pre>
+      {{else}}
+      <span class="muted">(raw data hidden by default)</span>
+      {{end}}
+    </div>
+    {{end}}
+  </div>
+  {{end}}
+</div>
+{{else}}
+<p class="muted">No inputs.</p>
+{{end}}
+
+{{if .IncludeWitness}}
+<p><a href="/tx/{{.TxID}}">Hide raw witness data</a></p>
+{{else}}
+<p><a href="/tx/{{.TxID}}?include_witness=true">Show raw witness data (may be large)</a></p>
+{{end}}
+
+<h2>Outputs</h2>
+{{range .Outputs}}
+<div class="io-card">
+  <div class="io-title">Output #{{.VoutIndex}} &mdash; {{.ScriptType}}</div>
+  <div>Value: {{.ValueQOGE}} QOGE <span class="muted">({{.ValueSatoshis}} sats)</span></div>
+  {{if .Address}}<div>Address: <a class="mono wrap" href="/address/{{.Address}}">{{.Address}}</a></div>{{end}}
+  <div>Status: {{spentLabel .Spent}}</div>
+  <div>ScriptPubKey: <code class="mono wrap">{{.ScriptPubKeyHex}}</code></div>
+  {{if .WitnessVersion}}<div>Witness version: {{.WitnessVersion}}</div>{{end}}
+  {{if .WitnessProgram}}<div>Witness program: <code class="mono wrap">{{.WitnessProgram}}</code></div>{{end}}
+  {{if .Participants}}
+  <div>Participants (not independent balance owners):
+    <ul>{{range .Participants}}<li><a class="mono wrap" href="/address/{{.}}">{{.}}</a></li>{{end}}</ul>
+  </div>
+  {{end}}
+</div>
+{{else}}
+<p class="muted">No outputs.</p>
+{{end}}
+{{end}}

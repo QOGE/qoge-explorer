@@ -196,3 +196,160 @@ func TestSnapshotConsistency_BlockDetail_ConcurrentReorg(t *testing.T) {
 		t.Fatalf("fresh block Canonical = true, want false (A2 is now orphaned)")
 	}
 }
+
+// ExplorerOverview must not mix Status and RecentBlocks across a concurrent
+// reorg: the in-flight composite read's snapshot is fixed on branch
+// A0->A1->A2 before a REAL Store.RollbackTo + Store.ApplyBlock sequence
+// commits a full reorg to branch B0->B1->B2; the in-flight result must
+// still describe branch A entirely (both Status and RecentBlocks), never a
+// tip from one branch paired with recent blocks from the other. A
+// subsequent fresh call must see branch B entirely.
+func TestSnapshotConsistency_ExplorerOverview_ConcurrentReorg(t *testing.T) {
+	ctx := context.Background()
+	q, st, _ := newTestQueryStore(t)
+
+	g := block("snapov-genesis", 0, "", coinbaseTx("snapov-genesis", 100_00000000, "qSnapOvGenesis"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+	a1 := block("snapov-A1", 1, g.Hash, coinbaseTx("snapov-A1", 50_00000000, "qSnapOvA1"))
+	if err := st.ApplyBlock(ctx, a1); err != nil {
+		t.Fatalf("apply A1: %v", err)
+	}
+	a2 := block("snapov-A2", 2, a1.Hash, coinbaseTx("snapov-A2", 50_00000000, "qSnapOvA2"))
+	if err := st.ApplyBlock(ctx, a2); err != nil {
+		t.Fatalf("apply A2: %v", err)
+	}
+
+	ss := newSnapshotSync(t)
+
+	type result struct {
+		overview ExplorerOverview
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		o, err := q.ExplorerOverview(ctx, 10)
+		done <- result{o, err}
+	}()
+
+	ss.waitForSnapshot(t)
+
+	// Concurrently, through the REAL Store, reorg branch A entirely away.
+	if err := st.RollbackTo(ctx, g.Hash); err != nil {
+		t.Fatalf("rollback to genesis: %v", err)
+	}
+	b1 := block("snapov-B1", 1, g.Hash, coinbaseTx("snapov-B1", 50_00000000, "qSnapOvB1"))
+	if err := st.ApplyBlock(ctx, b1); err != nil {
+		t.Fatalf("apply B1: %v", err)
+	}
+	b2 := block("snapov-B2", 2, b1.Hash, coinbaseTx("snapov-B2", 50_00000000, "qSnapOvB2"))
+	if err := st.ApplyBlock(ctx, b2); err != nil {
+		t.Fatalf("apply B2: %v", err)
+	}
+
+	ss.release()
+	r := <-done
+	ss.disable()
+	if r.err != nil {
+		t.Fatalf("in-flight ExplorerOverview: %v", r.err)
+	}
+	if r.overview.Status.IndexedHash == nil || *r.overview.Status.IndexedHash != a2.Hash {
+		t.Fatalf("in-flight Status.IndexedHash = %v, want %s (must reflect the snapshot fixed BEFORE the concurrent reorg)", r.overview.Status.IndexedHash, a2.Hash)
+	}
+	if len(r.overview.RecentBlocks.Blocks) == 0 || r.overview.RecentBlocks.Blocks[0].Hash != a2.Hash {
+		t.Fatalf("in-flight RecentBlocks[0] = %+v, want hash %s", r.overview.RecentBlocks.Blocks, a2.Hash)
+	}
+
+	fresh, err := q.ExplorerOverview(ctx, 10)
+	if err != nil {
+		t.Fatalf("fresh ExplorerOverview: %v", err)
+	}
+	if fresh.Status.IndexedHash == nil || *fresh.Status.IndexedHash != b2.Hash {
+		t.Fatalf("fresh Status.IndexedHash = %v, want %s", fresh.Status.IndexedHash, b2.Hash)
+	}
+	if len(fresh.RecentBlocks.Blocks) == 0 || fresh.RecentBlocks.Blocks[0].Hash != b2.Hash {
+		t.Fatalf("fresh RecentBlocks[0] = %+v, want hash %s", fresh.RecentBlocks.Blocks, b2.Hash)
+	}
+}
+
+// AddressDetail must not mix AddressSummary and AddressHistory across a
+// concurrent reorg: branch A pays qSnapshotAddress 30 QOGE in A1; the
+// in-flight composite read's snapshot is fixed before a REAL
+// Store.RollbackTo + Store.ApplyBlock(B1) commits a reorg to a branch that
+// never pays that address. The in-flight result must still show the
+// snapshot-time balance AND history together (30 QOGE, A1 present), never a
+// balance from one branch paired with history from the other. A fresh call
+// afterward must see branch B entirely (0 QOGE, A1 absent).
+func TestSnapshotConsistency_AddressDetail_ConcurrentReorg(t *testing.T) {
+	ctx := context.Background()
+	q, st, _ := newTestQueryStore(t)
+
+	const addr = "qSnapshotAddress"
+
+	g := block("snapad-genesis", 0, "", coinbaseTx("snapad-genesis", 100_00000000, "qSnapAdGenesis"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+	a1 := block("snapad-A1", 1, g.Hash, coinbaseTx("snapad-A1", 30_00000000, addr))
+	if err := st.ApplyBlock(ctx, a1); err != nil {
+		t.Fatalf("apply A1: %v", err)
+	}
+	a1Txid := a1.Transactions[0].TxID
+
+	ss := newSnapshotSync(t)
+
+	type result struct {
+		detail AddressDetail
+		err    error
+	}
+	done := make(chan result, 1)
+	go func() {
+		d, err := q.AddressDetail(ctx, addr, nil, nil, 10)
+		done <- result{d, err}
+	}()
+
+	ss.waitForSnapshot(t)
+
+	// Concurrently, through the REAL Store, reorg to a branch that never
+	// pays addr.
+	if err := st.RollbackTo(ctx, g.Hash); err != nil {
+		t.Fatalf("rollback to genesis: %v", err)
+	}
+	b1 := block("snapad-B1", 1, g.Hash, coinbaseTx("snapad-B1", 30_00000000, "qSnapAdOther"))
+	if err := st.ApplyBlock(ctx, b1); err != nil {
+		t.Fatalf("apply B1: %v", err)
+	}
+
+	ss.release()
+	r := <-done
+	ss.disable()
+	if r.err != nil {
+		t.Fatalf("in-flight AddressDetail: %v", r.err)
+	}
+	if r.detail.Summary.BalanceSatoshis != 30_00000000 {
+		t.Fatalf("in-flight balance = %d sats, want 30_00000000 (must reflect the snapshot fixed BEFORE the concurrent reorg)", r.detail.Summary.BalanceSatoshis)
+	}
+	found := false
+	for _, e := range r.detail.History.Transactions {
+		if e.TxID == a1Txid {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("in-flight history = %+v, want A1's tx %s present", r.detail.History.Transactions, a1Txid)
+	}
+
+	fresh, err := q.AddressDetail(ctx, addr, nil, nil, 10)
+	if err != nil {
+		t.Fatalf("fresh AddressDetail: %v", err)
+	}
+	if fresh.Summary.BalanceSatoshis != 0 {
+		t.Fatalf("fresh balance = %d sats, want 0", fresh.Summary.BalanceSatoshis)
+	}
+	for _, e := range fresh.History.Transactions {
+		if e.TxID == a1Txid {
+			t.Fatalf("fresh history unexpectedly contains orphaned A1 tx %s: %+v", a1Txid, fresh.History.Transactions)
+		}
+	}
+}
