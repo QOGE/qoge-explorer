@@ -1,0 +1,14 @@
+{{define "header"}}
+<header class="site-header">
+  <div class="container header-inner">
+    <a class="brand" href="/">QOGE Explorer</a>
+    <form class="search-form" action="/search" method="get">
+      <input type="text" name="q" placeholder="Block height, hash, txid, wtxid, or address" maxlength="128" autocomplete="off" spellcheck="false">
+      <button type="submit">Search</button>
+    </form>
+    <nav class="site-nav">
+      <a href="/blocks">Blocks</a>
+    </nav>
+  </div>
+</header>
+{{end}}

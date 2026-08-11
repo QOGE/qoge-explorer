@@ -1,0 +1,31 @@
+{{define "body"}}
+<h1>Address</h1>
+<div class="mono wrap address-heading">{{.Summary.Address}}</div>
+<table class="kv-table">
+<tr><th>Balance</th><td>{{.Summary.BalanceQOGE}} QOGE <span class="muted">({{.Summary.BalanceSatoshis}} sats)</span></td></tr>
+<tr><th>Total Received</th><td>{{.Summary.TotalReceivedQOGE}} QOGE <span class="muted">({{.Summary.TotalReceivedSatoshis}} sats)</span></td></tr>
+<tr><th>Total Sent</th><td>{{.Summary.TotalSentQOGE}} QOGE <span class="muted">({{.Summary.TotalSentSatoshis}} sats)</span></td></tr>
+<tr><th>Tx Count</th><td>{{.Summary.TxCount}}</td></tr>
+{{if .Summary.FirstSeenHeight}}<tr><th>First Seen Height</th><td><a href="/block/{{.Summary.FirstSeenHeight}}">{{.Summary.FirstSeenHeight}}</a></td></tr>{{end}}
+{{if .Summary.LastSeenHeight}}<tr><th>Last Seen Height</th><td><a href="/block/{{.Summary.LastSeenHeight}}">{{.Summary.LastSeenHeight}}</a></td></tr>{{end}}
+</table>
+
+<h2>History</h2>
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>TxID</th><th>Block Height</th><th>Block Hash</th></tr></thead>
+<tbody>
+{{range .History}}
+<tr>
+  <td class="mono wrap"><a href="/tx/{{.TxID}}">{{.TxID}}</a></td>
+  <td><a href="/block/{{.BlockHeight}}">{{.BlockHeight}}</a></td>
+  <td class="mono wrap"><a href="/block/{{.BlockHash}}">{{.BlockHash}}</a></td>
+</tr>
+{{else}}
+<tr><td colspan="3">No canonical history for this address.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{template "pagination" .Pagination}}
+{{end}}

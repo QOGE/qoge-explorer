@@ -1,0 +1,7 @@
+{{define "pagination"}}
+{{if .HasNext}}
+<div class="pagination">
+  <a class="btn" href="{{.NextURL}}">Older &rarr;</a>
+</div>
+{{end}}
+{{end}}

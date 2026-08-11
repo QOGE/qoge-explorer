@@ -1,0 +1,32 @@
+{{define "blocktable"}}
+<div class="table-scroll">
+<table class="data-table">
+<thead>
+<tr>
+  <th>Height</th>
+  <th>Hash</th>
+  <th>Time (UTC)</th>
+  <th>Txs</th>
+  <th>Size</th>
+  <th>Weight</th>
+  <th>Difficulty</th>
+</tr>
+</thead>
+<tbody>
+{{range .}}
+<tr>
+  <td><a href="/block/{{.Height}}">{{.Height}}</a></td>
+  <td class="mono wrap"><a href="/block/{{.Hash}}">{{.Hash}}</a></td>
+  <td>{{formatTimeUTC .Time}}</td>
+  <td>{{.TxCount}}</td>
+  <td>{{.Size}} B</td>
+  <td>{{.Weight}}</td>
+  <td>{{.Difficulty}}</td>
+</tr>
+{{else}}
+<tr><td colspan="7">No blocks indexed yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{end}}

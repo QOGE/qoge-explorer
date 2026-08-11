@@ -2508,4 +2508,201 @@ their PostgreSQL-backed tests (never fail `go test ./...`) when
 `QOGE_TEST_DATABASE_URL` is unset, matching every prior phase's
 convention.
 
-This phase does not implement a public explorer HTML web UI.
+This phase does not implement a public explorer HTML web UI — see §20 for
+Phase 2E.1, which adds one as a sibling of this API over the same
+`query.Store`.
+
+## 20. Server-rendered HTML explorer UI (Phase 2E.1)
+
+Phase 2E.1 adds the first public HTML interface: `internal/web`, a
+PRESENTATION-ONLY package server-rendering pages from the same
+already-reviewed `query.Store` §19 introduced. Nothing in `migrations/`,
+`Store`'s write path, `internal/decode`, `internal/script`,
+`internal/chain`, `internal/indexer`, or `internal/query` changes; §19's
+`internal/api` also has ZERO behavioral diff — every fact this phase
+displays already existed as an exported `query.Store` method before this
+phase began, so no query/schema expansion was needed for any page.
+
+### `internal/web` is a sibling of `internal/api`, not a client of it
+
+```
+Qogecoin Core -> decoder -> Store/PostgreSQL -> indexer -> query.Store
+                                                              ├── internal/api  (JSON)
+                                                              └── internal/web  (HTML)
+```
+
+Both packages depend only on `internal/query`'s exported API and hold a
+`*query.Store`, never a write `internal/store.Store`, `internal/indexer`,
+`internal/rpc`, or `internal/decode`. Critically, `internal/web` never
+makes an HTTP call to `internal/api` (or vice versa) — that would add a
+loopback network dependency and a second, redundant read path for data
+`query.Store` already serves directly. `cmd/qoge-explorer/main.go`'s
+`newRootHandler` composes them as siblings under one `http.ServeMux`:
+`/api/`, `/healthz`, and `/readyz` delegate to `api.New(...)`; every other
+path delegates to `web.New(...)`. Both handlers run inside the same
+`qoge-explorer serve` process/listener `index` and `serve` have always
+been split from — `serve` still requires `QOGE_DATABASE_URL` and never
+Core RPC credentials, and `index` remains the only process that writes.
+
+### Rendering: `html/template`, embedded templates and assets, no build step
+
+`internal/web` uses `html/template` exclusively — never `text/template` —
+so every blockchain-derived string (addresses, script/witness hex, txids,
+block hashes, the raw `?q=` search value) is auto-escaped by default; no
+handler ever wraps a stored value in `template.HTML`. Templates
+(`internal/web/templates/*.tmpl`) and the one stylesheet
+(`internal/web/static/app.css`) are embedded via `//go:embed`
+(`templates.go`), so the built binary has no working-directory dependency
+and can be launched from anywhere. There is no Node/npm/webpack/Vite/
+Tailwind-build step and no external CDN dependency — a system font stack
+only. Each page is parsed as `layout.tmpl` + `header.tmpl` + `footer.tmpl`
++ `pagination.tmpl` + `blocktable.tmpl` + that page's own file defining a
+`"body"` block (`loadTemplates`), the standard shared-layout idiom that
+lets every page reuse the same `"body"`/`"layout"` template names without
+a name collision, and is rendered via `ExecuteTemplate(w, "layout", ...)`.
+A parse failure is a build-time defect in the embedded template set
+itself (never a runtime/data condition), so `web.New` panics on one and
+`TestTemplatesParse` parses every page in every test run.
+
+### Routes
+
+```
+GET /                              home: indexed tip + recent canonical blocks
+GET /blocks                        canonical blocks, keyset-paginated
+GET /block/{id}                    height (canonical-only) or 64-hex hash (canonical or orphan)
+GET /tx/{id}                       txid, falling back to wtxid on a miss
+GET /address/{address}             balance summary + canonical history
+GET /search?q=...                  conservative redirect/resolve, see below
+GET /static/{path}                 embedded CSS
+```
+
+Routing mirrors `internal/api/server.go`'s reviewed precedence pattern
+exactly: every known path is registered twice — once as `"GET
+<pattern>"` for the real handler, once as the bare `"<pattern>"` for a
+same-path wrong-method fallback — plus one final unrestricted `"/"`
+catch-all. The fallback and catch-all render the shared HTML error page
+(`templates/error.tmpl`) instead of JSON — `internal/web/web.go`'s
+`knownGETRoutes`/`routes()`.
+
+### Canonical/orphan visual semantics
+
+Block/transaction lookups reuse `query.Store`'s existing semantics
+unchanged: `BlockByHeight` is canonical-only (there is no orphan-by-height
+route or lookup), `BlockByHash` returns canonical OR orphaned blocks, and
+the orphan case renders a clearly-labeled, non-alarmist banner ("Orphaned
+block — retained for historical/audit view") — never styled to look
+canonical. Transaction occurrence rows likewise show each occurrence's own
+canonical/orphaned status, never collapsed to a single flag.
+
+### Address balance vs. history remain independent
+
+`templates/address.tmpl` renders `AddressSummary` (balance/accounting,
+from the `addresses` cache) and `AddressHistory` (canonical destination
+visibility, built from immutable relations) exactly as `query.Store`
+returns them, with no reconciliation attempted in the template or
+handler. A genesis-only P2PK destination therefore legitimately renders
+`0.00000000 QOGE` balance while still showing its canonical genesis
+transaction in history — this is not "fixed" in the UI, matching §19's
+"Address history vs. UTXO eligibility". Bare multisig participant
+addresses are rendered under a clearly separate "Participants" label on
+the transaction page, are never called a recipient/owner, and (being
+`output_participants` identities, not `output_addresses` ones) never
+appear in their own `AddressHistory`/`AddressSummary`.
+
+### P2QPK large-witness default-hidden policy
+
+`templates/tx.tmpl` never renders a witness item's `data_hex` unless the
+caller explicitly requested it — the same `?include_witness=true` opt-in
+`internal/api` already used, now also available as a same-page link/toggle
+on `/tx/{id}`. The default view shows each witness item's `item_index` and
+exact `size_bytes` (e.g. "Item 0: 17088 bytes... (raw data hidden by
+default)") with no hex at all; opting in renders the byte-exact hex inside
+a wrapping, horizontally-scrollable `<pre><code>` block
+(`pre.raw-hex` in `app.css`) so a 17,088-byte signature cannot force the
+page wider than the viewport. The raw bytes are never logged and no
+SLH-DSA verification is attempted anywhere in this package. The witness
+items on an INPUT (a spend) are rendered generically ("Item 0", "Item 1"
++ size) with no semantic label — they are never called "the public key,"
+which is deliberately reserved for a P2QPK OUTPUT's separate,
+structurally-distinct `witness_program` field (v2/32 bytes, shown next to
+the OUTPUT's own script type and stored address) — the two are visibly
+different sections of the page (Inputs vs. Outputs) so they are never
+conflated. P2TR (v1/32) and P2QPK (v2/32) outputs render with the
+decoder-assigned `script_type` string `query.Store` already returns
+(`p2tr` vs. `p2qpk`) — `internal/web` performs no script classification
+of its own.
+
+### Search
+
+`GET /search?q=...` resolves conservatively and deterministically, never
+querying Core and never running a broad SQL search
+(`handlers_search.go`): a non-negative decimal integer redirects straight
+to `/block/{height}` (the block page's own existence check applies, not
+duplicated in search); exactly 64 lowercase hex characters is tried, in
+this fixed order, against `BlockByHash`, then `TransactionByTxID`, then
+`TransactionByWTxID` — the first hit redirects there, and no hit renders
+an explicit "nothing matched" result page rather than guessing which
+identity space it might have belonged to; anything else within the
+ordinary address-shape bound (`isValidAddressShape`, mirroring
+`internal/api/validate.go`'s) redirects to `/address/{address}`. Input is
+length-bounded before any of this runs.
+
+### HTML error pages and security headers
+
+`/`, `/blocks`, `/block/{id}`, `/tx/{id}`, `/address/{address}`, and
+`/search` return HTML 400/404/405/500 pages sharing the same layout
+(`templates/error.tmpl`) — never a JSON body, and never a raw Go error
+string, SQL fragment, database URL, or stack trace; a real 500 is logged
+server-side via `slog` and the client only ever sees a fixed, generic
+message (`errors.go`'s `renderInternalError`, mirroring
+`internal/api/errors.go`'s `writeInternalError`). Every `internal/web`
+response — HTML pages, the static handler, and error pages alike — sets
+`X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a
+self-only `Content-Security-Policy` (`default-src 'self'; style-src
+'self'; img-src 'self'`; no inline scripts/styles are used anywhere in
+this phase). `internal/api`'s existing JSON headers/error contract are
+completely unmodified — `internal/web` never touches that package.
+
+### Time and money display
+
+Block timestamps render as an unambiguous absolute UTC string (e.g.
+`2026-08-11 02:34:56 UTC`, `formatTimeUTC` in `helpers.go`) — never
+server-local time, and this phase does not (yet) add a relative-time
+display. Monetary values use `query.Store`'s existing exact QOGE decimal
+strings (`ValueQOGE`, `BalanceQOGE`, `FeeQOGE`, ...) directly; satoshis
+are shown alongside as secondary text. `internal/web` never parses a
+monetary string into `float64` for formatting — the same "no float
+monetary path" invariant §19 established.
+
+### No live refresh yet
+
+Phase 2E.1 pages are deterministic, fully server-rendered on each
+request — no WebSockets, no SSE, no polling/auto-refresh JavaScript, and
+no mempool UI. The explorer remains fully usable with JavaScript
+disabled; this phase ships no JavaScript at all. Live-refresh and mempool
+features are explicitly deferred to a later phase.
+
+### Testing
+
+`internal/web`'s tests build canonical (and, for reorg/orphan cases,
+deliberately non-canonical) state through the real `Store.ApplyBlock`/
+`RollbackTo` — never ad-hoc SQL — using the same `chain.Block`-literal and
+`decode.DecodeBlock`-pipeline fixture patterns `internal/api` and
+`internal/query` already established (duplicated per-package on purpose,
+per this repo's existing convention — see `internal/web/dbtest_test.go`'s
+note), then exercise `Server.ServeHTTP` via `httptest` and assert on the
+rendered HTML body. This includes a dedicated escaping-regression test
+(`security_test.go`) that writes a real canonical output whose `address`
+is `<script>alert(1)</script>&"'` through `Store.ApplyBlock` — addresses
+are treated as opaque, unvalidated strings at every layer down to the
+schema, so this is a genuinely reachable value, not a weakened model —
+and asserts the rendered `/address/{...}` and `/tx/{...}` pages contain
+the escaped form and never the raw tag. `cmd/qoge-explorer/serve_test.go`
+separately confirms the actual route composition (`newRootHandler`): JSON
+routes stay JSON, HTML routes stay HTML, and `/healthz`/`/readyz` behavior
+is byte-for-byte unchanged from §19. All PostgreSQL-backed tests skip
+(never fail `go test ./...`) when `QOGE_TEST_DATABASE_URL` is unset,
+matching every prior phase.
+
+This phase does not add WebSockets/SSE/polling, a mempool view, or any
+JavaScript beyond what a future progressive-enhancement pass might add.
