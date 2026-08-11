@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/decode"
 	"github.com/QOGE/qoge-explorer/internal/indexer"
 	"github.com/QOGE/qoge-explorer/internal/logging"
+	"github.com/QOGE/qoge-explorer/internal/mempool"
 	"github.com/QOGE/qoge-explorer/internal/query"
 	"github.com/QOGE/qoge-explorer/internal/rpc"
 	"github.com/QOGE/qoge-explorer/internal/store"
@@ -81,8 +83,14 @@ Usage:
                                      then historically sync from genesis (or
                                      resume from the last checkpoint) and
                                      poll for new blocks/reorgs until
-                                     SIGINT/SIGTERM. No API/UI. Run this as a
-                                     separate process from serve.
+                                     SIGINT/SIGTERM. Also runs the mempool
+                                     cache synchronizer (Phase 2F.1) against
+                                     the same Core node, isolated from
+                                     confirmed chain state; a mempool
+                                     refresh failure is logged and retried,
+                                     never halts confirmed indexing. No
+                                     API/UI. Run this as a separate process
+                                     from serve.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -386,13 +394,47 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 	pollInterval := time.Duration(cfg.IndexPollSeconds) * time.Second
 	idx := indexer.New(client, st, resolver, pollInterval, log)
 
+	// The mempool synchronizer runs alongside confirmed indexing, on the
+	// same process (it needs the same Core RPC credentials `serve`
+	// deliberately never has — docs/ARCHITECTURE.md §22) but against
+	// entirely separate PostgreSQL tables (migrations/
+	// 0002_mempool_cache.up.sql), sharing only the read-only confirmed
+	// checkpoint and the same address resolver (safe to share: it's just
+	// an in-memory pubkey->address cache guarded by its own mutex — see
+	// decode.CoreAddressResolver). mempoolCtx is cancelled explicitly
+	// after idx.Run returns, whether or not idx.Run itself observed ctx
+	// cancellation, so a confirmed-indexing halt (a real error, not a
+	// clean shutdown) still stops the mempool synchronizer rather than
+	// leaking its goroutine.
+	mempoolCtx, cancelMempool := context.WithCancel(ctx)
+	defer cancelMempool()
+
+	mempoolStore := mempool.NewStore(pool)
+	mempoolSync := mempool.New(client, st, mempoolStore, resolver, mempool.DefaultPollInterval, log)
+
+	var mempoolWG sync.WaitGroup
+	mempoolWG.Add(1)
+	go func() {
+		defer mempoolWG.Done()
+		mempoolSync.Run(mempoolCtx)
+	}()
+
 	log.Info("starting indexer", "poll_interval", pollInterval.String())
 	// idx.Run returns nil on a clean SIGINT/SIGTERM shutdown; any non-nil
 	// error is a deterministic halt (decode/store/integrity/deep-reorg
 	// failure) that a process supervisor should treat as a failed exit,
-	// not silently retry.
-	if err := idx.Run(ctx); err != nil {
-		log.Error("indexer halted", "error", err)
+	// not silently retry. A mempool refresh failure NEVER surfaces here —
+	// mempool.Synchronizer.Run logs and retries its own failures
+	// internally and never returns an error at all (docs/ARCHITECTURE.md
+	// §22): confirmed indexing remains authoritative and is never halted
+	// by mempool trouble.
+	runErr := idx.Run(ctx)
+
+	cancelMempool()
+	mempoolWG.Wait()
+
+	if runErr != nil {
+		log.Error("indexer halted", "error", runErr)
 		return 1
 	}
 	log.Info("indexer stopped")
