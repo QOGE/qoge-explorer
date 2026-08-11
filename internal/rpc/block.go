@@ -72,6 +72,19 @@ type RawTransaction struct {
 	Weight   *int    `json:"weight"`
 	LockTime *uint32 `json:"locktime"`
 
+	// BlockHash is present only when Core's getrawtransaction/getblock
+	// verbose output reports the block the transaction is confirmed in
+	// (Core's "blockhash" field — TxToUniv only sets it when a
+	// confirming block is known). It is absent (nil) for a mempool
+	// transaction, present for a confirmed one. `getblock <hash> 2`
+	// never supplies this key (every tx in a block response is
+	// confirmed-by-construction, so DecodeBlock never inspects this
+	// field); it exists on this shared DTO purely so
+	// internal/mempool can call GetRawTransactionVerbose and detect a
+	// transaction that was confirmed between listing and fetching —
+	// see docs/ARCHITECTURE.md §22.
+	BlockHash *string `json:"blockhash,omitempty"`
+
 	// Vin/Vout are plain slices — see Tx's doc comment above for why a nil
 	// check on the slice itself is already a reliable presence check.
 	Vin  []RawVin  `json:"vin"`

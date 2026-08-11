@@ -3013,3 +3013,222 @@ auto-refresh (address pages only update on an explicit user refresh, same
 as every other detail page). Mempool has different, ephemeral consistency
 semantics from confirmed-chain PostgreSQL state and remains a dedicated
 future phase.
+
+## 22. Mempool cache foundation (Phase 2F.1)
+
+Phase 2F.1 adds the first mempool (unconfirmed-transaction) support:
+Core mempool RPC acquisition, strict transaction decoding, and an
+isolated, atomically-replaceable PostgreSQL cache (`internal/mempool`,
+`migrations/0002_mempool_cache.up.sql`). It adds NO public read API or
+UI — `internal/query`, `internal/api`, and `internal/web` all have ZERO
+diff from Phase 2E.2. `internal/store`, `internal/chain`,
+`internal/script`, and `internal/decode`'s own decoding *behavior* are
+similarly untouched; the only decode-adjacent change is a new optional
+`BlockHash` field on `rpc.RawTransaction` (see "Confirmed-transaction
+detection" below), which `DecodeBlock`/`DecodeTransaction` never inspect.
+
+### Mempool state is a fundamentally different model from confirmed state
+
+Confirmed chain state flows Core -> `internal/indexer` -> immutable
+confirmed transaction/block tables + canonical mutable UTXO/address
+state, forever (subject only to an audited reorg rollback). Mempool state
+flows Core -> `internal/mempool.Synchronizer` -> a completely
+**replaceable** ephemeral PostgreSQL cache. A mempool transaction can
+disappear, be replaced (RBF), expire, conflict, or become confirmed at
+any moment; it must never become permanent historical data merely
+because it was observed once. Concretely:
+
+- No `mempool_*` table has a REQUIRED foreign key into `transactions`,
+  `blocks`, `utxo_state`, `addresses`, or `sync_state` — a mempool
+  transaction can depend on a confirmed prevout or another mempool
+  transaction without coupling its lifetime to confirmed tables.
+- Confirmed tables are never written by anything in `internal/mempool` —
+  enforced in tests by `TestConfirmedState_UnaffectedByMempoolReplacement`,
+  which snapshots the exact (not just row-count) content of every
+  confirmed table before and after a mempool replacement.
+- `addresses`/`utxo_state` are never updated for mempool activity — no
+  pending balance, no pending received/sent, no spendable-including-
+  mempool figure exists anywhere yet. That is a separately reviewed
+  future decision, not an implicit side effect of this phase.
+
+### `serve` remains Core-RPC-independent
+
+`qoge-explorer serve` still requires only PostgreSQL and never Core RPC
+credentials — unchanged from every prior phase. `internal/mempool` is
+wired in only by `qoge-explorer index` (`cmd/qoge-explorer/main.go`'s
+`runIndex`), the process that already holds Core credentials. The
+mempool synchronizer runs as a second goroutine alongside the confirmed
+`indexer.Indexer.Run` loop, sharing the same `rpc.Client` and the same
+`decode.AddressResolver` (safe to share — it's an in-memory pubkey ->
+address cache guarded by its own mutex) but writing to entirely separate
+tables.
+
+### mempool_state: explicit initialized/uninitialized, never a fake anchor
+
+`mempool_state` is a singleton row (`name = 'main'`) whose `initialized`
+boolean distinguishes "never successfully synchronized" from
+"successfully synchronized" — including the legitimate "successfully
+synchronized and currently empty" case (`initialized = true,
+tx_count = 0`, which is NOT the same state as never having synchronized
+at all). There is no fake/placeholder Core tip hash used as bootstrap
+state, mirroring `sync_state`'s own `indexed_height = -1,
+indexed_block_hash = NULL` bootstrap representation. A CHECK constraint
+(`mempool_state_initialized_consistency`) makes every other combination
+of fields structurally unrepresentable, written so it always evaluates
+to TRUE or FALSE (never an ambiguous NULL that Postgres would treat as
+"passes") — the same defensive pattern
+`transaction_outputs_witness_metadata_consistency` in
+`0001_initial.up.sql` already established.
+
+### Isolated, normalized mempool tables
+
+`mempool_transactions` / `mempool_inputs` / `mempool_input_witness` /
+`mempool_outputs` / `mempool_output_addresses` /
+`mempool_output_participants` / `mempool_dependencies` mirror the
+confirmed schema's shape and invariants closely, with two deliberate
+differences:
+
+- A mempool transaction has exactly one observed witness serialization
+  at a time (the current snapshot) — there is no confirmed-style
+  `transactions`/`transaction_variants` split; txid and wtxid both live
+  on `mempool_transactions` directly.
+- `mempool_inputs.prev_txid`/`prev_vout_index` are `NOT NULL` — a
+  coinbase-shaped transaction can never be valid mempool data (Core's
+  mempool never contains one; this is defense in depth, enforced at
+  three independent layers: `Candidate.validate()` in-memory,
+  `mempool.Synchronizer.fetchAndDecode`'s explicit `IsCoinbase` check,
+  and this NOT NULL).
+
+`mempool_output_addresses` (balance-accounting destination, at most one
+row per output) vs. `mempool_output_participants` (bare-multisig
+co-signer identities) is the exact same structurally-enforced
+distinction as confirmed `output_addresses`/`output_participants`
+(trigger-enforced: a multisig output can never get an
+`mempool_output_addresses` row, and vice versa) — never double-crediting
+a multisig output's value once per participant.
+
+`mempool_dependencies` — Core's per-entry `"depends"` list — is two
+foreign keys into `mempool_transactions(txid)`, so a dependency can only
+ever reference another transaction that is part of the SAME candidate
+snapshot; a dangling mempool-only reference is rejected, not silently
+stored (`TestReplaceSnapshot_DanglingDependencyRejected`).
+
+### Full replacement, not additive deltas
+
+`internal/mempool.Store.ReplaceSnapshot` is the only write path. Every
+`mempool_*` child table cascades from `mempool_transactions` via
+`ON DELETE CASCADE`, so `DELETE FROM mempool_transactions` atomically
+clears the entire previous snapshot in one statement; the complete new
+snapshot is then inserted, and `mempool_state` is updated LAST — all
+inside one PostgreSQL transaction that also holds a `FOR UPDATE` lock on
+the `mempool_state` row for its whole duration, serializing concurrent
+writers exactly the way `internal/store`'s canonical-mutation lock does.
+If any step fails, the whole transaction rolls back and the previous
+complete snapshot is exactly as it was — a half-replaced mempool is
+never observable. `generation` increments once per successful commit,
+including a non-empty -> empty transition (an observed empty mempool is
+real synchronized state), and never on a failed or skipped refresh.
+
+### Confirmed-transaction detection: `getrawtransaction`'s optional `blockhash`
+
+`rpc.RawTransaction` gained one new optional field, `BlockHash`
+(`json:"blockhash,omitempty"`) — Core's verbose transaction response
+includes `"blockhash"` once a transaction is confirmed, and omits it
+while unconfirmed. `getblock <hash> 2` never supplies this key (every
+transaction in a block response is confirmed by construction), so
+`DecodeBlock` never inspects it; only `internal/mempool`'s
+`fetchAndDecode` checks it, to detect a transaction that became
+confirmed between being listed by `getrawmempool` and being fetched by
+`getrawtransaction` (see "Snapshot acquisition" below).
+
+### Snapshot acquisition: anchored, not atomic — because it cannot be
+
+Core RPC and PostgreSQL can never share one atomic snapshot. Each
+`Synchronizer.refreshOnce` cycle closes the practical race window
+(without eliminating it mathematically) by checking, in order:
+
+1. Read the confirmed PostgreSQL checkpoint and Core's active tip;
+   require them to match exactly (height AND hash) before doing any
+   mempool work at all. If the confirmed index is still catching up to
+   Core (initial historical sync, or merely lagging), this cycle
+   publishes nothing (`ErrConfirmedIndexBehind`) — a mempool snapshot
+   must never be anchored to a confirmed-state view a future read layer
+   cannot trust.
+2. `getrawmempool true` for the candidate transaction id set.
+3. Sequentially (never unbounded-concurrent — spec item 32)
+   `getrawtransaction <txid> true` and strictly decode each one via the
+   SAME `decode.DecodeTransaction` confirmed-chain decoding uses. A
+   transaction that disappeared (RPC error) or gained a `BlockHash`
+   (became confirmed) mid-fetch discards the WHOLE candidate
+   (`ErrMempoolRace`) — this is a normal, expected mempool race, not
+   corruption; the previously committed snapshot is left untouched and
+   the next poll cycle retries.
+4. Re-read Core's active tip and the confirmed checkpoint; require BOTH
+   to still exactly match their initial readings from step 1. Any
+   mismatch discards the candidate the same way step 3 does.
+5. Only then: `Store.ReplaceSnapshot`, anchored to the tip height/hash
+   observed in step 4.
+
+Every fee value (`getrawmempool`'s `fees.base`) is converted to exact
+satoshis via the SAME `decode.DecodeAmount` confirmed-chain amounts use
+— `json.Number` text/integer arithmetic only, never `float64`; more than
+8 fractional digits, a negative value, or a malformed number all discard
+the candidate rather than substituting a rounded or zero value
+(`TestRefreshOnce_ExactFeeParsing`).
+
+### Mempool failures never halt confirmed indexing
+
+`Synchronizer.Run` never returns an error at all — every failure mode
+(a plain RPC error, `ErrConfirmedIndexBehind`, `ErrMempoolRace`, a
+malformed candidate) is logged (`Warn` for a race/failure, `Debug` for
+the ordinary "confirmed index still catching up" skip) and retried on
+the next poll cycle, preserving whatever snapshot was last committed.
+`cmd/qoge-explorer`'s `runIndex` starts the mempool synchronizer in a
+second goroutine bound to a context derived from (and always cancelled
+alongside) confirmed indexing's own context, and `wg.Wait()`s for it
+before returning — a confirmed-indexing halt (a real error, not just a
+clean SIGINT/SIGTERM shutdown) still stops the mempool synchronizer
+rather than leaking its goroutine, but a mempool failure can never
+surface as `runIndex`'s exit code. Confirmed indexing's existing fatal-
+error behavior (docs §18) is completely unchanged.
+
+### Poll interval
+
+A conservative package default, `mempool.DefaultPollInterval = 10s` — no
+sub-second polling against Core, no new environment variable (a bare
+package constant is sufficient for this phase, matching
+`indexer.DefaultPollInterval`'s own precedent).
+
+### Testing
+
+Every `internal/mempool` test that needs PostgreSQL uses the same
+disposable-per-test-schema pattern as `internal/store`/`internal/query`
+(skips, never fails, when `QOGE_TEST_DATABASE_URL` is unset). Race/retry
+behavior (confirmed-index-behind, Core tip moving mid-acquisition, DB tip
+moving mid-acquisition, a listed transaction disappearing or becoming
+confirmed mid-fetch, a transient RPC error) is tested with a fully
+deterministic fake `RPCClient`/`ConfirmedTipReader` — no sleep-based
+timing assumptions anywhere. P2QPK (structural witness v2/32, exact
+17,088+32-byte spend witness, byte-exact on read-back), the P2TR
+negative control, an explicitly-guarded txid != wtxid fixture, bare
+multisig (participants never credited as a balance destination), and
+OP_RETURN/zero-value-output persistence are all driven through the real
+`rpc.RawTransaction -> decode.DecodeTransaction -> mempool.Candidate ->
+Store.ReplaceSnapshot -> raw PostgreSQL verification` pipeline — never a
+hand-inserted row that bypasses the decoder or classifier.
+`TestConfirmedState_UnaffectedByMempoolReplacement` seeds a real
+confirmed chain through `store.ApplyBlock`, captures exact per-table
+content (not just row counts) of every confirmed table, runs successful
+mempool replacements, and requires byte-identical confirmed state
+afterward.
+
+### Explicitly deferred to Phase 2F.2
+
+No `/api/v1/mempool`, no `/mempool` page, no mempool navigation, no
+transaction-detail fallback to mempool data, no address pending-activity
+display, no `live.js` mempool polling, no pending/spendable-including-
+mempool balance figures. Phase 2F.2 adds the read-only query layer, JSON
+API, and functional (unstyled) SSR mempool pages on top of the
+foundation this phase lays down; visual polishing remains deferred until
+all functional phases are complete, per the project's existing phase
+ordering.
