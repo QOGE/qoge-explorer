@@ -14,7 +14,7 @@
 </thead>
 <tbody>
 {{range .}}
-<tr>
+<tr data-block-height="{{.Height}}" data-block-hash="{{.Hash}}">
   <td><a href="/block/{{.Height}}">{{.Height}}</a></td>
   <td class="mono wrap"><a href="/block/{{.Hash}}">{{.Hash}}</a></td>
   <td>{{formatTimeUTC .Time}}</td>

@@ -1,5 +1,11 @@
 {{define "body"}}
 <h1>Blocks</h1>
+{{if .FirstPage}}
+<div data-live-refresh="blocks">
 {{template "blocktable" .Blocks}}
+</div>
+{{else}}
+{{template "blocktable" .Blocks}}
+{{end}}
 {{template "pagination" .Pagination}}
 {{end}}

@@ -266,6 +266,29 @@ pre.raw-hex code {
   color: var(--warn-text);
 }
 
+/* Live chain-update notification (Phase 2E.2) */
+
+.live-banner {
+  margin: 0 auto;
+  margin-top: 0.75rem;
+  padding: 0.55rem 1.25rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  flex-wrap: wrap;
+  background: var(--bg-raised);
+  border-bottom: 1px solid var(--accent-dim);
+  color: var(--text);
+  font-size: 0.88rem;
+}
+.live-banner[hidden] { display: none; }
+.live-banner .btn {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
 /* Pagination */
 
 .pagination {

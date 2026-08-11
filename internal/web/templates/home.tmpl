@@ -1,5 +1,5 @@
 {{define "body"}}
-<section class="hero">
+<section class="hero" data-live-refresh="home" data-indexed-height="{{.Status.IndexedHeight}}"{{if .Status.IndexedHash}} data-indexed-hash="{{.Status.IndexedHash}}"{{end}}>
   <h1>QOGE Explorer</h1>
   {{if .Status.IndexedHash}}
   <p class="status-line">Indexed height <strong>{{.Status.IndexedHeight}}</strong> &mdash; tip
