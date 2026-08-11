@@ -31,9 +31,13 @@ func simpleRawMempoolTx(label string, feeSats int64) (rpc.RawTransaction, rpc.Ra
 	vin := []rpc.RawVin{rawSpendVin(prevTxid, 0, "473044")}
 	vout := []rpc.RawVout{rawVout(0, 10_00000000, p2pkhScript(label), "pubkeyhash", &addr)}
 	raw := rawMempoolTx(label, vin, vout)
-	// vsize/weight must agree with rawMempoolTx's own hardcoded 200/800 —
-	// fetchAndDecode now cross-checks getrawmempool's vsize/weight against
-	// the strictly decoded getrawtransaction response (spec item 9).
+	// weight must agree with rawMempoolTx's own hardcoded 800 — fetchAndDecode
+	// cross-checks getrawmempool's weight against the strictly decoded
+	// getrawtransaction response's weight (the two always report the same
+	// underlying BIP141 quantity). vsize is deliberately NOT cross-checked —
+	// entry.VSize here is Core mempool POLICY vsize (sigop-cost-adjusted),
+	// which is allowed to diverge from rawMempoolTx's plain BIP141 vsize; see
+	// TestRefreshOnce_MempoolPolicyVSizeMayDifferFromTransactionVSize.
 	entry := mempoolEntry(200, 800, feeSats, 1_700_000_000, 100, nil, true)
 	return raw, entry
 }
@@ -483,4 +487,118 @@ func TestRefreshOnce_RPCIdentityMismatchRejected(t *testing.T) {
 	requireMempoolTxExists(t, ctx, pool, *rawGood.TxID, true)        // previous snapshot preserved
 	requireMempoolTxExists(t, ctx, pool, *mismatchedRaw.TxID, false) // never substituted in under the requested id or its own
 	requireMempoolTxExists(t, ctx, pool, requestedTxid, false)
+}
+
+// TestRefreshOnce_MempoolPolicyVSizeMayDifferFromTransactionVSize is the
+// required regression test (review round 2) pinning the architectural fact
+// that Core mempool entry vsize is POLICY metadata
+// (CTxMemPoolEntry::GetTxSize -> GetVirtualTransactionSize(weight,
+// sigOpCost), sigop-cost-adjusted per policy/policy.cpp) and is allowed to
+// legitimately diverge from the transaction's plain BIP141 vsize that
+// verbose getrawtransaction reports (core_write.cpp's TxToUniv, pure
+// weight-derived). A refresh must NOT reject on this divergence, and the
+// persisted vsize must remain the decoded transaction's own vsize, never
+// the mempool entry's policy value.
+func TestRefreshOnce_MempoolPolicyVSizeMayDifferFromTransactionVSize(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	mstore := NewStore(pool)
+
+	tip := store.Checkpoint{Height: 10, Hash: fakeHash("policy-vsize-tip")}
+	confirmed := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+
+	raw, entry := simpleRawMempoolTx("PolicyVSize", 1000)
+	// raw (via rawMempoolTx) hardcodes VSize=200, Weight=800. entry.Weight
+	// agrees (800); entry.VSize is deliberately a DIFFERENT value (250) —
+	// a legitimate mempool-policy vsize a high-sigop-cost transaction could
+	// report, not RPC corruption.
+	entry.VSize = intPtr(250)
+
+	client := &fakeRPCClient{
+		blockCountSeq:  []int64{10},
+		bestHashSeq:    []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{*raw.TxID: entry},
+		rawTxs:         map[string]rpc.RawTransaction{*raw.TxID: raw},
+	}
+	s := newTestSynchronizer(client, confirmed, mstore)
+
+	if err := s.refreshOnce(ctx); err != nil {
+		t.Fatalf("refreshOnce with diverging mempool-policy vsize: %v, want success", err)
+	}
+
+	state, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if !state.Initialized || state.Generation != 1 || state.TxCount != 1 {
+		t.Fatalf("state = %+v, want initialized=true generation=1 tx_count=1", state)
+	}
+
+	var gotVSize int
+	if err := pool.QueryRow(ctx, `SELECT vsize FROM mempool_transactions WHERE txid = $1`, *raw.TxID).Scan(&gotVSize); err != nil {
+		t.Fatalf("read vsize: %v", err)
+	}
+	if gotVSize != 200 {
+		t.Fatalf("persisted vsize = %d, want 200 (the decoded transaction's own vsize, not the mempool entry's policy value 250)", gotVSize)
+	}
+}
+
+// TestRefreshOnce_WeightMismatchRejected is the required negative
+// counterpart (review round 2): unlike vsize, getrawmempool's weight and
+// verbose getrawtransaction's weight report the exact same underlying
+// BIP141 quantity (entryToJSON's e.GetTxWeight() and TxToUniv's
+// GetTransactionWeight(tx) both trace to CTransaction's own weight), so a
+// disagreement there remains a genuine RPC/wire-integrity problem and must
+// still be rejected.
+func TestRefreshOnce_WeightMismatchRejected(t *testing.T) {
+	pool := migratedPool(t)
+	ctx := context.Background()
+	mstore := NewStore(pool)
+
+	// First, a real successful publication, to prove it's retained.
+	rawGood, entryGood := simpleRawMempoolTx("WeightGood", 1000)
+	tip := store.Checkpoint{Height: 10, Hash: fakeHash("weight-mismatch-tip")}
+	confirmedGood := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+	clientGood := &fakeRPCClient{
+		blockCountSeq:  []int64{10},
+		bestHashSeq:    []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{*rawGood.TxID: entryGood},
+		rawTxs:         map[string]rpc.RawTransaction{*rawGood.TxID: rawGood},
+	}
+	sGood := newTestSynchronizer(clientGood, confirmedGood, mstore)
+	if err := sGood.refreshOnce(ctx); err != nil {
+		t.Fatalf("initial successful refreshOnce: %v", err)
+	}
+	stateBefore, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State before: %v", err)
+	}
+
+	// Second cycle: decoded transaction's weight (800, from rawMempoolTx) does
+	// NOT match the mempool entry's weight (801) — a genuine wire-integrity
+	// disagreement, not mempool-policy metadata.
+	raw, entry := simpleRawMempoolTx("WeightMismatch", 1000)
+	entry.Weight = intPtr(801)
+	confirmedBad := &fakeConfirmedTip{seq: []store.Checkpoint{tip}}
+	clientBad := &fakeRPCClient{
+		blockCountSeq:  []int64{10},
+		bestHashSeq:    []string{tip.Hash},
+		mempoolEntries: map[string]rpc.RawMempoolEntry{*raw.TxID: entry},
+		rawTxs:         map[string]rpc.RawTransaction{*raw.TxID: raw},
+	}
+	sBad := newTestSynchronizer(clientBad, confirmedBad, mstore)
+
+	if err := sBad.refreshOnce(ctx); err == nil {
+		t.Fatalf("refreshOnce with mismatched weight: got nil error, want rejection")
+	}
+
+	stateAfter, err := mstore.State(ctx)
+	if err != nil {
+		t.Fatalf("State after: %v", err)
+	}
+	if stateAfter.Generation != stateBefore.Generation || stateAfter.TxCount != stateBefore.TxCount {
+		t.Fatalf("state changed after a weight-mismatch response: before=%+v after=%+v", stateBefore, stateAfter)
+	}
+	requireMempoolTxExists(t, ctx, pool, *rawGood.TxID, true) // previous snapshot preserved
+	requireMempoolTxExists(t, ctx, pool, *raw.TxID, false)    // rejected candidate never persisted
 }

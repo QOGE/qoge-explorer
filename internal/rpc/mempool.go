@@ -24,6 +24,14 @@ type MempoolFees struct {
 // and Core always emits "depends" (possibly as an empty array), so a nil
 // check is a reliable presence check without a pointer wrapper.
 type RawMempoolEntry struct {
+	// VSize is Core mempool POLICY virtual size (CTxMemPoolEntry::GetTxSize,
+	// i.e. GetVirtualTransactionSize(weight, sigOpCost) — see
+	// policy/policy.cpp), not the plain BIP141 vsize verbose
+	// getrawtransaction reports. It can legitimately exceed the
+	// transaction's ordinary vsize for a high-sigop-cost transaction, so
+	// internal/mempool must never compare it for equality against a
+	// decoded chain.Transaction.VSize (see docs/ARCHITECTURE.md §22).
+	// Kept as mempool policy metadata; not persisted in Phase 2F.1.
 	VSize  *int   `json:"vsize"`
 	Weight *int   `json:"weight"`
 	Time   *int64 `json:"time"`

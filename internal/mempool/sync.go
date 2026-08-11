@@ -264,20 +264,35 @@ func (s *Synchronizer) fetchAndDecode(ctx context.Context, entries map[string]rp
 			return nil, fmt.Errorf("mempool: transaction %s is coinbase-shaped; Core's mempool must never report a coinbase transaction", txid)
 		}
 
-		// Both vsize and weight are documented as always-present (never
-		// marked "optional") in Core's getrawmempool verbose result,
-		// unlike fee/modifiedfee/descendantfees/etc. — confirmed against
-		// a live Qogecoin Core node's own `help getrawmempool` output
-		// during this phase's manual check (see docs/ARCHITECTURE.md
-		// §22). Both entries describe the SAME transaction, so a
-		// disagreement with the strictly decoded getrawtransaction
-		// response is itself a wire-integrity problem worth rejecting,
-		// not silently tolerating — checked only when Core actually
-		// supplied the field, so an unexpected future omission doesn't
-		// turn into a spurious hard failure here.
-		if entry.VSize != nil && *entry.VSize != txn.VSize {
-			return nil, fmt.Errorf("mempool: transaction %s: getrawmempool vsize=%d disagrees with decoded getrawtransaction vsize=%d", txid, *entry.VSize, txn.VSize)
-		}
+		// weight, unlike vsize, IS safe to cross-check for equality.
+		// Verified against QOGE/qogecoin src directly (not just RPC help
+		// text) during this review round:
+		//
+		//   - core_write.cpp's TxToUniv (backs verbose getrawtransaction)
+		//     computes vsize as ceil(GetTransactionWeight(tx) /
+		//     WITNESS_SCALE_FACTOR) — pure BIP141 weight, nothing else.
+		//   - txmempool.cpp's CTxMemPoolEntry::GetTxSize (backs
+		//     getrawmempool's "vsize") calls
+		//     GetVirtualTransactionSize(nTxWeight, sigOpCost), which
+		//     (via policy/settings.h's nBytesPerSigOp, default 20)
+		//     resolves to policy.cpp's
+		//     max(nWeight, nSigOpCost * bytes_per_sigop) rounded up to
+		//     vbytes — a mempool POLICY size that can legitimately
+		//     exceed the plain BIP141 vsize for a high-sigop-cost
+		//     transaction.
+		//
+		// So getrawmempool.vsize and getrawtransaction.vsize are related
+		// but NOT guaranteed equal; comparing them for equality would
+		// reject valid, honestly-reported mempool snapshots and must
+		// never be done (see docs/ARCHITECTURE.md §22).
+		//
+		// weight has no such divergence: both entryToJSON's "weight"
+		// (e.GetTxWeight(), i.e. nTxWeight) and TxToUniv's "weight"
+		// (GetTransactionWeight(tx)) report the exact same underlying
+		// BIP141 weight, so a disagreement here is a genuine
+		// RPC/wire-integrity problem, not policy metadata — checked only
+		// when Core actually supplied the field, so an unexpected future
+		// omission doesn't turn into a spurious hard failure here.
 		if entry.Weight != nil && *entry.Weight != txn.Weight {
 			return nil, fmt.Errorf("mempool: transaction %s: getrawmempool weight=%d disagrees with decoded getrawtransaction weight=%d", txid, *entry.Weight, txn.Weight)
 		}

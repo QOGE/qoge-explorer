@@ -3172,17 +3172,55 @@ mempool entry's fee/time/dependency metadata to a different decoded
 transaction merely because they arrived in the same fetch loop.
 
 `getrawmempool`'s verbose per-entry `vsize` and `weight` are documented
-by Core's own `help getrawmempool` (confirmed against the live local
-node during this phase's manual check) as always-present — unlike
+by Core's own `help getrawmempool` as always-present — unlike
 `fee`/`modifiedfee`/`descendantfees`/etc., which Core's help text
-explicitly marks "(numeric, optional)". Because both fields describe the
-same transaction as the strictly decoded `getrawtransaction` response,
-`fetchAndDecode` cross-checks them against `chain.Transaction`'s own
-`VSize`/`Weight` whenever Core supplied them, rejecting the candidate on
-disagreement rather than silently trusting whichever value happened to
-be read first. The check is skipped (not required) when either field is
-literally absent, so an unexpected future Core response shape doesn't
-turn into a spurious hard failure.
+explicitly marks "(numeric, optional)". A first pass at this project
+cross-checked BOTH fields for equality against the strictly decoded
+`getrawtransaction` response's `VSize`/`Weight`; a subsequent internal
+review round found the `vsize` half of that check invalid and it was
+removed. **`weight` alone is cross-checked; `vsize` deliberately is
+not.** The reason is a real semantic difference confirmed directly
+against QOGE/qogecoin's own source (`help` text alone does not carry
+this distinction and must not be relied on for it):
+
+- Verbose `getrawtransaction`'s `vsize` (`core_write.cpp`'s `TxToUniv`)
+  is computed purely as
+  `ceil(GetTransactionWeight(tx) / WITNESS_SCALE_FACTOR)` — the plain
+  BIP141 virtual size, nothing else.
+- `getrawmempool`'s `vsize` (`txmempool.cpp`'s
+  `CTxMemPoolEntry::GetTxSize`, called via `policy/settings.h`'s
+  `nBytesPerSigOp`-aware overload) resolves to `policy.cpp`'s
+  `GetVirtualTransactionSize`, which computes
+  `ceil(max(weight, sigOpCost * bytes_per_sigop) / WITNESS_SCALE_FACTOR)`.
+  This is Core's mempool **policy** virtual size: for a
+  high-sigop-cost transaction, the sigop term can exceed the plain
+  weight term, making this value legitimately larger than the
+  `getrawtransaction` vsize for the exact same transaction.
+
+Comparing these two values for equality would reject valid, honestly
+reported mempool snapshots whenever a listed transaction's sigop cost
+pushes its policy vsize above its BIP141 vsize — this is not RPC
+corruption and must never be treated as such. `rpc.RawMempoolEntry.VSize`
+is retained as mempool policy metadata (documented as such at its
+declaration site) but is neither cross-checked nor persisted in Phase
+2F.1; `CandidateTransaction.Transaction.VSize` always comes from the
+strictly decoded `getrawtransaction` response and is never overwritten
+by it. `TestRefreshOnce_MempoolPolicyVSizeMayDifferFromTransactionVSize`
+pins this: a candidate whose mempool-entry vsize disagrees with its
+decoded transaction vsize still publishes successfully, with the
+persisted `vsize` column equal to the decoded transaction's own value.
+
+`weight`, by contrast, has no such divergence: `entryToJSON`'s
+`"weight"` (`e.GetTxWeight()`, i.e. the mempool entry's stored
+`nTxWeight`) and `TxToUniv`'s `"weight"` (`GetTransactionWeight(tx)`)
+both report the exact same underlying BIP141 weight for the same
+transaction, with no policy adjustment on either side. A disagreement
+there remains a genuine RPC/wire-integrity problem, so
+`fetchAndDecode` still rejects the candidate when
+`entry.Weight != nil && *entry.Weight != txn.Weight`, unchanged from
+before this round.
+`TestRefreshOnce_WeightMismatchRejected` covers this negative case:
+previous snapshot retained, generation unchanged.
 
 ### Confirmed-transaction detection: `getrawtransaction`'s optional `blockhash`
 
