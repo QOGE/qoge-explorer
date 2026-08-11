@@ -9,17 +9,13 @@ import "net/http"
 // a zero balance while still showing its canonical genesis transaction in
 // history; the template renders whatever the query layer returns without
 // trying to reconcile the two (see query.Store.AddressHistory's doc
-// comment and docs/ARCHITECTURE.md §20).
+// comment and docs/ARCHITECTURE.md §20). Both are read from ONE composite
+// snapshot (query.Store.AddressDetail) so the rendered page can never pair
+// a balance from one canonical branch with history from another.
 func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 	address := r.PathValue("address")
 	if !isValidAddressShape(address) {
 		s.renderBadRequest(w, "Malformed address.")
-		return
-	}
-
-	summary, err := s.q.AddressSummary(r.Context(), address)
-	if err != nil {
-		s.renderInternalError(w, "address summary", err)
 		return
 	}
 
@@ -48,15 +44,15 @@ func (s *Server) handleAddress(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	history, err := s.q.AddressHistory(r.Context(), address, beforeHeight, beforeTxIDPtr, limit)
+	detail, err := s.q.AddressDetail(r.Context(), address, beforeHeight, beforeTxIDPtr, limit)
 	if err != nil {
-		s.renderInternalError(w, "address history", err)
+		s.renderInternalError(w, "address detail", err)
 		return
 	}
 
 	s.render(w, "address", http.StatusOK, addressView{
-		Summary:    summary,
-		History:    history.Transactions,
-		Pagination: addressPagination(address, history.NextBeforeHeight, history.NextBeforeTxID),
+		Summary:    detail.Summary,
+		History:    detail.History.Transactions,
+		Pagination: addressPagination(address, limit, detail.History.NextBeforeHeight, detail.History.NextBeforeTxID),
 	})
 }

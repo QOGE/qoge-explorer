@@ -2168,7 +2168,11 @@ canonical-mutation writers.
 A single `SELECT` is trivially internally consistent — Postgres gives it
 one statement-level snapshot regardless of isolation level, so
 single-statement methods (`Status`, `RecentBlocks`, `AddressSummary`,
-`AddressHistory`) need nothing extra.
+`AddressHistory`) need nothing extra when called standalone. (§20 later
+reuses these same statements' underlying SQL, unchanged, inside composite
+multi-statement snapshots for the web UI's home and address pages — see
+§20 "Composite read snapshots: home and address pages" — via the same
+`querier`-parameterized helper shape described below.)
 
 A DETAIL response assembled from several related `SELECT`s is a different
 problem. Under the default READ COMMITTED isolation, EACH statement in an
@@ -2518,10 +2522,16 @@ Phase 2E.1 adds the first public HTML interface: `internal/web`, a
 PRESENTATION-ONLY package server-rendering pages from the same
 already-reviewed `query.Store` §19 introduced. Nothing in `migrations/`,
 `Store`'s write path, `internal/decode`, `internal/script`,
-`internal/chain`, `internal/indexer`, or `internal/query` changes; §19's
-`internal/api` also has ZERO behavioral diff — every fact this phase
-displays already existed as an exported `query.Store` method before this
-phase began, so no query/schema expansion was needed for any page.
+`internal/chain`, or `internal/indexer` changes; §19's `internal/api` also
+has ZERO behavioral diff — every fact this phase displays already existed
+as an exported `query.Store` method before this phase began, so no new
+query capability was needed for any page. `internal/query` itself gained a
+small, deliberate, READ-ONLY exception after an internal review of the
+first draft of this phase — see "Composite read snapshots: home and
+address pages" below — to fix a page-level snapshot-consistency bug the
+same class as the one §19's "Multi-statement read consistency" already
+fixed at the single-response level; no write SQL, schema change, or
+canonical-accounting change was involved.
 
 ### `internal/web` is a sibling of `internal/api`, not a client of it
 
@@ -2583,6 +2593,70 @@ same-path wrong-method fallback — plus one final unrestricted `"/"`
 catch-all. The fallback and catch-all render the shared HTML error page
 (`templates/error.tmpl`) instead of JSON — `internal/web/web.go`'s
 `knownGETRoutes`/`routes()`.
+
+### Composite read snapshots: home and address pages
+
+The home page and the address page each assemble their response from TWO
+logically related `query.Store` calls: home needs `Status` (the indexed
+checkpoint) plus `RecentBlocks` (the newest canonical blocks); address
+needs `AddressSummary` (balance/accounting) plus `AddressHistory`
+(canonical destination visibility). An internal review of the first draft
+of this phase caught that calling these two methods independently
+reintroduces, at the PAGE level, the exact class of bug §19's "Multi-
+statement read consistency" already fixed at the single-response level: a
+concurrent `ApplyBlock`/`RollbackTo` committing between the two calls can
+make one rendered HTML page describe two different canonical states that
+never coexisted — e.g. `Status` reporting tip `A2` while `RecentBlocks`'s
+own first row is already `B2` after a reorg, or an address page pairing a
+balance that belongs to branch A with a history that belongs to branch B.
+
+The fix mirrors §19's existing pattern exactly, at a coarser grain:
+`internal/query/composite.go` adds two new exported methods —
+
+```go
+func (s *Store) ExplorerOverview(ctx context.Context, recentBlocksPageSize int) (ExplorerOverview, error)
+func (s *Store) AddressDetail(ctx context.Context, address string, beforeHeight *int64, beforeTxID *string, pageSize int) (AddressDetail, error)
+```
+
+— each opening one `Store.readTx` (`REPEATABLE READ`, `ReadOnly`) and
+issuing both underlying SELECTs through that same `pgx.Tx`, firing the
+existing `snapshotTestHook` immediately after the first one (same
+convention `BlockByHash`/`TransactionByTxID` already use). `internal/web`'s
+`handleHome`/`handleAddress` call ONLY these composite methods now; they
+never independently call `Status`/`RecentBlocks`/`AddressSummary`/
+`AddressHistory` themselves.
+
+No SQL was duplicated to build this: `Status`, `RecentBlocks`,
+`AddressSummary`, and `AddressHistory`'s bodies were each split into a
+public single-statement method (still called with `s.pool`, unchanged
+behavior/signature, `internal/api` keeps calling exactly these) plus a
+private `*From(ctx, querier, ...)` helper (`statusFrom`, `recentBlocksFrom`,
+`addressSummaryFrom`, `addressHistoryFrom`) that takes the same `querier`
+interface §19 already introduced for this exact reason. The composite
+methods call the `*From` helpers with the open `pgx.Tx`; the public methods
+call them with `s.pool`. Same SQL, two callers. No `SELECT FOR UPDATE`, no
+new lock, no checkpoint mutation — `AccessMode: ReadOnly` still means
+neither composite method ever blocks or is blocked by `ApplyBlock`/
+`RollbackTo` beyond ordinary MVCC.
+
+`internal/query/snapshot_test.go` proves both composites deterministically
+(no `sleep`, same `snapshotTestHook`-based synchronization §19's tests
+use): `TestSnapshotConsistency_ExplorerOverview_ConcurrentReorg` and
+`TestSnapshotConsistency_AddressDetail_ConcurrentReorg` each fix a
+composite read's snapshot on branch A, commit a real reorg to branch B on a
+concurrent goroutine through the real `Store`, and assert the in-flight
+result is entirely branch-A-consistent (never a mix) while a fresh call
+issued afterward is entirely branch-B-consistent.
+
+Separately, `/blocks` and `/address/{address}`'s "next page" links now
+also preserve the caller's originally-requested `limit` query parameter
+(`blocksPagination`/`addressPagination` in `internal/web/viewmodels.go`) —
+a caller paging forward from `?limit=2` no longer gets silently reset back
+to `query.DefaultPageSize` on the next click, a small independent cleanup
+found by the same review. HTML 405 responses on a known GET-only route now
+also set an `Allow: GET` header (`internal/web/web.go`'s bare-pattern
+fallback), matching ordinary HTTP semantics for method-not-allowed; unknown
+routes remain a plain 404 with no `Allow` header.
 
 ### Canonical/orphan visual semantics
 

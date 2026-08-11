@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/QOGE/qoge-explorer/internal/chain"
@@ -162,6 +163,38 @@ func TestAddress_History_ReorgAndFlipBack(t *testing.T) {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	bodyContains(t, rec, "/block/"+a1.Hash)
+}
+
+// Address history pagination preserves the caller's requested limit across
+// the next-page link, same as /blocks (see viewmodels.go's
+// addressPagination) — a naive cursor-only link would silently reset
+// paging forward back to query.DefaultPageSize.
+func TestAddress_History_PaginationPreservesLimit(t *testing.T) {
+	ctx := context.Background()
+	s, st := newTestServer(t)
+
+	g := block("ahp-g", 0, "", coinbaseTx("ahp-g", 100_00000000, "qAHPG"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+	prev := g
+	for h := int64(1); h <= 3; h++ {
+		label := "ahp-" + string(rune('a'+h))
+		b := block(label, h, prev.Hash, coinbaseTx(label, 10_00000000, "qAHPTarget"))
+		if err := st.ApplyBlock(ctx, b); err != nil {
+			t.Fatalf("apply block %d: %v", h, err)
+		}
+		prev = b
+	}
+
+	rec := doRequest(t, s, "GET", "/address/qAHPTarget?limit=2")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "limit=2") {
+		t.Fatalf("next-page link does not preserve limit=2:\n%s", body)
+	}
 }
 
 // R: bare-multisig participant identities render under a clearly separate

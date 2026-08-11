@@ -90,7 +90,11 @@ func TestBlocksPagination(t *testing.T) {
 	bodyContains(t, rec, heights[len(heights)-1]) // height 5
 	bodyContains(t, rec, heights[len(heights)-2]) // height 4
 	bodyNotContains(t, rec, heights[len(heights)-3])
-	bodyContains(t, rec, "/blocks?before=4") // next-page cursor link
+	// Next-page cursor link preserves the caller's requested limit, not just
+	// the cursor — a naive "/blocks?before=4" would silently reset paging
+	// forward back to query.DefaultPageSize. html/template escapes the "&"
+	// separator in the href attribute, so assert the escaped form.
+	bodyContains(t, rec, "/blocks?before=4&amp;limit=2")
 
 	rec2 := doRequest(t, s, "GET", "/blocks?limit=2&before=4")
 	if rec2.Code != http.StatusOK {
@@ -226,6 +230,19 @@ func TestMethodNotAllowed_HTML405(t *testing.T) {
 	ct := rec.Header().Get("Content-Type")
 	if !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("Content-Type = %q, want text/html", ct)
+	}
+	if allow := rec.Header().Get("Allow"); allow != "GET" {
+		t.Fatalf("Allow = %q, want GET", allow)
+	}
+
+	// An unknown route must remain a plain 404, never a fake 405 with an
+	// Allow header for a route that was never registered at all.
+	rec = doRequest(t, s, "GET", "/no-such-page")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown route status = %d, want 404", rec.Code)
+	}
+	if allow := rec.Header().Get("Allow"); allow != "" {
+		t.Fatalf("unknown route Allow = %q, want empty", allow)
 	}
 }
 

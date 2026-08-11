@@ -36,12 +36,18 @@ type AddressSummary struct {
 // address validity to distinguish "malformed address" from "syntactically
 // fine address with no on-chain history" — see docs/ARCHITECTURE.md §19.
 func (s *Store) AddressSummary(ctx context.Context, address string) (AddressSummary, error) {
+	return addressSummaryFrom(ctx, s.pool, address)
+}
+
+// addressSummaryFrom runs AddressSummary's SELECT against any querier — see
+// statusFrom's doc comment for why this shape exists.
+func addressSummaryFrom(ctx context.Context, q querier, address string) (AddressSummary, error) {
 	sum := AddressSummary{Address: address}
 	var received, sent, balance int64
 	var txCount int
 	var firstSeen, lastSeen *int64
 
-	err := s.pool.QueryRow(ctx, `
+	err := q.QueryRow(ctx, `
 		SELECT total_received_satoshis, total_sent_satoshis, balance_satoshis, tx_count, first_seen_height, last_seen_height
 		FROM addresses WHERE address = $1
 	`, address).Scan(&received, &sent, &balance, &txCount, &firstSeen, &lastSeen)
@@ -124,9 +130,15 @@ type AddressHistoryPage struct {
 // this history — searching by participant address, if ever exposed, must
 // remain a structurally separate query (docs/ARCHITECTURE.md §13.A).
 func (s *Store) AddressHistory(ctx context.Context, address string, beforeHeight *int64, beforeTxID *string, pageSize int) (AddressHistoryPage, error) {
+	return addressHistoryFrom(ctx, s.pool, address, beforeHeight, beforeTxID, pageSize)
+}
+
+// addressHistoryFrom runs AddressHistory's query against any querier — see
+// statusFrom's doc comment for why this shape exists.
+func addressHistoryFrom(ctx context.Context, q querier, address string, beforeHeight *int64, beforeTxID *string, pageSize int) (AddressHistoryPage, error) {
 	pageSize = clampPageSize(pageSize)
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := q.Query(ctx, `
 		WITH received AS (
 			SELECT bt.txid, bt.block_hash, bt.block_height
 			FROM output_addresses oa

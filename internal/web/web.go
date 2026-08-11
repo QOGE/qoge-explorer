@@ -79,6 +79,7 @@ func (s *Server) routes() {
 
 	for _, pattern := range knownGETRoutes {
 		s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Allow", "GET")
 			s.renderError(w, http.StatusMethodNotAllowed, "Method Not Allowed", "This page only supports GET.")
 		})
 	}

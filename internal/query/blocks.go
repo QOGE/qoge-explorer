@@ -71,9 +71,15 @@ func scanBlockSummary(row pgx.Row) (BlockSummary, error) {
 // migrations/0001_initial.up.sql) rather than OFFSET, so page N's cost does
 // not grow with N.
 func (s *Store) RecentBlocks(ctx context.Context, beforeHeight *int64, pageSize int) (BlockPage, error) {
+	return recentBlocksFrom(ctx, s.pool, beforeHeight, pageSize)
+}
+
+// recentBlocksFrom runs RecentBlocks's SELECT against any querier — see
+// statusFrom's doc comment for why this shape exists.
+func recentBlocksFrom(ctx context.Context, q querier, beforeHeight *int64, pageSize int) (BlockPage, error) {
 	pageSize = clampPageSize(pageSize)
 
-	rows, err := s.pool.Query(ctx, `
+	rows, err := q.Query(ctx, `
 		SELECT `+blockColumns+`
 		FROM blocks
 		WHERE canonical AND ($1::bigint IS NULL OR height < $1)

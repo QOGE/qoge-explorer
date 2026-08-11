@@ -20,9 +20,17 @@ type Status struct {
 // IndexedHeight is -1 and IndexedHash is nil for an explorer that has never
 // completed a block (migration's bootstrap row).
 func (s *Store) Status(ctx context.Context) (Status, error) {
+	return statusFrom(ctx, s.pool)
+}
+
+// statusFrom runs Status's SELECT against any querier — s.pool for the
+// single-statement public method above, or an open read-only REPEATABLE
+// READ pgx.Tx when it must share one snapshot with other reads (see
+// ExplorerOverview in overview.go).
+func statusFrom(ctx context.Context, q querier) (Status, error) {
 	var st Status
 	var hash *string
-	err := s.pool.QueryRow(ctx,
+	err := q.QueryRow(ctx,
 		`SELECT indexed_height, indexed_block_hash FROM sync_state WHERE name = 'main'`,
 	).Scan(&st.IndexedHeight, &hash)
 	if err != nil {

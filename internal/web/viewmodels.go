@@ -15,20 +15,35 @@ type pagination struct {
 	NextURL string
 }
 
-func blocksPagination(next *int64) pagination {
+// blocksPagination builds the "next page" link for /blocks. limit is the
+// caller's originally-requested "limit" query parameter (0 meaning
+// unspecified/default — see parsePageSize) and is carried through to the
+// next link so paging forward doesn't silently reset back to
+// query.DefaultPageSize.
+func blocksPagination(limit int, next *int64) pagination {
 	if next == nil {
 		return pagination{}
 	}
-	return pagination{HasNext: true, NextURL: "/blocks?before=" + strconv.FormatInt(*next, 10)}
+	v := url.Values{}
+	v.Set("before", strconv.FormatInt(*next, 10))
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
+	return pagination{HasNext: true, NextURL: "/blocks?" + v.Encode()}
 }
 
-func addressPagination(address string, nextHeight *int64, nextTxID *string) pagination {
+// addressPagination builds the "next page" link for /address/{address}.
+// limit is preserved the same way blocksPagination preserves it.
+func addressPagination(address string, limit int, nextHeight *int64, nextTxID *string) pagination {
 	if nextHeight == nil || nextTxID == nil {
 		return pagination{}
 	}
 	v := url.Values{}
 	v.Set("before", strconv.FormatInt(*nextHeight, 10))
 	v.Set("before_txid", *nextTxID)
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
 	return pagination{HasNext: true, NextURL: "/address/" + url.PathEscape(address) + "?" + v.Encode()}
 }
 
