@@ -1,0 +1,39 @@
+{{define "body"}}
+<h1>Mempool</h1>
+{{if not .Overview.State.Initialized}}
+<p class="status-line">Mempool cache not synchronized yet.</p>
+{{else}}
+<table class="kv-table">
+<tr><th>Status</th><td>{{if eq .Overview.State.Status "fresh"}}Fresh{{else}}Stale &mdash; confirmed indexing has advanced past this snapshot's anchor{{end}}</td></tr>
+<tr><th>Generation</th><td>{{.Overview.State.Generation}}</td></tr>
+<tr><th>Observed</th><td>{{formatObservedAt .Overview.State.ObservedAt}}</td></tr>
+<tr><th>Anchor Height</th><td>{{if .Overview.State.CoreTipHeight}}{{.Overview.State.CoreTipHeight}}{{end}}</td></tr>
+<tr><th>Anchor Hash</th><td class="mono wrap">{{if .Overview.State.CoreTipHash}}{{.Overview.State.CoreTipHash}}{{end}}</td></tr>
+<tr><th>Confirmed Indexed Height</th><td>{{.Overview.State.ConfirmedIndexedHeight}}</td></tr>
+<tr><th>Transaction Count</th><td>{{.Overview.State.TxCount}}</td></tr>
+<tr><th>Total VSize</th><td>{{.Overview.State.TotalVSize}}</td></tr>
+<tr><th>Total Fees</th><td>{{.Overview.State.TotalFeeQOGE}} QOGE <span class="muted">({{.Overview.State.TotalFeeSatoshis}} sats)</span></td></tr>
+</table>
+
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>TxID</th><th>WTxID</th><th>VSize</th><th>Fee</th><th>Entry Time</th><th>Replaceable</th></tr></thead>
+<tbody>
+{{range .Overview.Transactions.Transactions}}
+<tr>
+  <td class="mono wrap"><a href="/mempool/tx/{{.TxID}}">{{.TxID}}</a></td>
+  <td class="mono wrap">{{.WTxID}}</td>
+  <td>{{.VSize}}</td>
+  <td>{{.FeeQOGE}} QOGE <span class="muted">({{.FeeSatoshis}} sats)</span></td>
+  <td>{{formatTimeUTC .EntryTime}}</td>
+  <td>{{replaceableLabel .Replaceable}}</td>
+</tr>
+{{else}}
+<tr><td colspan="6">No cached mempool transactions.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{template "pagination" .Pagination}}
+{{end}}
+{{end}}

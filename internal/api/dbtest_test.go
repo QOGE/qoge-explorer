@@ -92,6 +92,17 @@ func randomHex(t *testing.T, n int) string {
 // ad-hoc SQL) and a Server under test wired to the same pool's query.Store.
 func newTestServer(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
+	s, st, _ := newTestServerWithPool(t)
+	return s, st
+}
+
+// newTestServerWithPool is newTestServer plus the underlying pool, for
+// tests that also need to seed mempool_* fixtures directly through a real
+// internal/mempool.Store (which needs the pool — there is no write mempool
+// access through Server itself, mirroring internal/query's own read/write
+// separation).
+func newTestServerWithPool(t *testing.T) (*Server, *store.Store, *pgxpool.Pool) {
+	t.Helper()
 	ctx := context.Background()
 	pool := newTestSchema(t)
 
@@ -102,5 +113,5 @@ func newTestServer(t *testing.T) (*Server, *store.Store) {
 	if _, err := store.Up(ctx, pool, migrations); err != nil {
 		t.Fatalf("apply migrations: %v", err)
 	}
-	return New(query.New(pool), nil), store.New(pool)
+	return New(query.New(pool), nil), store.New(pool), pool
 }

@@ -10,9 +10,11 @@ import (
 // already been decided by internal/query; these only format it for
 // display.
 var templateFuncs = template.FuncMap{
-	"formatTimeUTC": formatTimeUTC,
-	"spentLabel":    spentLabel,
-	"yesNo":         yesNo,
+	"formatTimeUTC":    formatTimeUTC,
+	"spentLabel":       spentLabel,
+	"yesNo":            yesNo,
+	"formatObservedAt": formatObservedAt,
+	"replaceableLabel": replaceableLabel,
 }
 
 // formatTimeUTC renders a block header's Unix timestamp as an unambiguous
@@ -43,4 +45,26 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// formatObservedAt renders mempool_state.observed_at (nil when the mempool
+// cache has never successfully synchronized — see query.MempoolState) as an
+// unambiguous absolute UTC time, same convention as formatTimeUTC.
+func formatObservedAt(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
+// replaceableLabel distinguishes the three states Core's
+// "bip125-replaceable" metadata carries (see
+// query.MempoolTxSummary.Replaceable/MempoolTransactionDetail.Replaceable's
+// doc comments): nil means Core did not report reliable RBF metadata for
+// this transaction — never presented as a false "no".
+func replaceableLabel(b *bool) string {
+	if b == nil {
+		return "unknown"
+	}
+	return yesNo(*b)
 }

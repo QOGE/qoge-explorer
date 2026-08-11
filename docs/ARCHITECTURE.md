@@ -3325,3 +3325,269 @@ API, and functional (unstyled) SSR mempool pages on top of the
 foundation this phase lays down; visual polishing remains deferred until
 all functional phases are complete, per the project's existing phase
 ordering.
+
+## 23. Read-only mempool explorer: query layer, JSON API, SSR pages (Phase 2F.2)
+
+Phase 2F.1 built the isolated, atomic mempool_* PostgreSQL cache and its
+Core synchronizer. Phase 2F.2 makes that cache READABLE, adding nothing
+to the write side: `internal/mempool`, `internal/rpc`, `internal/store`,
+`internal/indexer`, `internal/decode`, `internal/script`,
+`internal/chain`, and every migration are all byte-for-byte unchanged by
+this phase — verified by an explicit `git diff --stat` against the
+Phase 2F.1 baseline before this phase's PR was opened. All new
+production code lives in `internal/query/mempool.go`,
+`internal/api/handlers_mempool.go`, and `internal/web/handlers_mempool.go`
++ two new templates; `cmd/qoge-explorer/main.go` needed no change at all
+(the mempool synchronizer was already wired into `index` only, back in
+Phase 2F.1 — see §22).
+
+### `serve` remains Core-independent
+
+`internal/query`, `internal/api`, and `internal/web` never call
+`getrawmempool`, `getrawtransaction`, or any other Core RPC method —
+every mempool read in this phase is an ordinary `SELECT` against the
+`mempool_*` tables, using exactly the same `querier`/`readTx` machinery
+`internal/query`'s confirmed-chain code already used (see §19's
+"Multi-statement read consistency"). `runServe` in
+`cmd/qoge-explorer/main.go` is unchanged: it never constructs an
+`internal/rpc.Client` and never receives Core RPC credentials — confirmed
+directly by this phase's `serve`-binary route smoke (§ "Serve smoke",
+below), which ran the real binary against an isolated PostgreSQL schema
+with no Core process reachable at all.
+
+### Read model: `internal/query/mempool.go`
+
+A new file, deliberately NOT depending on `internal/mempool.Store` (the
+Phase 2F.1 writer) — it reads the `mempool_*` schema directly, exactly
+the way the confirmed query layer reads `blocks`/`transactions` directly
+rather than importing `internal/store`. The only cross-package test-time
+dependency is in `*_test.go` files (`mempool_fixtures_test.go` in each of
+`internal/query`, `internal/api`, `internal/web`), which build real
+`mempool_*` rows through the real `internal/mempool.Store.ReplaceSnapshot`
+writer — never ad-hoc SQL — mirroring exactly how those same test files
+already build confirmed fixtures through `internal/store.Store.ApplyBlock`.
+
+### `MempoolState`: initialized vs. synchronized-empty vs. never-synchronized
+
+`query.MempoolState` is a read of `mempool_state('main')` PLUS, from the
+SAME PostgreSQL snapshot, the confirmed chain's own `sync_state`
+checkpoint (`statusFrom` — the exact function `query.Status` already
+uses). The two are compared to derive `Status`/`Stale`:
+
+- **`"uninitialized"`** (`Initialized=false`): `internal/mempool` has
+  never successfully published a snapshot. `Stale` is unconditionally
+  `false` in this case — never `true` — so a reader can never mistake
+  "never synchronized" for "synchronized but out of date"; this is a
+  third, explicit state, not a degenerate case of the other two (spec
+  requirement: "stale is not equivalent to true; represent uninitialized
+  explicitly").
+- **`"fresh"`** (`Initialized=true`, `mempool_state.core_tip_height`/
+  `core_tip_hash` == `sync_state.indexed_height`/`indexed_block_hash`
+  exactly): the cached rows were observed against the exact confirmed
+  chain state a reader is also seeing right now.
+- **`"stale"`** (`Initialized=true`, anchor != confirmed tip): real,
+  previously-observed mempool state, but confirmed indexing has since
+  advanced past the snapshot's anchor. **This is normal asynchronous
+  operation, not corruption** — Phase 2F.1's synchronizer publishes a
+  snapshot anchored at whatever tip it observed at acquisition time
+  (§22 "Snapshot acquisition: anchored, not atomic"), and confirmed
+  indexing can advance again before the NEXT mempool cycle runs. A
+  reader must never be left to assume a stale snapshot is current — every
+  mempool response, JSON or HTML, surfaces `stale`/`status` explicitly
+  rather than silently presenting cached rows as live.
+
+Both `MempoolOverview` (list) and `mempoolTransactionDetail` (detail)
+call the same `mempoolStateFrom` helper against their own already-open
+`readTx`, so the freshness comparison always shares one snapshot with
+every other read in the same response — never two independent queries
+that could observe two different instants.
+
+### Repeatable-read snapshots, extended to the mempool cache
+
+Every multi-statement mempool read opens the SAME `s.readTx` (`BEGIN
+ISOLATION LEVEL REPEATABLE READ, READ ONLY`) the confirmed-chain query
+layer already uses — no new transaction machinery was introduced.
+`MempoolOverview` reads `MempoolState` then one page of transactions from
+one snapshot; `mempoolTransactionDetail` reads the transaction body,
+`MempoolState`, dependencies, inputs (+ witness), and outputs (+
+participants) from one snapshot. A concurrent
+`internal/mempool.Store.ReplaceSnapshot` can therefore never produce a
+response mixing rows from two different generations —
+`TestSnapshotConsistency_MempoolOverview_ConcurrentReplacement` and
+`TestSnapshotConsistency_MempoolDetail_ConcurrentReplacement` (in
+`internal/query`) prove this directly: a REAL concurrent
+`ReplaceSnapshot` is driven from generation 1 to generation 2 while an
+in-flight read's snapshot is deliberately held open via the same
+`snapshotTestHook` rendezvous pattern `snapshot_test.go` already uses for
+confirmed-chain reorgs (never sleep-based). The in-flight read always
+observes the complete, coherent PRE-replacement generation (state
+generation N, only generation-N rows, never a generation-N+1 row mixed
+in) — PostgreSQL's REPEATABLE READ isolation guarantees this at the
+engine level once the snapshot is fixed, so the in-flight detail read for
+a transaction that gets deleted-and-replaced mid-read never has to
+"discover" a not-found partway through; it simply keeps seeing the
+pre-replacement row for the rest of that transaction.
+
+### Generation-safe pagination
+
+A mempool list cursor (`query.MempoolCursor`) carries THREE fields, not
+two: `Generation`, `EntryTime`, `TxID` — ordered `entry_time DESC, txid
+DESC` (deterministic, never relying on PostgreSQL's physical row order).
+Because `ReplaceSnapshot` always fully replaces `mempool_transactions`
+(never an additive delta — see §22 "Full replacement, not additive
+deltas"), a cursor's `(entry_time, txid)` pair only has meaning relative
+to the EXACT generation it was read from. `MempoolOverview` therefore
+requires `cursor.Generation == state.Generation` (read from the same
+snapshot) before honoring the cursor at all; a mismatch is
+`query.ErrMempoolGenerationChanged`, never silently paginated against the
+new snapshot. `internal/api` maps this to HTTP 409 with the stable
+machine-readable code `mempool_generation_changed`; `internal/web`
+redirects to a clean `/mempool` first page instead of rendering an error
+— a stale cursor from a page the user still has open is expected,
+ordinary behavior, not a fault.
+`TestMempoolOverview_GenerationSafePagination` /
+`TestMempoolEndpoint_GenerationCursor` /
+`TestMempoolPage_GenerationCursorRedirects` cover the query/API/web
+layers respectively.
+
+### `GET /api/v1/mempool` and `GET /api/v1/mempool/tx/{id}`
+
+Mirror the confirmed-chain endpoints' conventions exactly:
+`?include_witness=true` opt-in (default hidden — see below),
+`?limit=`/keyset-cursor pagination, a `query.ErrNotFound` mapped to 404,
+a JSON error envelope with a stable `code` field for every non-2xx
+response. `GET /api/v1/mempool`'s cursor is three query parameters
+(`generation`, `before_entry_time`, `before_txid`) that must be supplied
+together or all omitted — a partial cursor is 400.
+
+An **uninitialized** mempool cache is a valid HTTP 200 response with
+`state.initialized=false` and no transactions — never a fake
+synchronized-and-empty response (`TestMempoolEndpoint_Uninitialized`). A
+**stale** cache still returns its cached rows, but with `stale:true` and
+both the mempool anchor and the actual confirmed indexed tip visible
+side by side (`TestMempoolEndpoint_Stale`) — a caller is never left to
+assume a stale snapshot describes Core's current mempool.
+
+`GET /api/v1/mempool/tx/{id}` tries `id` as a txid first, then (only on a
+miss) as a wtxid — identical fallback order to the confirmed
+`/api/v1/tx/{id}` endpoint. A missing id in an initialized mempool is a
+plain 404: never a Core RPC fallback, and never old/expired mempool
+history, since none exists by design (full-replacement snapshots only —
+§22).
+
+### `GET /mempool` and `GET /mempool/tx/{id}` (SSR)
+
+Minimal, functional, unstyled-beyond-existing-conventions HTML pages
+using the same `html/template` layout/security-header machinery every
+other page already uses (`app.css`'s existing `.kv-table`/`.data-table`/
+`.io-card`/`.witness-block` classes — no new CSS was needed). `/mempool`
+shows the state summary (initialized/fresh/stale, generation, observed
+time, anchor height/hash, confirmed indexed height, tx count, total
+vsize, total fees) above a paginated transaction table.
+`/mempool/tx/{id}` labels the transaction **"UNCONFIRMED / MEMPOOL"**
+when the snapshot is fresh, or the qualified **"Present in cached
+mempool snapshot ... snapshot stale"** wording when it is not — a stale
+cache is never presented as proof of current mempool membership. Neither
+page participates in `live.js`'s auto-refresh (deliberately deferred —
+see "No browser mempool polling yet" below); a stale snapshot page
+requires a manual reload to pick up a newer generation, same as any other
+manually-refreshed page in this project today.
+
+A single "Mempool" link was added to the shared site header
+(`templates/header.tmpl`) — the existing nav/header layout itself was not
+redesigned.
+
+### Default witness omission, P2QPK exact opt-in, P2TR distinct
+
+Identical policy to the confirmed transaction page, reusing the exact
+same `query.WitnessItem` type (no new witness-item shape was
+introduced): `mempool_input_witness` rows are only fetched from
+PostgreSQL at all when the caller passes `?include_witness=true`
+(`mempoolWitnessByVin`, mirroring `witnessByVin`). Default responses
+report each witness item's size only; explicit opt-in returns the exact
+bytes, never truncated — including a full 17,088-byte P2QPK signature
+item and its accompanying exactly-32-byte public-key item
+(`TestMempoolTransaction_P2QPKAndP2TR`,
+`TestMempoolTransactionWitness_DefaultOmitsRaw_OptInIncludesIt`,
+`TestMempoolTxWitness_DefaultHidden_OptInIncludes` across the three
+layers). `script_type`/`witness_version`/`witness_program` are read
+as-is from what Phase 2F.1's writer already persisted — this phase
+performs NO script classification of its own; P2TR (`witness_version=1`)
+and P2QPK (`witness_version=2`) remain visibly distinct through query,
+API, and SSR alike, and the 32-byte P2QPK output witness program is
+never called a public key anywhere in this phase's code or templates.
+
+### No derived input accounting; no policy-feerate confusion
+
+Mempool transaction detail shows input OUTPOINTS only (`prev_txid`,
+`prev_vout_index`) — this phase does not compute total input value,
+pending spend/receive balances, or a "spendable after mempool" figure.
+Fee is displayed exactly as `internal/mempool` already persisted it
+(`fee_satoshis`, Core-authored exact value via
+`decode.DecodeAmount` — never reconstructed here by resolving prevouts).
+Separately: the persisted `vsize` a mempool transaction list/detail shows
+is always the transaction's own BIP141 vsize as decoded from
+`getrawtransaction` (frozen by Phase 2F.1 — see §22's vsize/weight
+semantics section); Core's sigop-adjusted mempool POLICY vsize was never
+persisted in Phase 2F.1 and this phase does not compute or display a
+"Core mempool feerate" from `fee / persisted vsize` — doing so would
+misrepresent Core's actual policy feerate, which depends on the (not
+persisted) policy vsize denominator.
+
+### Bare multisig: participants shown separately, never a monetary destination
+
+`MempoolOutputDetail.Address` is `nil` for a multisig output (no single
+balance-accounting destination exists for it — mirrors the confirmed
+schema's `output_addresses` vs. `output_participants` split exactly, see
+§7/§13.A); `Participants` lists the co-signer identities separately, and
+neither the JSON API nor the HTML template ever sums an output's value
+once per participant or calls a participant an "owner" of the full
+output value (`TestMempoolTransaction_Multisig`,
+`TestMempoolEndpoint_ListAndDetail`-adjacent coverage).
+
+### Search: mempool as a lower-priority fallback, confirmed always wins
+
+`/search`'s fixed 64-hex lookup order gained two new steps at the END:
+`BlockByHash` -> `TransactionByTxID` -> `TransactionByWTxID` ->
+`MempoolTransactionByTxID` -> `MempoolTransactionByWTxID` — the first hit
+redirects there. Confirmed data always takes priority: a mempool match is
+only ever tried once every confirmed lookup has already missed, so a
+transaction that has since confirmed (but whose mempool row a later
+`ReplaceSnapshot` hasn't cleared away yet) is never shadowed by a stale
+mempool hit (`TestSearch_ConfirmedTakesPriorityOverMempool`). A mempool
+hit's destination page carries its own honest fresh/stale qualification
+(§ above) — search performs no additional filtering of its own
+(`TestSearch_MempoolFallback`).
+
+### Explicitly NOT added in this phase
+
+No mempool balance/activity on `/address/{address}` (confirmed-only,
+unchanged); no `live.js` mempool polling (mempool pages require a manual
+reload to see a newer generation); no pending/spendable-including-mempool
+balance anywhere; no new script classification logic in
+`internal/query`/`internal/api`/`internal/web` (script_type is read
+as-is from what Phase 2F.1 already classified and persisted); no schema
+change (`migrations/` is byte-for-byte unchanged); no change to Phase
+2F.1 write-side semantics (`ReplaceSnapshot`, synchronization interval,
+Core anchor acquisition, dependency persistence, generation semantics,
+vsize/weight semantics, mempool transaction decoding — all untouched).
+Final visual/UI polishing remains deferred until all functional phases
+are complete, per the project's existing phase ordering.
+
+### Serve smoke
+
+The real `qoge-explorer serve` binary (built from this branch, no source
+changes to `cmd/`) was run against an isolated, freshly migrated
+PostgreSQL schema seeded with one confirmed block and one mempool
+snapshot, with NO Core process reachable and NO Core RPC environment
+variables set. Every route responded 200:
+`/`, `/blocks`, `/block/{id}`, `/tx/{id}`, `/address/{address}`,
+`/mempool`, `/mempool/tx/{id}`, `/api/v1/status`, `/api/v1/mempool`,
+`/api/v1/mempool/tx/{id}`, `/healthz`, `/readyz`. A follow-up manual
+fresh/stale cycle against the same running process — (A) confirmed tip ==
+mempool anchor -> `fresh`; (B) confirmed tip advanced without a new
+mempool snapshot -> `stale`; (C) a new mempool snapshot anchored to the
+advanced tip -> `fresh` again — was verified through both the JSON API
+and the rendered HTML page at each step, confirming the freshness
+comparison behaves correctly against a real running server, not just
+inside the test suite.

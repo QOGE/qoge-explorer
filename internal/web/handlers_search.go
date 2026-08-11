@@ -19,8 +19,17 @@ import (
 //     does not duplicate that existence check);
 //   - exactly 64 lowercase hex characters is tried, in this fixed order,
 //     against the already-reviewed lookups: BlockByHash, TransactionByTxID,
-//     TransactionByWTxID — the first hit redirects there; no hit renders an
-//     explicit "nothing found" result page, never a guess;
+//     TransactionByWTxID, MempoolTransactionByTxID,
+//     MempoolTransactionByWTxID — the first hit redirects there; no hit
+//     renders an explicit "nothing found" result page, never a guess.
+//     Confirmed data always takes priority: a mempool match is only ever
+//     tried once every confirmed lookup has missed, so a mempool entry can
+//     never shadow a confirmed transaction (e.g. one that just confirmed
+//     but whose mempool row hasn't been cleared by the next snapshot yet).
+//     A mempool hit's destination page shows its own fresh/stale
+//     qualification (see templates/mempooltx.tmpl) — search itself performs
+//     no additional staleness filtering, it simply redirects to whatever
+//     the current cached snapshot has;
 //   - anything else within the ordinary address-shape bound is treated as
 //     an address and redirected to /address/{address}.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +73,22 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		} else if !errors.Is(err, query.ErrNotFound) {
 			s.renderInternalError(w, "search: transaction by wtxid", err)
+			return
+		}
+
+		if _, err := s.q.MempoolTransactionByTxID(ctx, q, false); err == nil {
+			http.Redirect(w, r, "/mempool/tx/"+q, http.StatusFound)
+			return
+		} else if !errors.Is(err, query.ErrNotFound) {
+			s.renderInternalError(w, "search: mempool transaction by txid", err)
+			return
+		}
+
+		if _, err := s.q.MempoolTransactionByWTxID(ctx, q, false); err == nil {
+			http.Redirect(w, r, "/mempool/tx/"+q, http.StatusFound)
+			return
+		} else if !errors.Is(err, query.ErrNotFound) {
+			s.renderInternalError(w, "search: mempool transaction by wtxid", err)
 			return
 		}
 

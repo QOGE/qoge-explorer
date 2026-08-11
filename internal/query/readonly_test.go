@@ -2,6 +2,7 @@ package query
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -18,8 +19,9 @@ import (
 // mutableContentSnapshot below for the check that actually catches that
 // class of bug (review round: task item 13).
 type dbSnapshot struct {
-	syncState, blocks, txs, variants, blockTxs, inputs, witness, outputs, addrs, addrOut, participants, utxo int64
-	indexedHeight                                                                                            int64
+	syncState, blocks, txs, variants, blockTxs, inputs, witness, outputs, addrs, addrOut, participants, utxo                int64
+	indexedHeight                                                                                                           int64
+	mempoolState, mempoolTxs, mempoolInputs, mempoolWitness, mempoolOutputs, mempoolAddrs, mempoolParticipants, mempoolDeps int64
 }
 
 func snapshotDB(t *testing.T, ctx context.Context, pool *pgxpool.Pool) dbSnapshot {
@@ -43,6 +45,14 @@ func snapshotDB(t *testing.T, ctx context.Context, pool *pgxpool.Pool) dbSnapsho
 	s.addrOut = count("output_addresses")
 	s.participants = count("output_participants")
 	s.utxo = count("utxo_state")
+	s.mempoolState = count("mempool_state")
+	s.mempoolTxs = count("mempool_transactions")
+	s.mempoolInputs = count("mempool_inputs")
+	s.mempoolWitness = count("mempool_input_witness")
+	s.mempoolOutputs = count("mempool_outputs")
+	s.mempoolAddrs = count("mempool_output_addresses")
+	s.mempoolParticipants = count("mempool_output_participants")
+	s.mempoolDeps = count("mempool_dependencies")
 	if err := pool.QueryRow(ctx, "SELECT indexed_height FROM sync_state WHERE name = 'main'").Scan(&s.indexedHeight); err != nil {
 		t.Fatalf("read sync_state: %v", err)
 	}
@@ -171,6 +181,12 @@ func TestReadOnlyEnforcement(t *testing.T) {
 
 	f := buildTxFixture(t, ctx, st)
 
+	mstore := newTestMempoolStore(pool)
+	roTx := mempoolCandidateTx(t, ctx, simpleMempoolRawTx("readonly-mempool", 0), 1000, 1_700_000_000, i64Ptr(1), boolPtr(true), nil)
+	if _, err := mstore.ReplaceSnapshot(ctx, mempoolCandidate(1, fakeHash("readonly-mempool-tip"), roTx)); err != nil {
+		t.Fatalf("seed mempool fixture: %v", err)
+	}
+
 	beforeCounts := snapshotDB(t, ctx, pool)
 	beforeContent := snapshotMutableContent(t, ctx, pool)
 
@@ -215,6 +231,24 @@ func TestReadOnlyEnforcement(t *testing.T) {
 	}
 	if _, err := q.AddressHistory(ctx, "qTxY1", nil, nil, 10); err != nil {
 		t.Fatalf("AddressHistory: %v", err)
+	}
+	if _, err := q.MempoolState(ctx); err != nil {
+		t.Fatalf("MempoolState: %v", err)
+	}
+	if _, err := q.MempoolOverview(ctx, nil, 50); err != nil {
+		t.Fatalf("MempoolOverview: %v", err)
+	}
+	if _, err := q.MempoolTransactionByTxID(ctx, roTx.TxID, false); err != nil {
+		t.Fatalf("MempoolTransactionByTxID: %v", err)
+	}
+	if _, err := q.MempoolTransactionByTxID(ctx, roTx.TxID, true); err != nil {
+		t.Fatalf("MempoolTransactionByTxID(raw witness): %v", err)
+	}
+	if _, err := q.MempoolTransactionByWTxID(ctx, roTx.WTxID, false); err != nil {
+		t.Fatalf("MempoolTransactionByWTxID: %v", err)
+	}
+	if _, err := q.MempoolTransactionByTxID(ctx, fakeHash("readonly-mempool-missing"), false); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("MempoolTransactionByTxID(missing): %v", err)
 	}
 
 	afterCounts := snapshotDB(t, ctx, pool)

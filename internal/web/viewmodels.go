@@ -88,3 +88,42 @@ type addressView struct {
 type searchView struct {
 	Query string
 }
+
+// mempoolPagination builds the "next page" link for /mempool. Unlike
+// blocksPagination/addressPagination (a single-value or two-value cursor),
+// a mempool page must carry all three MempoolCursor fields — generation
+// included — so a stale link (the mempool having since been replaced)
+// fails loudly via ErrMempoolGenerationChanged rather than silently
+// pointing at the wrong snapshot.
+func mempoolPagination(limit int, next *query.MempoolCursor) pagination {
+	if next == nil {
+		return pagination{}
+	}
+	v := url.Values{}
+	v.Set("generation", strconv.FormatInt(next.Generation, 10))
+	v.Set("before_entry_time", strconv.FormatInt(next.EntryTime, 10))
+	v.Set("before_txid", next.TxID)
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
+	return pagination{HasNext: true, NextURL: "/mempool?" + v.Encode()}
+}
+
+// mempoolView backs templates/mempool.tmpl. FirstPage is true only when the
+// request had no cursor at all — mirrors blocksView.FirstPage's rationale,
+// though mempool pages do not currently participate in live.js auto-refresh
+// (deliberately deferred — see docs/ARCHITECTURE.md §23 "No browser mempool
+// polling yet").
+type mempoolView struct {
+	Overview   query.MempoolOverview
+	Pagination pagination
+	FirstPage  bool
+}
+
+// mempoolTxView backs templates/mempooltx.tmpl: query.MempoolTransactionDetail
+// plus whether the caller opted into raw witness data — mirrors txView
+// exactly.
+type mempoolTxView struct {
+	query.MempoolTransactionDetail
+	IncludeWitness bool
+}

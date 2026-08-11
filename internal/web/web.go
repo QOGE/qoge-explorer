@@ -60,6 +60,8 @@ var knownGETRoutes = []string{
 	"/tx/{id}",
 	"/address/{address}",
 	"/search",
+	"/mempool",
+	"/mempool/tx/{id}",
 	"/static/",
 }
 
@@ -70,6 +72,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /tx/{id}", s.handleTx)
 	s.mux.HandleFunc("GET /address/{address}", s.handleAddress)
 	s.mux.HandleFunc("GET /search", s.handleSearch)
+	s.mux.HandleFunc("GET /mempool", s.handleMempool)
+	s.mux.HandleFunc("GET /mempool/tx/{id}", s.handleMempoolTx)
 
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
