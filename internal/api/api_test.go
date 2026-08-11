@@ -1,15 +1,14 @@
 package api
 
 import (
-	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
-	"github.com/QOGE/qoge-explorer/internal/chain"
 	"github.com/QOGE/qoge-explorer/internal/script"
 )
 
@@ -162,8 +161,11 @@ func TestTransactionEndpoint(t *testing.T) {
 		t.Fatalf("tx.TxID = %s, want %s", tx.TxID, g.Transactions[0].TxID)
 	}
 
-	// Same lookup via wtxid (equal to txid here, but exercises the
-	// fallback path identically).
+	// Lookup by this coinbase's own wtxid. Coinbase txid == wtxid, so this
+	// is a coincidental re-lookup, NOT a proof the wtxid fallback path
+	// works — see TestTransactionEndpoint_WTxIDFallback below for a
+	// fixture where txid != wtxid, which actually forces
+	// TransactionByTxID to miss and TransactionByWTxID to be exercised.
 	rec = doRequest(t, s, "GET", "/api/v1/tx/"+g.Transactions[0].WTxID)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("wtxid lookup status = %d", rec.Code)
@@ -182,92 +184,168 @@ func TestTransactionEndpoint(t *testing.T) {
 	}
 }
 
-// P2QPK witness policy at the HTTP layer: the default response body must
-// never contain the raw signature hex; ?include_witness=true must return it
-// byte-exact.
-func TestTransactionWitness_DefaultOmitsRaw_OptInIncludesIt(t *testing.T) {
+// 3 (review round): the wtxid identifier space is only genuinely exercised
+// when txid != wtxid — a witness-bearing transaction, decoded through the
+// real pipeline. GET by txid must succeed via TransactionByTxID directly;
+// GET by wtxid must MISS TransactionByTxID (ErrNotFound) and fall back to
+// TransactionByWTxID, and the response must report both identities
+// distinctly and correctly regardless of which one was requested.
+func TestTransactionEndpoint_WTxIDFallback(t *testing.T) {
 	ctx := context.Background()
 	s, st := newTestServer(t)
+	f := buildDecodedP2QPKFixture(t, ctx, st)
 
-	g := block("wit-g", 0, "", coinbaseTx("wit-g", 100_00000000, "qWitG"))
-	if err := st.ApplyBlock(ctx, g); err != nil {
-		t.Fatalf("apply genesis: %v", err)
-	}
-	b1 := block("wit-1", 1, g.Hash, coinbaseTx("wit-1", 50_00000000, "qWit1"))
-	if err := st.ApplyBlock(ctx, b1); err != nil {
-		t.Fatalf("apply block1: %v", err)
-	}
-	cbTxid := b1.Transactions[0].TxID
-
-	sigItem := bytes.Repeat([]byte{0xab}, script.P2QPKSignatureLength)
-	pubkeyItem := bytes.Repeat([]byte{0xcd}, script.P2QPKPublicKeyLength)
-	program := bytes.Repeat([]byte{0xef}, script.P2QPKProgramLength)
-	witnessVersion := script.P2QPKWitnessVersion
-
-	spendTxid := fakeHash("wit-spend-tx")
-	spendWtxid := fakeHash("wit-spend-wtx")
-	spend := chain.Transaction{
-		TxID: spendTxid, WTxID: spendWtxid,
-		Version: 2, LockTime: 0,
-		Size: 17200, VSize: 4310, Weight: 17240,
-		Inputs: []chain.Input{
-			{
-				Index:       0,
-				PreviousOut: &chain.OutPoint{TxID: cbTxid, Index: 0},
-				Sequence:    0xffffffff,
-				Witness:     chain.WitnessStack{sigItem, pubkeyItem},
-			},
-		},
-		Outputs: []chain.Output{
-			{
-				Index: 0, Value: chain.Amount(40_00000000),
-				ScriptPubKey:   bytes.Repeat([]byte{0x00}, 34),
-				ScriptType:     script.TypeP2QPK,
-				WitnessVersion: &witnessVersion,
-				WitnessProgram: program,
-				Address:        "qP2QPKDest",
-			},
-		},
-	}
-	b2 := block("wit-2", 2, b1.Hash, coinbaseTx("wit-2-cb", 50_00000000, "qWit2CB"), spend)
-	if err := st.ApplyBlock(ctx, b2); err != nil {
-		t.Fatalf("apply block2: %v", err)
+	if f.spendTxid == f.spendWtxid {
+		t.Fatalf("fixture invalid: witness-bearing tx must have txid != wtxid")
 	}
 
-	defaultRec := doRequest(t, s, "GET", "/api/v1/tx/"+spendTxid)
-	if defaultRec.Code != http.StatusOK {
-		t.Fatalf("default status = %d", defaultRec.Code)
-	}
-	bodyDefault := defaultRec.Body.String()
-	sigHexFull := hexEncode(sigItem)
-	if strings.Contains(bodyDefault, sigHexFull) {
-		t.Fatalf("default transaction response leaks the raw P2QPK signature hex")
+	type txJSON struct {
+		TxID  string `json:"txid"`
+		WTxID string `json:"wtxid"`
 	}
 
-	rawRec := doRequest(t, s, "GET", "/api/v1/tx/"+spendTxid+"?include_witness=true")
-	if rawRec.Code != http.StatusOK {
-		t.Fatalf("include_witness status = %d", rawRec.Code)
+	byTxid := doRequest(t, s, "GET", "/api/v1/tx/"+f.spendTxid)
+	if byTxid.Code != http.StatusOK {
+		t.Fatalf("txid lookup status = %d, body=%s", byTxid.Code, byTxid.Body.String())
 	}
-	bodyRaw := rawRec.Body.String()
-	if !strings.Contains(bodyRaw, sigHexFull) {
-		t.Fatalf("include_witness=true response does not contain the byte-exact signature hex")
+	var gotByTxid txJSON
+	decodeBody(t, byTxid, &gotByTxid)
+	if gotByTxid.TxID != f.spendTxid || gotByTxid.WTxID != f.spendWtxid {
+		t.Fatalf("txid lookup = %+v, want (txid=%s, wtxid=%s)", gotByTxid, f.spendTxid, f.spendWtxid)
 	}
 
-	// Malformed include_witness value.
-	rec := doRequest(t, s, "GET", "/api/v1/tx/"+spendTxid+"?include_witness=maybe")
-	if rec.Code != http.StatusBadRequest {
-		t.Fatalf("malformed include_witness status = %d, want 400", rec.Code)
+	byWtxid := doRequest(t, s, "GET", "/api/v1/tx/"+f.spendWtxid)
+	if byWtxid.Code != http.StatusOK {
+		t.Fatalf("wtxid lookup status = %d, body=%s", byWtxid.Code, byWtxid.Body.String())
+	}
+	var gotByWtxid txJSON
+	decodeBody(t, byWtxid, &gotByWtxid)
+	if gotByWtxid.TxID != f.spendTxid || gotByWtxid.WTxID != f.spendWtxid {
+		t.Fatalf("wtxid lookup = %+v, want (txid=%s, wtxid=%s) — proves the fallback path, not a coincidence",
+			gotByWtxid, f.spendTxid, f.spendWtxid)
 	}
 }
 
-func hexEncode(b []byte) string {
-	const digits = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
-	for i, c := range b {
-		out[i*2] = digits[c>>4]
-		out[i*2+1] = digits[c&0x0f]
+// P2QPK witness policy at the HTTP layer, through the REAL decode pipeline
+// (review item 1/2): the transaction travels rpc.RawBlock -> decode.DecodeBlock
+// -> Store.ApplyBlock -> query.Store -> HTTP, so script.TypeP2QPK is the
+// decoder's own classification of a structurally valid OP_2 PUSH32 <program>
+// scriptPubKey, never a fixture's say-so. The default response body must
+// never contain the raw signature hex and must report exact witness sizes
+// with no data_hex; ?include_witness=true must return both witness items
+// byte-exact after decoding, not merely via a substring match.
+func TestTransactionWitness_DefaultOmitsRaw_OptInIncludesIt(t *testing.T) {
+	ctx := context.Background()
+	s, st := newTestServer(t)
+	f := buildDecodedP2QPKFixture(t, ctx, st)
+
+	if f.spendTxid == f.spendWtxid {
+		t.Fatalf("fixture invalid: witness-bearing tx must have txid != wtxid")
 	}
-	return string(out)
+
+	type witnessJSON struct {
+		ItemIndex int     `json:"item_index"`
+		SizeBytes int     `json:"size_bytes"`
+		DataHex   *string `json:"data_hex,omitempty"`
+	}
+	type outputJSON struct {
+		ScriptType     string  `json:"script_type"`
+		Address        *string `json:"address,omitempty"`
+		WitnessVersion *int    `json:"witness_version,omitempty"`
+		WitnessProgram *string `json:"witness_program,omitempty"`
+	}
+	type inputJSON struct {
+		Witness []witnessJSON `json:"witness,omitempty"`
+	}
+	type txJSON struct {
+		Outputs []outputJSON `json:"outputs"`
+		Inputs  []inputJSON  `json:"inputs"`
+	}
+
+	sigHexFull := hex.EncodeToString(f.sigItem)
+	pubHexFull := hex.EncodeToString(f.pubkeyItem)
+	programHexFull := hex.EncodeToString(f.program)
+
+	// Default: structural P2QPK classification, no raw witness anywhere.
+	defaultRec := doRequest(t, s, "GET", "/api/v1/tx/"+f.spendTxid)
+	if defaultRec.Code != http.StatusOK {
+		t.Fatalf("default status = %d, body=%s", defaultRec.Code, defaultRec.Body.String())
+	}
+	var got txJSON
+	decodeBody(t, defaultRec, &got)
+
+	if len(got.Outputs) != 1 {
+		t.Fatalf("Outputs = %+v, want exactly 1", got.Outputs)
+	}
+	out := got.Outputs[0]
+	if out.ScriptType != string(script.TypeP2QPK) {
+		t.Fatalf("script_type = %s, want %s (decoder-assigned)", out.ScriptType, script.TypeP2QPK)
+	}
+	if out.WitnessVersion == nil || *out.WitnessVersion != script.P2QPKWitnessVersion {
+		t.Fatalf("witness_version = %v, want %d", out.WitnessVersion, script.P2QPKWitnessVersion)
+	}
+	if out.WitnessProgram == nil || *out.WitnessProgram != programHexFull {
+		t.Fatalf("witness_program = %v, want %s", out.WitnessProgram, programHexFull)
+	}
+	if out.Address == nil || *out.Address != "qDP2QPKDest" {
+		t.Fatalf("address = %v, want qDP2QPKDest (Core-provided, persisted as-is)", out.Address)
+	}
+
+	if len(got.Inputs) != 1 || len(got.Inputs[0].Witness) != 2 {
+		t.Fatalf("Inputs = %+v, want 1 input with a 2-item witness", got.Inputs)
+	}
+	w := got.Inputs[0].Witness
+	if w[0].SizeBytes != script.P2QPKSignatureLength || w[0].DataHex != nil {
+		t.Fatalf("default witness[0] = %+v, want size=%d data_hex=absent", w[0], script.P2QPKSignatureLength)
+	}
+	if w[1].SizeBytes != script.P2QPKPublicKeyLength || w[1].DataHex != nil {
+		t.Fatalf("default witness[1] = %+v, want size=%d data_hex=absent", w[1], script.P2QPKPublicKeyLength)
+	}
+
+	// Belt-and-suspenders: the default body must not leak the signature hex
+	// as a raw substring either, in addition to the structural check above.
+	if strings.Contains(defaultRec.Body.String(), sigHexFull) {
+		t.Fatalf("default transaction response leaks the raw P2QPK signature hex")
+	}
+
+	// Explicit opt-in: byte-exact raw witness, verified by decoding the hex
+	// back to bytes and checking both content and exact length — not a
+	// substring match.
+	rawRec := doRequest(t, s, "GET", "/api/v1/tx/"+f.spendTxid+"?include_witness=true")
+	if rawRec.Code != http.StatusOK {
+		t.Fatalf("include_witness status = %d, body=%s", rawRec.Code, rawRec.Body.String())
+	}
+	var gotRaw txJSON
+	decodeBody(t, rawRec, &gotRaw)
+	wr := gotRaw.Inputs[0].Witness
+
+	if wr[0].DataHex == nil || *wr[0].DataHex != sigHexFull {
+		t.Fatalf("raw witness[0] not byte-exact")
+	}
+	decodedSig, err := hex.DecodeString(*wr[0].DataHex)
+	if err != nil {
+		t.Fatalf("decode witness[0] hex: %v", err)
+	}
+	if len(decodedSig) != script.P2QPKSignatureLength {
+		t.Fatalf("decoded witness[0] length = %d, want exactly %d", len(decodedSig), script.P2QPKSignatureLength)
+	}
+
+	if wr[1].DataHex == nil || *wr[1].DataHex != pubHexFull {
+		t.Fatalf("raw witness[1] not byte-exact")
+	}
+	decodedPub, err := hex.DecodeString(*wr[1].DataHex)
+	if err != nil {
+		t.Fatalf("decode witness[1] hex: %v", err)
+	}
+	if len(decodedPub) != script.P2QPKPublicKeyLength {
+		t.Fatalf("decoded witness[1] length = %d, want exactly %d", len(decodedPub), script.P2QPKPublicKeyLength)
+	}
+
+	// Malformed include_witness value.
+	rec := doRequest(t, s, "GET", "/api/v1/tx/"+f.spendTxid+"?include_witness=maybe")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("malformed include_witness status = %d, want 400", rec.Code)
+	}
 }
 
 func TestAddressEndpoints(t *testing.T) {

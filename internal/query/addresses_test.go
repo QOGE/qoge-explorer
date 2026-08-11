@@ -167,9 +167,15 @@ func TestAddressSummary_OrphanExcluded(t *testing.T) {
 // output — used to build the genesis-address edge fixture below. Unlike
 // coinbaseTx (P2PKH), this exercises a script_type that Store deliberately
 // never inserts into utxo_state for height 0 (isGenesis) regardless of
-// script type — see Store.ApplyBlock's "Core UTXO semantics".
+// script type — see Store.ApplyBlock's "Core UTXO semantics". The
+// scriptPubKey bytes are a real structurally valid bare-P2PK script
+// (PUSH33 <33-byte compressed pubkey> OP_CHECKSIG, via p2pkScript), so
+// ScriptType and the raw script bytes agree — the database does not
+// cross-validate them, so a mismatched fixture would silently pass without
+// proving anything about real P2PK shape.
 func genesisP2PKTx(label string, valueSats int64, addr string) chain.Transaction {
 	txid := fakeHash(label + "-tx")
+	pkScript, _ := p2pkScript(label)
 	return chain.Transaction{
 		TxID: txid, WTxID: txid,
 		Version: 1, LockTime: 0,
@@ -179,7 +185,7 @@ func genesisP2PKTx(label string, valueSats int64, addr string) chain.Transaction
 			{Index: 0, Coinbase: []byte{0x51}, Sequence: 0xffffffff},
 		},
 		Outputs: []chain.Output{
-			{Index: 0, Value: chain.Amount(valueSats), ScriptPubKey: p2pkhScript(label), ScriptType: script.TypeP2PK, Address: addr},
+			{Index: 0, Value: chain.Amount(valueSats), ScriptPubKey: pkScript, ScriptType: script.TypeP2PK, Address: addr},
 		},
 	}
 }
