@@ -5,9 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QOGE Explorer</title>
 <link rel="stylesheet" href="/static/app.css">
+<script src="/static/live.js" defer></script>
 </head>
 <body>
 {{template "header" .}}
+<div id="live-chain-banner" class="container live-banner" hidden role="status" aria-live="polite">
+  <span data-live-banner-message>The indexed canonical tip changed.</span>
+  <button type="button" class="btn" data-live-banner-refresh>Refresh</button>
+</div>
 <main class="container">
 {{template "body" .}}
 </main>

@@ -25,5 +25,6 @@ func (s *Server) handleBlocks(w http.ResponseWriter, r *http.Request) {
 	s.render(w, "blocks", http.StatusOK, blocksView{
 		Blocks:     page.Blocks,
 		Pagination: blocksPagination(limit, page.NextBeforeHeight),
+		FirstPage:  before == nil,
 	})
 }

@@ -2734,8 +2734,10 @@ response — HTML pages, the static handler, and error pages alike — sets
 `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and a
 self-only `Content-Security-Policy` (`default-src 'self'; style-src
 'self'; img-src 'self'`; no inline scripts/styles are used anywhere in
-this phase). `internal/api`'s existing JSON headers/error contract are
-completely unmodified — `internal/web` never touches that package.
+this phase — Phase 2E.2 later adds `script-src 'self'` explicitly when it
+introduces the first embedded script, see §21). `internal/api`'s existing
+JSON headers/error contract are completely unmodified — `internal/web`
+never touches that package.
 
 ### Time and money display
 
@@ -2753,8 +2755,9 @@ monetary path" invariant §19 established.
 Phase 2E.1 pages are deterministic, fully server-rendered on each
 request — no WebSockets, no SSE, no polling/auto-refresh JavaScript, and
 no mempool UI. The explorer remains fully usable with JavaScript
-disabled; this phase ships no JavaScript at all. Live-refresh and mempool
-features are explicitly deferred to a later phase.
+disabled; this phase ships no JavaScript at all. Live-refresh is added,
+CONFIRMED-CHAIN ONLY, in Phase 2E.2 (§21); mempool remains deferred to a
+separate future phase.
 
 ### Testing
 
@@ -2780,3 +2783,191 @@ matching every prior phase.
 
 This phase does not add WebSockets/SSE/polling, a mempool view, or any
 JavaScript beyond what a future progressive-enhancement pass might add.
+
+## 21. Confirmed-chain live UI refresh (Phase 2E.2)
+
+Phase 2E.2 adds the first JavaScript this project ships:
+`internal/web/static/live.js`, a small polling client that notices when
+the INDEXED PostgreSQL checkpoint has moved and either reloads the page or
+shows a passive notification, so a browser tab left open doesn't silently
+go stale. It is explicitly CONFIRMED CHAIN ONLY — no mempool, no
+unconfirmed transactions, no WebSockets/SSE, no Core RPC access from
+`serve`, no background indexing in `serve`, no new persistence, and no
+client-side reconstruction of canonical state. `internal/query`,
+`internal/api`, `internal/store`, `internal/indexer`, `internal/decode`,
+`internal/script`, `internal/chain`, `internal/rpc`, and `migrations/` all
+have ZERO diff from Phase 2E.1 — this phase is confined to `internal/web`
+(plus `docs/ARCHITECTURE.md`).
+
+### The browser is a notifier, not a second explorer engine
+
+Phase 2E.1 deliberately guarantees that every server-rendered page is one
+coherent snapshot (§19 "Multi-statement read consistency", §20 "Composite
+read snapshots"). Piecemeal client-side updates — fetching several API
+objects and patching individual DOM nodes — would silently undo that
+guarantee by letting a single browser view mix data from different
+snapshots the same way the reviewed bugs in §19/§20 did at the server
+layer. `live.js` is deliberately kept incapable of this: it polls exactly
+one endpoint,
+
+```
+GET /api/v1/status
+```
+
+(already existing, unchanged — Phase 2E.2 needed no `internal/api`,
+`internal/query`, or schema change; the existing `indexed_height` /
+`indexed_block_hash` fields were already sufficient), and its only two
+actions are (a) trigger a normal full-page reload — `window.location.
+reload()`, which re-fetches the page through the exact same server-render
+path §19/§20 already guarantee is coherent — or (b) show a static
+notification banner asking the user to do that manually. It never issues
+a second `fetch` for block/transaction/address data and never writes
+blockchain-derived content into the DOM itself.
+
+### Polling behavior
+
+Every page loads `/static/live.js` (embedded via `go:embed`, same
+mechanism as `app.css` — no Node/npm/bundler, no CDN) via
+`<script src="/static/live.js" defer></script>` in `templates/
+layout.tmpl` — no inline script anywhere. It polls every 10 seconds with
+
+```js
+fetch("/api/v1/status", { cache: "no-store", headers: { "Accept": "application/json" } })
+```
+
+guarded by an in-flight flag so a slow response never overlaps the next
+scheduled poll. While `document.hidden` is true (a background tab), the
+poll function still fires on the interval but exits immediately without
+issuing a request — so a backgrounded tab generates no network load at
+all — and `visibilitychange` triggers one immediate poll the instant the
+tab becomes visible again, so the notification/reload decision is never
+stale by up to a full 10-second interval after switching back. A failed
+`fetch` (network hiccup, transient 5xx) is swallowed silently: the last
+known checkpoint is retained, nothing reloads, no false banner appears,
+and the console is never spammed — matching Phase 2E.1's principle that
+JavaScript failure must never break a page that already rendered
+correctly server-side.
+
+### Baseline tip: harmless data attributes, never executable data
+
+The home page and the first (cursor-less) `/blocks` page each expose the
+tip they were server-rendered from via plain HTML data attributes —
+`data-indexed-height`/`data-indexed-hash` on the home page's hero section
+(`templates/home.tmpl`, sourced from the same `Status` §20's
+`ExplorerOverview` already reads), and `data-block-height`/
+`data-block-hash` on every canonical block row (`templates/
+blocktable.tmpl`). `html/template`'s ordinary auto-escaping is what
+protects these — there is no separate escaping path to get wrong, and
+nothing is ever placed inside a `<script>` block or `javascript:` URL.
+`live.js` reads these once at load time as its baseline, before the first
+poll — this is what lets the FIRST poll detect a block that was indexed
+in the gap between the HTML snapshot being rendered and the script's
+first request actually firing.
+
+### Auto-refresh is opt-in per page, via one marker attribute
+
+A page is only ever eligible for an automatic reload if it contains an
+element carrying `data-live-refresh="home"` or `data-live-refresh="blocks"`
+— `live.js` looks for exactly one such element via
+`document.querySelector("[data-live-refresh]")`; its absence (every
+detail page, every paginated `/blocks?before=...`, and
+`?include_witness=true`) means "notify only, never reload," with no
+separate configuration needed. Concretely:
+
+- `templates/home.tmpl`'s hero section carries `data-live-refresh="home"`.
+- `templates/blocks.tmpl` wraps its block table in
+  `<div data-live-refresh="blocks">` only when `blocksView.FirstPage` is
+  true (`handlers_blocks.go` sets it from `before == nil`) — a historical
+  page never auto-reloads just because the global tip advances (a
+  requirement carried over unchanged from §20's height-cursor pagination
+  design).
+- `/block/{id}`, `/tx/{id}`, `/address/{address}`, and any
+  `?include_witness=true` transaction view carry no such marker at all,
+  so a person reading a transaction, inspecting an orphan block, or
+  viewing a raw 17,088-byte P2QPK witness is never interrupted by a
+  background reload, never loses scroll position, and never has that
+  witness view silently re-rendered.
+
+### Tip-change semantics: hash-changed, not "new block"
+
+The comparison signal is `indexed_block_hash` changing from what
+`live.js` last observed — never simply "height increased," because a
+reorg can replace the canonical block at an unchanged height, and
+`RollbackTo` followed by a replacement `ApplyBlock` can transiently move
+the reported height backward before the replacement lands. `live.js`
+never attempts to interpret *why* the hash changed (no client-side reorg
+logic) and never claims "New block" — the banner text is the neutral "The
+indexed canonical tip changed." For an auto-refresh-eligible page, a
+reload is only actually triggered once the newly observed height is at or
+above that page's own baseline height; if it's below (the rollback half
+of a reorg observed mid-flight), `live.js` shows the banner instead and
+lets a later poll observe the stabilized tip rather than reloading into a
+transient ancestor state.
+
+### The live banner
+
+One shared element, `#live-chain-banner` in `templates/layout.tmpl`,
+present (and `hidden`) on every page regardless of live-refresh
+eligibility — including detail pages, which only ever get the banner, never
+an automatic reload. It carries `role="status"` and `aria-live="polite"`
+so assistive technology announces it without stealing keyboard focus, and
+its "Refresh" control is a real `<button>` (not a div/span with a click
+handler bolted on) so it's reachable and operable via normal keyboard
+navigation. `live.js` only ever sets the banner's message via
+`textContent` — never `innerHTML` — and the message text itself is a
+fixed string, never interpolated from the API response body (§16 below).
+With JavaScript disabled, the banner's `hidden` attribute is never
+cleared, so it never appears and the "Refresh" button is simply inert
+dead markup — the rest of the page is completely unaffected, preserving
+Phase 2E.1's "usable with JavaScript disabled" property exactly.
+
+### Security posture
+
+The CSP gains an explicit `script-src 'self'` (`internal/web/web.go`):
+`default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'`
+— still no `unsafe-inline`, no `unsafe-eval`, no external host of any
+kind. `live.js` itself never calls `eval`, `new Function`, or
+`document.write`, and never sets `.innerHTML` — a dedicated Go test
+(`live_test.go`'s `TestLive_ScriptContract`) reads the embedded script
+source directly and asserts both the required substrings
+(`/api/v1/status`, `no-store`, `indexed_height`, `indexed_block_hash`) and
+the forbidden ones (`WebSocket`, `EventSource`, `/mempool`,
+`getrawmempool`, `innerHTML`, `eval(`, `new Function`, any `http://`/
+`https://` literal) are exactly as expected — pinning the architectural
+contract without needing a JS runtime in the Go test suite. `live.js`
+only ever reads `indexed_height`/`indexed_block_hash` from the status
+response; it never touches addresses, script bytes, witness data,
+transaction bodies, or monetary values, and never logs a raw API response
+body.
+
+### Testing
+
+`internal/web/live_test.go` covers the full contract: the layout loads
+`/static/live.js`; the banner is present, hidden, and carries
+`role="status"`/`aria-live="polite"`; the home page exposes its baseline
+tip via data attributes (including the "no blocks indexed yet" case,
+where `data-indexed-height="-1"` is present but `data-indexed-hash` is
+correctly absent); canonical block rows expose their own height/hash and
+only the cursor-less `/blocks` page carries the live-refresh-eligible
+wrapper; `/static/live.js` serves `200` with a JavaScript-compatible
+`Content-Type`; the CSP explicitly permits self-hosted script with no
+unsafe directives; no page contains an external `http(s)://` or CDN
+reference; and existing pages still render their full, meaningful content
+with nothing depending on script execution. All of Phase 2E.1's existing
+tests — canonical/orphan, txid/wtxid, P2QPK/P2TR, address history,
+genesis, multisig, pagination, escaping, security headers, error pages,
+and the `internal/query` concurrent-reorg snapshot tests
+(`TestSnapshotConsistency_ExplorerOverview_ConcurrentReorg`,
+`TestSnapshotConsistency_AddressDetail_ConcurrentReorg`, and the
+`BlockDetail`/`TransactionDetail` ones) — continue passing unmodified,
+confirming the live UI doesn't weaken any server-side snapshot guarantee.
+`internal/api`'s existing test suite also runs completely unmodified.
+
+### Explicitly deferred
+
+No mempool, no unconfirmed transactions, no WebSockets/SSE, no live
+balance/fee updates, no client-side monetary arithmetic, no address-page
+auto-refresh (address pages only update on an explicit user refresh, same
+as every other detail page). Mempool has different, ephemeral consistency
+semantics from confirmed-chain PostgreSQL state and remains a dedicated
+future phase.

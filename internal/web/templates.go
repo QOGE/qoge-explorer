@@ -9,7 +9,7 @@ import (
 //go:embed templates/*.tmpl
 var templateFS embed.FS
 
-//go:embed static/app.css
+//go:embed static/app.css static/live.js
 var staticFS embed.FS
 
 // pageTemplates are the shared layout/partials every page template is

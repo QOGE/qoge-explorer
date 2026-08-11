@@ -53,10 +53,17 @@ type homeView struct {
 	RecentBlocks []query.BlockSummary
 }
 
-// blocksView backs templates/blocks.tmpl.
+// blocksView backs templates/blocks.tmpl. FirstPage is true only when the
+// request had no "before" cursor — i.e. this page's first row is the
+// current canonical tip, not merely a historical page. Only that page is
+// live-refresh eligible (see templates/blocks.tmpl's data-live-refresh
+// attribute and docs/ARCHITECTURE.md §21): a historical/paginated
+// /blocks?before=... page must never auto-reload just because the global
+// tip advances.
 type blocksView struct {
 	Blocks     []query.BlockSummary
 	Pagination pagination
+	FirstPage  bool
 }
 
 // txView backs templates/tx.tmpl: query.TransactionDetail plus whether the
