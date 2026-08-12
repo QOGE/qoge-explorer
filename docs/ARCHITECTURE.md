@@ -861,10 +861,18 @@ indexed, requires trusting no indexed data at all, and can't be corrupted by
 an indexing bug. Deriving it from indexed coinbase totals minus a separately
 indexed fee figure requires *both* numbers to be correct, which is exactly
 the kind of double bookkeeping that let eIquidus's bug through unnoticed.
-The two numbers should still be cross-checked against each other
-periodically as an integrity check (`cumulative coinbase output value` should
-always equal `total issued supply + cumulative fees`) — a mismatch means an
-indexing bug, and is exactly the kind of alarm eIquidus had no way to raise.
+
+**Correction (Phase 2H.1 — see §26):** the two numbers are NOT expected to
+satisfy a strict equality, even for perfectly correct data. Confirmed
+directly against Qogecoin Core `stable` source (`src/validation.cpp`
+`ConnectBlock`): Core rejects a block only if `coinbase_output_total >
+subsidy + fees` ("bad-cb-amount") — a miner may validly claim LESS than
+the maximum available reward, and real chains do. `cumulative coinbase
+output value == total issued supply + cumulative fees` is therefore not a
+sound integrity check; the correct per-block invariant is `coinbase_output
++ unclaimed_reward == subsidy + fees` (`unclaimed_reward >= 0`), which is
+what §26's `block_accounting` table and `internal/accounting.
+ComputeBlockFacts` actually enforce.
 
 ## 7. Script classification model
 
@@ -4213,3 +4221,182 @@ ways — test-only, no production code was implicated:
   `TestDeploymentDetailPage_AllStatusesRenderSafely` (web) each verify
   the boundary object is reported/serialized/rendered exactly as Core
   sent it, with no special-cased transition branch in production code.
+
+## 26. Block monetary accounting foundation (Phase 2H.1)
+
+Phase 2H.1 adds the write/foundation layer for a future
+`GET /api/v1/supply`, `/supply` page, and rich-list/address-distribution
+work. It adds NO public API or HTML — those are deferred to Phase 2H.2
+(public read surface) and Phase 2H.3 (rich list). This section documents
+the monetary model, correcting and superseding the "Recommendation"
+paragraph at the end of §6, which is still correct about the subsidy
+formula and the general four-concepts framing, but predates the
+correction below about what invariant Core actually enforces.
+
+### Monetary terms
+
+Six distinct concepts, kept structurally separate (`internal/accounting`)
+so a bug in one can never silently contaminate another:
+
+- **Block subsidy** — the height-derived new-issuance entitlement, a pure
+  function of height (`accounting.BlockSubsidy`). Verified directly
+  against Qogecoin Core `stable` (not merely trusted from this document):
+  `src/validation.cpp`'s `GetBlockSubsidy` computes `CAmount nSubsidy =
+  100 * COIN; nSubsidy >>= halvings;` with `if (halvings >= 64) return
+  0;`; `src/consensus/amount.h` defines `COIN = 100000000`; `src/
+  chainparams.cpp`'s `CMainParams` sets `nSubsidyHalvingInterval =
+  500000`. This confirms the formula already stated in §6 —
+  `subsidy(height) = 100 QOGE >> (height / 500000)`, zero once 64
+  halvings have elapsed — with the exact Core source locations that
+  formula is drawn from.
+- **Transaction fees** — the exact sum of a block's non-coinbase
+  transaction fees, using the SAME `inputSum - outputSum` figure already
+  persisted to `transactions.fee_satoshis` by `applyTransaction` (§16
+  "Fee computation") — never a second, independently derived figure that
+  could disagree with it.
+- **Maximum available block reward** — `subsidy + fees`. Not a stored
+  column; a value `accounting.ComputeBlockFacts` derives on the fly.
+- **Actual coinbase output total** — the exact sum of every output of a
+  block's transaction index 0. OP_RETURN, unspendable, unknown, P2QPK,
+  and the genesis coinbase are all included — this is "what the coinbase
+  transaction's outputs actually paid," not "spendable miner reward."
+- **Unclaimed reward** — `subsidy + fees - actual coinbase output total`.
+  See "Coinbase correction" below for why a positive value here is
+  ordinary, valid chain state, not corruption.
+- **Issued supply** — `SUM(subsidy(h), h=0..tip)`, computed via
+  `accounting.IssuedSupplyThroughHeight` in O(number of halving eras)
+  (at most 64 iterations — one multiply-add per era), never O(height).
+  Genesis (height 0) is included: issued supply is what the consensus
+  schedule ENTITLES a height to, which is a different metric from
+  currently-spendable UTXO value — Core's own `ConnectBlock` never
+  inserts the genesis coinbase into the coins view at all (§16 "Core UTXO
+  semantics"), but that UTXO-set bookkeeping choice doesn't change what
+  height 0 was consensus-entitled to issue. `coinbase output total` is
+  never treated as issued supply (fees are transferred existing coins,
+  not new issuance), and `maximum reward` is never treated as actual
+  miner payout.
+
+### Coinbase correction: overclaim is the only rejected direction
+
+Core's `ConnectBlock` (`src/validation.cpp`) computes `CAmount
+blockReward = nFees + GetBlockSubsidy(...)` and rejects a block only if
+`block.vtx[0]->GetValueOut() > blockReward` (`"bad-cb-amount"`).
+Confirmed directly from source, not assumed: this means
+
+```
+coinbase_output_total == subsidy + fees
+```
+
+is **NOT** a consensus invariant — a miner may validly claim LESS than
+the maximum available reward. This corrects the older `docs/
+ARCHITECTURE.md` §6 wording, which described periodically cross-checking
+"`cumulative coinbase output value` should always equal `total issued
+supply + cumulative fees`" as an integrity check whose failure signals an
+indexing bug; that equality is not actually guaranteed even for perfectly
+correct data, since real miners can and do underclaim. `accounting.
+ComputeBlockFacts` reflects the corrected rule exactly: it rejects only
+`coinbase_output_total > subsidy + fees` (`ErrCoinbaseOverclaim`) and
+reports any lesser value as a positive, valid `UnclaimedRewardSatoshis` —
+never clamped, never treated as an error.
+
+### `internal/accounting`: pure, checked-arithmetic functions
+
+`internal/accounting` is DISPLAY/ACCOUNTING logic layered on top of an
+already-Core-validated chain — it never decides whether Core should have
+accepted a block, and Core remains the sole consensus authority.
+`BlockSubsidy`/`IssuedSupplyThroughHeight`/`ComputeBlockFacts` are pure
+functions: no floats anywhere (`chain.Amount`/plain `int64` satoshis
+throughout), negative heights rejected, and every accumulation checked
+against `int64` overflow rather than silently wrapping (mirroring
+`internal/store`'s existing `addChecked` policy from §16 "Fee
+computation").
+
+### Immutable, per-block `block_accounting` — not a cumulative counter
+
+`migrations/0004_block_accounting.up.sql` adds one table, keyed by
+`block_hash TEXT PRIMARY KEY REFERENCES blocks (hash)`, storing exactly
+one block's own subsidy/fee/coinbase-output/unclaimed-reward facts. This
+follows the SAME "immutable body vs. canonical derived state" split
+already used for `transaction_outputs` vs. `utxo_state` (§3b): a block's
+monetary facts are immutable properties of that block, exactly like its
+merkle root — they never change when a reorg later demotes the block off
+the canonical chain. `block_accounting` carries no `canonical` column of
+its own; `blocks.canonical` is already the single source of truth for
+which chain a block belongs to, and duplicating it here would let two
+canonical flags drift apart. `RollbackTo` (§18 "Reorg execution") marks
+`blocks.canonical = false` and never deletes the block row, so it never
+touches `block_accounting` either — an orphaned block's accounting row
+remains queryable as audit history, exactly like its transactions and
+outputs.
+
+Deliberately absent: any cumulative `total_issued`/`total_fees`/
+`total_coinbase`/`total_unclaimed` counter. An additive global monetary
+counter is exactly the eIquidus-style design this project already avoids
+elsewhere (§2) — it would require every `ApplyBlock` to correctly
+increment a running total (a single missed/duplicated increment corrupts
+it forever with no way to detect the drift), would need a parent-
+accounting dependency that breaks this codebase's frozen "arbitrary
+synthetic bootstrap height" test policy (§16, §18 "Fresh production sync
+always starts at genesis"), and would couple branch-independent per-block
+records to reorg-sensitive replay order. Issued supply doesn't need a
+running counter at all — it's a pure O(halving-eras) function of height
+(`IssuedSupplyThroughHeight`); a future cumulative fee/coinbase/unclaimed
+analytic, if ever needed, is deferred to Phase 2H.2 to be designed after
+benchmarking the real PostgreSQL chain, not decided speculatively here.
+
+`ApplyBlock` computes and idempotently persists this row inside the SAME
+transaction as everything else it writes (§16 "Atomicity"), using the
+SAME `insertOrVerifyIdempotent` idempotent-conflict machinery every other
+immutable identity in this package uses: a replay of the exact same block
+reapplies identical facts as a safe no-op, and contradictory facts for an
+already-persisted `block_hash` is `ErrImmutableConflict`, never silently
+overwritten. It is written after the transaction loop has produced the
+exact fee total and the coinbase output total, but strictly before the
+`sync_state` checkpoint update, which remains the final logical write.
+
+### Backfill: an explicit, separate command — not an invisible migration
+
+Migration 0004 is schema-only; it does not attempt to backfill millions
+of pre-existing rows inside a schema migration. A database indexed before
+migration 0004 existed has zero `block_accounting` rows for its existing
+blocks. `qoge-explorer backfill-accounting` (`cmd/qoge-explorer/main.go`)
+reconstructs them from already-indexed PostgreSQL data alone — it never
+calls Core RPC. For each stored block (canonical AND orphaned — this is
+immutable historical metadata independent of current canonical status),
+it derives fees and the coinbase output total strictly through that
+block's OWN occurrence (`block_transactions`), not the global
+`transactions` table, since the same txid can have more than one
+historical block occurrence across a reorg an indexer already resolved
+before the backfill ever ran.
+
+`BackfillAccounting` (`internal/store/backfill.go`) is idempotent and
+safely restartable: each block's row goes through the identical
+insert-or-verify path `ApplyBlock` itself uses, so an already-correct row
+is cheaply re-verified (not blindly skipped, and not re-derived from a
+fragile numeric progress counter — `block_hash`-keyed immutability is
+already a complete resume mechanism), a missing row is freshly inserted,
+and a contradictory existing row fails loudly rather than being silently
+overwritten. It takes a PostgreSQL session-level advisory lock for its
+whole duration, rejecting a second concurrent `backfill-accounting` run
+outright — but this does NOT, and cannot, serialize against a
+concurrently running `index` process (which serializes its own
+`ApplyBlock`/`RollbackTo` calls via a different mechanism, the
+`sync_state` row lock in §16 "Canonical tip continuity" — holding THAT
+lock for an entire backfill's duration would block live indexing for as
+long as the backfill takes). Stopping `index` before running
+`backfill-accounting` is therefore an operational requirement, documented
+in the command's own usage text, not a mechanically enforced one.
+
+### No `circulating_supply` label yet
+
+Phase 2H.1 introduces no stored or public metric named
+`circulating_supply`, in code or in this document. Genesis is
+intentionally absent from Core's own coins view, provably unspendable
+outputs are absent from `utxo_state`, bare multisig is intentionally
+excluded from address-balance ownership (§7/§13.A), and an unresolved/
+unknown script may have no `output_addresses` row at all — `SUM(utxo_state
+values)` and `SUM(addresses.balance)` are therefore both real, precise,
+independently useful metrics, but neither is safely labelable
+"circulating supply" without a UI layer carefully choosing its own
+terminology, which is explicitly deferred (Phase 2H.2/2H.3), not decided
+here.

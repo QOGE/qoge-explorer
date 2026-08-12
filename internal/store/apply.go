@@ -146,9 +146,18 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	isGenesis := block.Height == 0
 
 	touched := map[string]struct{}{}
+	var blockFeeTotal int64
 	for i, txn := range block.Transactions {
-		if err := applyTransaction(ctx, tx, block.Hash, i, txn, isGenesis, touched); err != nil {
+		fee, err := applyTransaction(ctx, tx, block.Hash, i, txn, isGenesis, touched)
+		if err != nil {
 			return fmt.Errorf("store: apply block %s tx %d (txid %s): %w", block.Hash, i, txn.TxID, err)
+		}
+		if fee != nil {
+			sum, ok := addChecked(blockFeeTotal, *fee)
+			if !ok {
+				return fmt.Errorf("%w: block %s fee total", ErrAmountOverflow, block.Hash)
+			}
+			blockFeeTotal = sum
 		}
 	}
 
@@ -156,6 +165,16 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 		if err := recomputeAddress(ctx, tx, addr); err != nil {
 			return fmt.Errorf("store: apply block %s: recompute address %s: %w", block.Hash, addr, err)
 		}
+	}
+
+	// Phase 2H.1: block_accounting is written only now — after the
+	// transaction loop above has produced the exact block fee total and
+	// block.Transactions[0].Outputs (this block's coinbase, guaranteed
+	// present and at index 0 by validateBlockShape) is available for the
+	// coinbase output total — but strictly BEFORE the checkpoint update
+	// below, inside this SAME transaction. See applyBlockAccounting.
+	if err := applyBlockAccounting(ctx, tx, block, blockFeeTotal); err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
 	}
 
 	// The checkpoint is the FINAL logical write (task item 10). Continuity
@@ -362,7 +381,13 @@ func addChecked(a, b int64) (int64, bool) {
 // the time each statement runs. Addresses this transaction created an
 // output for or spent a UTXO from are added to touched. isGenesis is
 // ApplyBlock's block.Height == 0 — see "Core UTXO semantics" on ApplyBlock.
-func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex int, txn chain.Transaction, isGenesis bool, touched map[string]struct{}) error {
+//
+// Returns this transaction's computed fee (nil for coinbase) — the SAME
+// value persisted into transactions.fee_satoshis, never a second
+// independently computed figure — so ApplyBlock can accumulate the block's
+// total non-coinbase fee for block_accounting (Phase 2H.1) without
+// re-deriving it (see docs/ARCHITECTURE.md §26 "Fee source").
+func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex int, txn chain.Transaction, isGenesis bool, touched map[string]struct{}) (*int64, error) {
 	hasWitness := false
 	for _, in := range txn.Inputs {
 		if !in.Witness.IsEmpty() {
@@ -371,7 +396,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		}
 	}
 	if (txn.WTxID == txn.TxID) == hasWitness {
-		return fmt.Errorf("%w: txid=%s wtxid=%s hasWitness=%t", ErrWitnessIdentityMismatch, txn.TxID, txn.WTxID, hasWitness)
+		return nil, fmt.Errorf("%w: txid=%s wtxid=%s hasWitness=%t", ErrWitnessIdentityMismatch, txn.TxID, txn.WTxID, hasWitness)
 	}
 
 	var fee *int64
@@ -379,15 +404,15 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		var inputSum int64
 		for _, in := range txn.Inputs {
 			if in.PreviousOut == nil {
-				return fmt.Errorf("store: non-coinbase input %d has no PreviousOut", in.Index)
+				return nil, fmt.Errorf("store: non-coinbase input %d has no PreviousOut", in.Index)
 			}
 			value, err := checkPrevout(ctx, tx, in.PreviousOut.TxID, int(in.PreviousOut.Index), txn.TxID, int(in.Index))
 			if err != nil {
-				return err
+				return nil, err
 			}
 			sum, ok := addChecked(inputSum, value)
 			if !ok {
-				return fmt.Errorf("%w: input value sum for tx %s", ErrAmountOverflow, txn.TxID)
+				return nil, fmt.Errorf("%w: input value sum for tx %s", ErrAmountOverflow, txn.TxID)
 			}
 			inputSum = sum
 		}
@@ -395,13 +420,13 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		for _, out := range txn.Outputs {
 			sum, ok := addChecked(outputSum, out.Value.Satoshis())
 			if !ok {
-				return fmt.Errorf("%w: output value sum for tx %s", ErrAmountOverflow, txn.TxID)
+				return nil, fmt.Errorf("%w: output value sum for tx %s", ErrAmountOverflow, txn.TxID)
 			}
 			outputSum = sum
 		}
 		f := inputSum - outputSum
 		if f < 0 {
-			return fmt.Errorf("%w: inputs=%d outputs=%d", ErrNegativeFee, inputSum, outputSum)
+			return nil, fmt.Errorf("%w: inputs=%d outputs=%d", ErrNegativeFee, inputSum, outputSum)
 		}
 		fee = &f
 	}
@@ -414,7 +439,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		txn.TxID, int64(txn.Version), int64(txn.LockTime), txn.IsCoinbase, fee,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	variantFresh, err := insertOrVerifyIdempotent(ctx, tx, "transaction_variant "+txn.WTxID,
@@ -425,7 +450,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		txn.WTxID, txn.TxID, txn.Size, txn.VSize, txn.Weight,
 	)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	if _, err := insertOrVerifyIdempotent(ctx, tx, fmt.Sprintf("block_transaction %s:%d", blockHash, txIndex),
@@ -434,32 +459,32 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		`SELECT txid = $3 AND wtxid = $4 FROM block_transactions WHERE block_hash = $1 AND tx_index = $2`,
 		blockHash, txIndex, txn.TxID, txn.WTxID,
 	); err != nil {
-		return err
+		return nil, err
 	}
 
 	if !transactionFresh {
 		if err := verifyExactCount(ctx, tx, "transaction_inputs for "+txn.TxID,
 			`SELECT count(*) FROM transaction_inputs WHERE txid = $1`, []any{txn.TxID}, len(txn.Inputs),
 		); err != nil {
-			return err
+			return nil, err
 		}
 		if err := verifyExactCount(ctx, tx, "transaction_outputs for "+txn.TxID,
 			`SELECT count(*) FROM transaction_outputs WHERE txid = $1`, []any{txn.TxID}, len(txn.Outputs),
 		); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	for _, in := range txn.Inputs {
 		if err := applyInput(ctx, tx, txn.TxID, txn.WTxID, in, variantFresh); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
 	for _, out := range txn.Outputs {
 		addr, err := applyOutput(ctx, tx, blockHash, txn.TxID, out, isGenesis)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if addr != "" {
 			touched[addr] = struct{}{}
@@ -470,7 +495,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		for _, in := range txn.Inputs {
 			addr, err := markSpent(ctx, tx, in.PreviousOut.TxID, int(in.PreviousOut.Index), txn.TxID, int(in.Index), blockHash)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if addr != "" {
 				touched[addr] = struct{}{}
@@ -478,7 +503,7 @@ func applyTransaction(ctx context.Context, tx pgx.Tx, blockHash string, txIndex 
 		}
 	}
 
-	return nil
+	return fee, nil
 }
 
 // checkPrevout resolves a non-coinbase input's previous output: it must

@@ -234,7 +234,7 @@ func TestApplyBlock_ImmutableChildSetCompleteness(t *testing.T) {
 	t.Run("G: same txid, added input rejected", func(t *testing.T) {
 		s, _ := newTestStore(t)
 		g0 := testBlock(hash64("compG0"), 100, "",
-			coinbaseTx(hash64("compG0tx"), out(0, 10_000_000_000, "qAlice"), out(1, 10_000_000_000, "qAlice2")),
+			coinbaseTx(hash64("compG0tx"), out(0, 4_000_000_000, "qAlice"), out(1, 4_000_000_000, "qAlice2")),
 		)
 		mustApply(t, ctx, s, g0)
 
@@ -267,7 +267,7 @@ func TestApplyBlock_ImmutableChildSetCompleteness(t *testing.T) {
 	t.Run("H: same txid, omitted input rejected", func(t *testing.T) {
 		s, _ := newTestStore(t)
 		h0 := testBlock(hash64("compH0"), 100, "",
-			coinbaseTx(hash64("compH0tx"), out(0, 10_000_000_000, "qAlice"), out(1, 10_000_000_000, "qAlice2")),
+			coinbaseTx(hash64("compH0tx"), out(0, 4_000_000_000, "qAlice"), out(1, 4_000_000_000, "qAlice2")),
 		)
 		mustApply(t, ctx, s, h0)
 

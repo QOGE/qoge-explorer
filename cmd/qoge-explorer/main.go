@@ -56,6 +56,8 @@ func main() {
 		os.Exit(runMigrate(cfg, log, os.Args[2:]))
 	case "index":
 		os.Exit(runIndex(cfg, log))
+	case "backfill-accounting":
+		os.Exit(runBackfillAccounting(cfg, log))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -92,6 +94,26 @@ Usage:
                                      never halts confirmed indexing. No
                                      API/UI. Run this as a separate process
                                      from serve.
+  qoge-explorer backfill-accounting Reconstruct block_accounting rows
+                                     (Phase 2H.1) for every block already in
+                                     the database — canonical and orphaned
+                                     alike — from already-indexed PostgreSQL
+                                     data only; never calls Core RPC. Only
+                                     needed on a database that was indexed
+                                     before migration 0004 existed; a
+                                     database indexed entirely on or after
+                                     0004 already has every row (ApplyBlock
+                                     writes it live). Idempotent and safely
+                                     restartable — rerun after an
+                                     interruption to continue. REQUIRES the
+                                     index process to be stopped first: this
+                                     command takes a PostgreSQL
+                                     advisory lock against a second
+                                     CONCURRENT backfill-accounting run, but
+                                     that lock does not, and cannot,
+                                     serialize against a live indexer
+                                     writing new blocks at the same time —
+                                     see docs/ARCHITECTURE.md §26.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -100,7 +122,8 @@ Configuration is read from environment variables:
   QOGE_RPC_PASSWORD         required for check-rpc, index
   QOGE_RPC_TLS              default false     (check-rpc, index)
   QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc, index)
-  QOGE_DATABASE_URL         required for migrate/index/serve, e.g. postgres://user:pass@host:5432/dbname
+  QOGE_DATABASE_URL         required for migrate/index/serve/backfill-accounting,
+                             e.g. postgres://user:pass@host:5432/dbname
   QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
   QOGE_NETWORK              required for index; must exactly match Core's
                              getblockchaininfo "chain" (e.g. main/test/regtest)
@@ -333,6 +356,70 @@ func runMigrate(cfg config.Config, log interface {
 		fmt.Fprintf(os.Stderr, "unknown migrate subcommand: %s\n", args[0])
 		return 2
 	}
+}
+
+// runBackfillAccounting reconstructs block_accounting (Phase 2H.1) for
+// every already-indexed block from PostgreSQL data alone — see
+// store.Store.BackfillAccounting's doc comment for the full idempotency/
+// concurrency contract. It does not connect to Core RPC and does not
+// require any RPC configuration.
+func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	st := store.New(pool)
+
+	before, err := store.CheckAccountingCompleteness(ctx, pool)
+	if err != nil {
+		log.Error("pre-backfill completeness check failed", "error", err)
+		return 1
+	}
+	log.Info("starting accounting backfill",
+		"blocks", before.BlockCount, "existing_accounting_rows", before.AccountingCount, "missing", before.MissingCount)
+
+	start := time.Now()
+	result, err := st.BackfillAccounting(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Error("accounting backfill failed", "error", err, "elapsed", elapsed.String())
+		return 1
+	}
+
+	after, err := store.CheckAccountingCompleteness(ctx, pool)
+	if err != nil {
+		log.Error("post-backfill completeness check failed", "error", err)
+		return 1
+	}
+
+	fmt.Println("qoge-explorer backfill-accounting")
+	fmt.Println("----------------------------------")
+	fmt.Printf("blocks considered:   %d\n", result.TotalBlocks)
+	fmt.Printf("rows inserted:       %d\n", result.Inserted)
+	fmt.Printf("rows verified:       %d\n", result.Verified)
+	fmt.Printf("blocks (final):      %d\n", after.BlockCount)
+	fmt.Printf("accounting (final):  %d\n", after.AccountingCount)
+	fmt.Printf("missing (final):     %d\n", after.MissingCount)
+	fmt.Printf("elapsed:             %s\n", elapsed)
+
+	if after.MissingCount != 0 {
+		log.Error("accounting backfill completed but coverage is still incomplete", "missing", after.MissingCount)
+		return 1
+	}
+
+	log.Info("accounting backfill complete", "elapsed", elapsed.String())
+	return 0
 }
 
 // runIndex validates the Core/database/network environment, then runs

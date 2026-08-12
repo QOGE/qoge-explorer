@@ -936,7 +936,7 @@ func TestApplyBlock_RealMainnetFixtures(t *testing.T) {
 			txid:      "1d4bdd70951bae6dd62b265a1877b7b140ea86b6ff0cd51102eec801c3947a1d",
 			scriptHex: "21029f94e03d2ba37bda673eb132687705ac284d380478d63cbce0c19e2f0bd597cdac",
 			wantType:  script.TypeP2PK,
-			value:     10_000_000_000,
+			value:     5_000_000_000,
 		},
 		{
 			name:      "block 8000 coinbase — P2PKH",
@@ -945,7 +945,7 @@ func TestApplyBlock_RealMainnetFixtures(t *testing.T) {
 			txid:      "a8ee14b21e7d42a4e9c155de159c9836ce932d4c4cccf77a0f23a71acd031b45",
 			scriptHex: "76a914db6cdf671aa4dc3a395b934ca08bffb54658f36c88ac",
 			wantType:  script.TypeP2PKH,
-			value:     10_000_000_000,
+			value:     4_000_000_000,
 		},
 		{
 			name:      "block 38393 — OP_RETURN witness commitment",

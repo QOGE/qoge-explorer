@@ -1,8 +1,9 @@
 # qoge-explorer
 
-Permanent QOGE block explorer (Go). Phase 1: environment reconnaissance and
-project skeleton only — no indexing yet. See `docs/ARCHITECTURE.md` for the
-full design.
+Permanent QOGE block explorer (Go): indexes the confirmed chain, mempool,
+and consensus deployment state into PostgreSQL, and serves a read-only
+JSON API plus a server-rendered HTML explorer UI over it. See
+`docs/ARCHITECTURE.md` for the full design.
 
 ## Build
 
@@ -25,5 +26,6 @@ QOGE_RPC_PASSWORD=...
 
 ```
 QOGE_RPC_USER=... QOGE_RPC_PASSWORD=... ./bin/qoge-explorer check-rpc
-QOGE_RPC_USER=... QOGE_RPC_PASSWORD=... ./bin/qoge-explorer serve   # loopback health endpoint only
+QOGE_RPC_USER=... QOGE_RPC_PASSWORD=... QOGE_NETWORK=main QOGE_DATABASE_URL=... ./bin/qoge-explorer index
+QOGE_DATABASE_URL=... ./bin/qoge-explorer serve   # read-only JSON API + HTML UI; no RPC credentials needed
 ```
