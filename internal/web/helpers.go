@@ -10,9 +10,12 @@ import (
 // already been decided by internal/query; these only format it for
 // display.
 var templateFuncs = template.FuncMap{
-	"formatTimeUTC": formatTimeUTC,
-	"spentLabel":    spentLabel,
-	"yesNo":         yesNo,
+	"formatTimeUTC":    formatTimeUTC,
+	"spentLabel":       spentLabel,
+	"yesNo":            yesNo,
+	"formatObservedAt": formatObservedAt,
+	"replaceableLabel": replaceableLabel,
+	"prevOutLink":      prevOutLink,
 }
 
 // formatTimeUTC renders a block header's Unix timestamp as an unambiguous
@@ -43,4 +46,44 @@ func yesNo(b bool) string {
 		return "yes"
 	}
 	return "no"
+}
+
+// formatObservedAt renders mempool_state.observed_at (nil when the mempool
+// cache has never successfully synchronized — see query.MempoolState) as an
+// unambiguous absolute UTC time, same convention as formatTimeUTC.
+func formatObservedAt(t *time.Time) string {
+	if t == nil {
+		return "never"
+	}
+	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
+// prevOutLink returns the correct navigation target for a mempool
+// transaction input's previous output. A mempool transaction input can
+// spend EITHER another current mempool transaction OR an already-confirmed
+// one — Core's "depends" list (query.MempoolTransactionDetail.Depends,
+// already loaded into every detail response) is the only reliable, already
+// -available signal for which: prevTxid links to "/mempool/tx/{prevTxid}"
+// only when it's one of THIS transaction's own in-mempool parents,
+// otherwise "/tx/{prevTxid}" (confirmed). This never queries the database
+// merely to choose a link — see docs/ARCHITECTURE.md §23.
+func prevOutLink(prevTxid string, depends []string) string {
+	for _, d := range depends {
+		if d == prevTxid {
+			return "/mempool/tx/" + prevTxid
+		}
+	}
+	return "/tx/" + prevTxid
+}
+
+// replaceableLabel distinguishes the three states Core's
+// "bip125-replaceable" metadata carries (see
+// query.MempoolTxSummary.Replaceable/MempoolTransactionDetail.Replaceable's
+// doc comments): nil means Core did not report reliable RBF metadata for
+// this transaction — never presented as a false "no".
+func replaceableLabel(b *bool) string {
+	if b == nil {
+		return "unknown"
+	}
+	return yesNo(*b)
 }
