@@ -23,6 +23,7 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/api"
 	"github.com/QOGE/qoge-explorer/internal/config"
 	"github.com/QOGE/qoge-explorer/internal/decode"
+	"github.com/QOGE/qoge-explorer/internal/deployments"
 	"github.com/QOGE/qoge-explorer/internal/indexer"
 	"github.com/QOGE/qoge-explorer/internal/logging"
 	"github.com/QOGE/qoge-explorer/internal/mempool"
@@ -419,6 +420,28 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 		mempoolSync.Run(mempoolCtx)
 	}()
 
+	// The deployment observer (Phase 2G.1) runs alongside confirmed
+	// indexing and the mempool synchronizer, on the same process (it
+	// needs the same Core RPC credentials `serve` deliberately never
+	// has) but against entirely separate PostgreSQL tables
+	// (chain_deployments, deployment_state — migrations/
+	// 0003_deployment_state.up.sql), sharing only the read-only confirmed
+	// checkpoint. deploymentCtx is cancelled explicitly after idx.Run
+	// returns, exactly like mempoolCtx, so a confirmed-indexing halt
+	// stops the deployment observer rather than leaking its goroutine.
+	deploymentCtx, cancelDeployment := context.WithCancel(ctx)
+	defer cancelDeployment()
+
+	deploymentStore := deployments.NewStore(pool)
+	deploymentSync := deployments.New(client, st, deploymentStore, deployments.DefaultPollInterval, log)
+
+	var deploymentWG sync.WaitGroup
+	deploymentWG.Add(1)
+	go func() {
+		defer deploymentWG.Done()
+		deploymentSync.Run(deploymentCtx)
+	}()
+
 	log.Info("starting indexer", "poll_interval", pollInterval.String())
 	// idx.Run returns nil on a clean SIGINT/SIGTERM shutdown; any non-nil
 	// error is a deterministic halt (decode/store/integrity/deep-reorg
@@ -427,11 +450,15 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 	// mempool.Synchronizer.Run logs and retries its own failures
 	// internally and never returns an error at all (docs/ARCHITECTURE.md
 	// §22): confirmed indexing remains authoritative and is never halted
-	// by mempool trouble.
+	// by mempool trouble. A deployment observation failure never
+	// surfaces here either, for the identical reason
+	// (deployments.Synchronizer.Run — docs/ARCHITECTURE.md §24).
 	runErr := idx.Run(ctx)
 
 	cancelMempool()
 	mempoolWG.Wait()
+	cancelDeployment()
+	deploymentWG.Wait()
 
 	if runErr != nil {
 		log.Error("indexer halted", "error", runErr)

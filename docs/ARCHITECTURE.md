@@ -3616,3 +3616,297 @@ advanced tip -> `fresh` again — was verified through both the JSON API
 and the rendered HTML page at each step, confirming the freshness
 comparison behaves correctly against a real running server, not just
 inside the test suite.
+
+## 24. Consensus deployment observer: write/cache foundation (Phase 2G.1)
+
+Phase 2G.1 adds explorer-native observation of Qogecoin Core's BIP9/
+versionbits deployment state (`getdeploymentinfo`), following the exact
+shape Phase 2F.1 established for the mempool cache: a dedicated package
+(`internal/deployments`) that calls Core RPC, strictly decodes the
+response, and atomically replaces an isolated PostgreSQL cache — used by
+`qoge-explorer index` only. This phase is the write/cache foundation
+ONLY: no public deployment API, no deployment web page, no P2QPK
+activation UI, no signalling visualization, no browser polling. Those
+belong to Phase 2G.2.
+
+### Core is authoritative
+
+The explorer never recreates VersionBits state transitions, never infers
+LOCKED_IN/ACTIVE itself, and never counts signalling blocks
+independently of Core's own reported statistics. `internal/deployments`
+strictly decodes and caches whatever `getdeploymentinfo` returns; it has
+no opinion of its own about what a deployment's status "should" be.
+
+### Scope: BIP9 deployments only
+
+`getdeploymentinfo` reports two kinds of deployment: `"buried"` (static
+historical consensus rules — e.g. BIP34/65/66, CSV, SegWit on a real
+chain — activated unconditionally at a fixed height, with no ongoing
+status model) and `"bip9"` (the versionbits signalling/threshold model:
+`defined` -> `started` -> `locked_in` -> `active`, or `started` ->
+`failed`). The existing `chain_deployments` table (migration
+0001_initial) is shaped around the BIP9 status enum
+(`defined`/`started`/`locked_in`/`active`/`failed`) plus `since_height` —
+there is no equivalent status concept for a buried deployment, so this
+phase does not invent one. `internal/deployments.DecodeDeploymentInfo`
+decodes every deployment object just enough to prove it isn't malformed
+(so a genuinely broken response is still rejected outright), then
+persists ONLY the entries whose `"type"` is `"bip9"`; buried entries are
+intentionally dropped before ever reaching a database write.
+
+P2QPK is a BIP9 deployment (Core's `DeploymentInfo` includes
+`Consensus::DEPLOYMENT_P2QPK` alongside every other enabled deployment),
+so it is naturally included by this same, non-special-cased path — the
+deployment map key `internal/deployments` persists is whatever name Core
+reports (`DeploymentName`'s result), never hardcoded, and its
+status/statistics are never estimated, forced, or precomputed locally.
+
+### Schema: `deployment_state` singleton (migration 0003)
+
+`migrations/0001_initial.*` and `migrations/0002_mempool_cache.*` are
+untouched by this phase. A new migration,
+`migrations/0003_deployment_state.*`, adds exactly one table:
+`deployment_state`, a singleton (`name = 'main'`) shaped identically to
+`mempool_state` (§22) — `initialized`, `generation`, `core_tip_height`,
+`core_tip_hash`, `deployment_count`, `observed_at` — with the same
+CHECK-constraint-enforced UNINITIALIZED/INITIALIZED consistency:
+
+- **UNINITIALIZED** (`initialized=false`): never successfully observed —
+  `generation=0`, `core_tip_height`/`core_tip_hash`/`observed_at` all
+  NULL, `deployment_count=0`.
+- **INITIALIZED** (`initialized=true`): successfully observed at least
+  once — `generation>=1`, a valid Core tip anchor, `observed_at` set.
+  This includes the legitimate **initialized-empty** case
+  (`deployment_count=0`, `initialized=true`): a real observation that
+  happened to find zero BIP9 deployments is synchronized state, not
+  "nothing happened" — indistinguishable from "never synchronized" by
+  `SELECT count(*) FROM chain_deployments` alone, which is exactly why
+  this explicit state table exists (mirrors `mempool_state`'s identical
+  rationale in §22).
+
+`chain_deployments` (from migration 0001) remains the per-deployment
+cache table; this phase does not rewrite 0001 merely because that table
+was created there. `deployment_state.deployment_count` and
+`chain_deployments`'s actual row count are kept in lockstep by
+`Store.ReplaceSnapshot` writing both inside the same transaction (below).
+Migration 0003's down migration removes only `deployment_state` —
+`chain_deployments` is never dropped by rolling 0003 back, since it
+belongs to 0001 and schema v2 must remain valid afterward. A migration
+round-trip test (v2 -> v3 -> v2 -> v3) with real pre-existing confirmed,
+address, and mempool data seeded beforehand proves none of it is
+disturbed by 0003 in either direction.
+
+### Anchored acquisition: explicit hash, before/after tip checks
+
+`internal/deployments.Synchronizer.refreshOnce` never calls
+`getdeploymentinfo` with no argument (Core's implicit, possibly-moving,
+active tip). It always supplies an EXPLICIT block hash — the confirmed
+PostgreSQL checkpoint's own hash — and follows the same anchored
+acquisition shape Phase 2F.1 established for the mempool cache (§22):
+
+1. Read the confirmed checkpoint (`sync_state` via `store.Checkpoint`).
+   An uninitialized checkpoint (`Height < 0`, the explorer has never
+   synced) skips publication.
+2. Read Core's active tip (`GetBlockCount` then `GetBlockHash(height)` —
+   a height-indexed lookup, not `GetBestBlockHash`, mirroring
+   `indexer.Indexer.confirmCaughtUp`'s style). Require it equal the
+   confirmed checkpoint; if the confirmed index is still behind (or
+   simply disagrees at the same height, e.g. mid-reorg), this cycle
+   skips publication — historical confirmed indexing is never blocked
+   or slowed by this check.
+3. Call `getdeploymentinfo <confirmed-checkpoint-hash>`. Require the
+   response's own self-reported `hash`/`height` match what was queried;
+   a disagreement here is a wire-integrity problem and discards the
+   candidate exactly like a race would.
+4. Strictly decode every deployment; keep only `type == "bip9"`.
+5. Re-read Core's active tip and the confirmed checkpoint.
+6. Require every anchor observed during this cycle — the initial
+   confirmed tip, the initial Core tip, `getdeploymentinfo`'s own
+   response anchor, the final Core tip, and the final confirmed tip —
+   all agree. If anything moved, the candidate is discarded and the
+   previous snapshot is preserved untouched; the next poll cycle retries.
+
+`getdeploymentinfo <hash>` can inspect a known block by hash regardless
+of whether it's still Core's active tip — querying the confirmed
+checkpoint's own hash is not, by itself, proof that hash is STILL Core's
+canonical tip if a reorg happens concurrently with acquisition. The
+before/after active-tip re-reads close that practical race window. As
+with every other cross-system check in this project (§18's
+`confirmCaughtUp`, §22's mempool acquisition), this is NOT a claim of
+mathematical cross-system atomicity — Core and PostgreSQL can never share
+one atomic snapshot. A genuine mismatch here just means this cycle
+publishes nothing; deterministic, race-free fixture tests (a fake RPC
+client and a fake confirmed-tip reader, no sleeps) cover every one of
+these skip/discard paths, including a temporary RPC failure and a
+malformed deployment object, in both cases proving the previously
+committed snapshot survives untouched.
+
+### Atomic replacement: `internal/deployments.Store.ReplaceSnapshot`
+
+One PostgreSQL transaction: lock `deployment_state('main')` FOR UPDATE
+(serializing concurrent writers, the same row-lock-first pattern
+`mempool.Store.ReplaceSnapshot` and `internal/store`'s
+`lockCheckpoint` use), `DELETE FROM chain_deployments` (full replacement,
+never incremental deltas), insert every surviving BIP9 deployment,
+`UPDATE deployment_state` LAST (`initialized=true`,
+`generation=generation+1`, the anchor, `deployment_count`,
+`observed_at`), then `COMMIT`. Any error at any step rolls back the
+whole transaction — the prior complete snapshot is exactly as it was; a
+half-replaced deployment cache is never observable. A reader always sees
+either the whole of generation N or the whole of generation N+1, never a
+partial mix. `generation` increments on every successful commit —
+including a non-empty -> empty transition, an empty -> non-empty
+transition, or a snapshot whose values happen to be byte-identical to
+the previous one — and is left unchanged by any failed or skipped
+observation. Each row of one snapshot shares the exact same
+`checked_at`/`observed_at` timestamp
+(`internal/deployments.Candidate.ObservedAt`), computed once per
+acquisition cycle.
+
+Store-level tests (real PostgreSQL, isolated per-test schema) exercise:
+initial publication (uninitialized -> generation 1, correct rows,
+correct anchor); full replacement (snapshot A's `p2qpk started` becomes
+B's `p2qpk locked_in` — only B is visible after commit); non-empty ->
+empty and empty -> non-empty transitions; and a failure injected AFTER
+`DELETE`/some rows' `INSERT` have already run inside the transaction
+(a deployment candidate with syntactically invalid JSON bytes, which
+passes Go-level candidate validation but is rejected by PostgreSQL's
+JSONB column type at `INSERT` time) — proving the previous snapshot's
+rows and `deployment_state` row are both completely preserved, with
+`generation` unchanged and none of the failed candidate's rows leaked
+in.
+
+### Exact raw JSON preservation
+
+`chain_deployments.raw_json` for a persisted BIP9 deployment is the exact
+semantic JSON object `getdeploymentinfo` returned for that deployment —
+never reconstructed from the normalized `name`/`status`/`since_height`
+columns after decoding. `internal/rpc.RawDeploymentInfo` deliberately
+keeps each deployment's bytes as `json.RawMessage` rather than eagerly
+unmarshaling into a typed map value, so the bytes that reach
+`Store.ReplaceSnapshot` and PostgreSQL are the same bytes Core sent, not
+a round-tripped Go-struct re-marshal (which could reorder fields or
+reformat numbers even when semantically identical). JSONB's own
+canonical key-ordering on read-back is acceptable per this phase's
+scope — the invariant is no field loss, no invented fields, and exact
+value preservation, not byte-for-byte key order — and a round-trip test
+using a realistic BIP9 object with every documented field
+(`type`, `active`, `bip9.bit`, `start_time`, `timeout`,
+`min_activation_height`, `status`, `since`, `status_next`,
+`statistics.period`, `statistics.threshold`, `statistics.elapsed`,
+`statistics.count`, `statistics.possible`, `signalling`) present
+confirms semantic equality survives both the decode step and a real
+PostgreSQL write/read cycle.
+
+### Strict decoding, honoring Core's actual field optionality
+
+`internal/deployments.DecodeDeploymentInfo` rejects a malformed or
+out-of-range field rather than silently normalizing it: hash format
+(lowercase 64-hex), non-negative heights, deployment name shape, `type`
+constrained to `"buried"`/`"bip9"`, BIP9 `status`/`status_next`
+constrained to the exact five-value enum, `bit` in `[0,28]` when
+present, and `statistics` internal consistency (`period > 0`,
+`0 <= elapsed <= period`, `0 <= count <= elapsed`, and
+`0 < threshold <= period` when threshold is present) when Core supplies
+a `statistics` object at all. Crucially, the decoder never REQUIRES a
+field in a state where Core legitimately omits it: `bit`, `statistics`,
+`statistics.threshold`, `statistics.possible`, `signalling`, and the
+top-level `height` (on `bip9`-type entries) are all optional and decoded
+as such — DEFINED carries no signalling statistics, LOCKED_IN may omit
+`threshold`/`possible`, and ACTIVE may omit `bit`/`statistics`/
+`signalling` entirely. Fixtures covering every BIP9 status
+(defined/started/locked_in/active/failed) deliberately do NOT give every
+state an identical optional-field shape, so the decoder is proven
+against Core's actual behavior rather than one hand-invented fixed JSON
+shape. (Fixture note: any deployment JSON used in this phase's tests,
+including the `p2qpk`-named fixtures, uses synthetic constants for
+illustration — none are asserted as real Qogecoin mainnet consensus
+values.)
+
+**Required-field presence, not just value ranges.** A field Core always
+emits (top-level `height`/`deployments`; per-deployment `active`; every
+`bip9` deployment's `start_time`/`timeout`/`min_activation_height`/
+`status`/`status_next`/`since`; `bip9.statistics`'s `period`/`elapsed`/
+`count` whenever `statistics` itself is present; a buried deployment's
+`height`) is decoded through a `*T` field in `internal/rpc`'s DTOs
+(`RawDeploymentInfo.Height`, `RawDeployment.Active`,
+`RawBIP9Deployment.StartTime`/`Timeout`/`MinActivationHeight`/`Since`,
+`RawBIP9Statistics.Period`/`Elapsed`/`Count`), never a bare Go scalar.
+This matters because encoding/json cannot otherwise tell "the field is
+absent, or explicitly `null`" apart from "the field is present with its
+legitimate zero value" — several of these fields (`since`, `start_time`,
+`elapsed`, `count`, buried `height`) can genuinely BE zero, so a bare
+`int64`/`bool` would let a malformed or truncated Core response pass
+strict decoding by silently becoming its zero value. `Deployments`
+itself stays a plain (non-pointer) map: Go's own `encoding/json`
+already leaves a map field `nil` for both a missing key and an explicit
+`null`, while allocating a non-nil (possibly empty) map for a present
+`{}` — exactly the three-way distinction needed to reject a
+missing/null `deployments` object while still accepting Core's
+legitimate `"deployments": {}` (an initialized, zero-BIP9-deployment
+snapshot; see the STATE section above). `Status`/`StatusNext` stay
+plain strings deliberately: their missing/null zero value (`""`) is
+already outside `validBIP9Statuses` and is rejected by the existing
+enum check without needing a pointer. This required/optional split is
+verified directly against `QOGE/qogecoin` stable's
+`rpc/blockchain.cpp` (`SoftForkDescPushBack`), not inferred from
+observed responses alone, and re-confirmed by feeding a real captured
+`getdeploymentinfo` response from a synced mainnet node through the
+corrected decoder.
+
+### Non-mutation of confirmed and mempool state
+
+`internal/deployments` never reads or writes any confirmed-chain table
+(`sync_state`, `blocks`, `transactions`, `transaction_variants`,
+`block_transactions`, `transaction_inputs`, `transaction_input_witness`,
+`transaction_outputs`, `output_addresses`, `output_participants`,
+`utxo_state`, `addresses`) or any `mempool_*` table. Tests seed real
+confirmed state via `internal/store.Store.ApplyBlock` and a real mempool
+snapshot via `internal/mempool.Store.ReplaceSnapshot`, fingerprint every
+one of those tables (row count plus an order-independent content
+digest), run a deployment `ReplaceSnapshot`, and require every
+fingerprint is byte-for-byte unchanged.
+
+### Runtime integration: `index` only, `serve` untouched
+
+The deployment observer is wired into `qoge-explorer index`'s existing
+orchestration in `cmd/qoge-explorer/main.go`, exactly alongside the
+Phase 2F.1 mempool synchronizer: its own `context.WithCancel` derived
+from the top-level shutdown context, its own `sync.WaitGroup`, started
+in a goroutine right after the mempool synchronizer's. If confirmed
+indexing (`idx.Run`) halts — cleanly or fatally — both the mempool
+context and the deployment context are cancelled and both goroutines are
+waited on before the process exits, so neither can leak regardless of
+why confirmed indexing stopped. `qoge-explorer serve` requires no code
+change at all: it never constructs an `internal/deployments.Synchronizer`
+or an `internal/rpc.Client`, and continues to require no Core RPC
+credentials whatsoever — deployment observation, like mempool
+observation, needs live Core RPC access that `serve` deliberately never
+has.
+
+### Failure policy: non-fatal, always
+
+A deployment observation failure — RPC unavailable, a malformed
+`getdeploymentinfo` response, a PostgreSQL write failure, a Core-tip or
+confirmed-tip race during acquisition — is logged (`Warn` for an
+unexpected failure, `Debug` for the ordinary "confirmed index not
+caught up yet" skip) and retried on the next poll cycle
+(`DefaultPollInterval` = 30s, deliberately conservative: deployment state
+changes on the order of blocks/weeks, not seconds). It NEVER halts
+confirmed indexing, and it never halts or is halted by mempool
+observation — the three observers are independent goroutines sharing
+only the same underlying Core RPC client and the same read-only
+confirmed-checkpoint reader.
+
+### Explicitly deferred to Phase 2G.2
+
+No `/deployments` or `/consensus` page, no `/api/v1/deployments`
+endpoint, no P2QPK status indicator on the homepage, no activation
+progress bar, no signalling visualization, no browser polling of
+deployment state. `internal/query`, `internal/api`, and `internal/web`
+are byte-for-byte unchanged by this phase — verified by an explicit
+`git diff --stat` against the Phase 2F.2 baseline before this phase's PR
+was opened, exactly as §23 did against the Phase 2F.1 baseline. This
+phase's only job is making sure Core's deployment state is being
+observed, strictly validated, and safely cached; giving anyone a way to
+actually SEE that cache is Phase 2G.2's job.
