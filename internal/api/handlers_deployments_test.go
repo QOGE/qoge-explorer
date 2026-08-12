@@ -221,6 +221,66 @@ func TestDeploymentDetailEndpoint_MalformedName(t *testing.T) {
 	}
 }
 
+// TestDeploymentDetailEndpoint_LockedInActivatingBoundary is spec item 8:
+// the LOCKED_IN -> ACTIVE transition boundary (current_state LOCKED_IN,
+// next_state ACTIVE) must serialize exactly as Core reported it — status
+// still "locked_in", status_next "active", active true, and
+// activation_height present — never deriving "active" from "status" in
+// the API layer.
+func TestDeploymentDetailEndpoint_LockedInActivatingBoundary(t *testing.T) {
+	ctx, s, _, dstore := newDeploymentTestServer(t)
+
+	cand := deploymentCandidateOf("p2qpk", "locked_in", 102_016, p2qpkLockedInActivatingFixture())
+	if _, err := dstore.ReplaceSnapshot(ctx, deploymentSnapshotCandidate(104_032, fakeHash("api-lockedin-activating-tip"), cand)); err != nil {
+		t.Fatalf("ReplaceSnapshot: %v", err)
+	}
+
+	rec := doRequest(t, s, "GET", "/api/v1/deployments/p2qpk")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Deployment struct {
+			Status           string `json:"status"`
+			StatusNext       string `json:"status_next"`
+			Active           bool   `json:"active"`
+			Bit              *int   `json:"bit"`
+			ActivationHeight *int64 `json:"activation_height"`
+			Statistics       *struct {
+				Threshold *int64 `json:"threshold"`
+				Possible  *bool  `json:"possible"`
+			} `json:"statistics"`
+			Signalling *string `json:"signalling"`
+		} `json:"deployment"`
+	}
+	decodeBody(t, rec, &detail)
+	d := detail.Deployment
+	if d.Status != "locked_in" {
+		t.Fatalf("status = %q, want locked_in", d.Status)
+	}
+	if d.StatusNext != "active" {
+		t.Fatalf("status_next = %q, want active", d.StatusNext)
+	}
+	if !d.Active {
+		t.Fatalf("active = false, want true")
+	}
+	if d.ActivationHeight == nil || *d.ActivationHeight != 104_032 {
+		t.Fatalf("activation_height = %v, want 104032", d.ActivationHeight)
+	}
+	if d.Bit == nil {
+		t.Fatalf("bit = nil, want present (current_state is still LOCKED_IN)")
+	}
+	if d.Statistics == nil {
+		t.Fatalf("statistics = nil, want present (current_state is still LOCKED_IN)")
+	}
+	if d.Statistics.Threshold != nil || d.Statistics.Possible != nil {
+		t.Fatalf("statistics = %+v, want threshold/possible nil (LOCKED_IN semantics)", d.Statistics)
+	}
+	if d.Signalling == nil {
+		t.Fatalf("signalling = nil, want present (current_state is still LOCKED_IN)")
+	}
+}
+
 // TestDeploymentDetailEndpoint_EncodedNameRoundTrip is spec item 6: a
 // writer-valid deployment name containing a literal '/' must resolve
 // through its percent-encoded path segment to the exact same name. No new

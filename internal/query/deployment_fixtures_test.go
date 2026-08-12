@@ -59,10 +59,15 @@ type bip9StatsJSONFixture struct {
 // bip9Fixture builds a realistic "type":"bip9" deployment object.
 // activationHeight mirrors Core's top-level "height", only ever populated
 // once status_next is ACTIVE, per Core's actual field optionality.
+// Core's top-level "active" reflects next_state == ACTIVE (SoftForkDescPushBack
+// in src/rpc/blockchain.cpp), NOT current_state — so it is derived from
+// statusNext here, never from status. A deployment can be current_state
+// LOCKED_IN with next_state ACTIVE (active=true) in the very block that
+// activates it.
 func bip9Fixture(status, statusNext string, since int64, bit *int, activationHeight *int64, statistics *bip9StatsJSONFixture, signalling *string) json.RawMessage {
 	raw, err := json.Marshal(deploymentJSONFixture{
 		Type:   "bip9",
-		Active: status == "active",
+		Active: statusNext == "active",
 		Height: activationHeight,
 		BIP9: &bip9JSONFixture{
 			Bit:                 bit,
@@ -88,15 +93,16 @@ func bip9Fixture(status, statusNext string, since int64, bit *int, activationHei
 
 // p2qpkDefinedFixture/p2qpkStartedFixture/p2qpkLockedInFixture/
 // p2qpkActiveFixture/p2qpkFailedFixture build a realistic "p2qpk"
-// deployment object at each BIP9 status, respecting Core's actual
-// per-status field optionality (docs/ARCHITECTURE.md §25, spec item 44
-// -47): DEFINED carries no signalling statistics; STARTED/LOCKED_IN
-// normally carry statistics (LOCKED_IN may omit threshold/possible);
-// ACTIVE may omit bit/statistics/signalling entirely but reports an
-// activation height. These are TEST FIXTURES with synthetic constants,
+// deployment object at each BIP9 status, matching QOGE Core stable's
+// src/rpc/blockchain.cpp SoftForkDescPushBack exactly: has_signal is true
+// only for current_state STARTED or LOCKED_IN, and that gates bit,
+// statistics, AND signalling together (not statistics alone) — so
+// DEFINED/ACTIVE/FAILED carry none of the three, and LOCKED_IN carries
+// all three (with statistics.threshold/possible additionally omitted
+// only for LOCKED_IN). These are TEST FIXTURES with synthetic constants,
 // never asserted real Qogecoin mainnet values.
 func p2qpkDefinedFixture() json.RawMessage {
-	return bip9Fixture("defined", "defined", 0, intPtr(21), nil, nil, nil)
+	return bip9Fixture("defined", "defined", 0, nil, nil, nil, nil)
 }
 
 func p2qpkStartedFixture() json.RawMessage {
@@ -107,23 +113,40 @@ func p2qpkStartedFixture() json.RawMessage {
 }
 
 func p2qpkLockedInFixture() json.RawMessage {
-	// Core output semantics: threshold/possible/signalling may be absent
-	// once LOCKED_IN.
+	// has_signal is true for LOCKED_IN, so bit and signalling are still
+	// present; only statistics.threshold/possible are additionally omitted
+	// for this state (current_state != LOCKED_IN gate in blockchain.cpp).
+	signalling := "####################"
 	return bip9Fixture("locked_in", "locked_in", 102_016, intPtr(21), nil, &bip9StatsJSONFixture{
 		Period: 2016, Elapsed: 2016, Count: 2000,
-	}, nil)
+	}, &signalling)
 }
 
 func p2qpkActiveFixture() json.RawMessage {
-	// ACTIVE: bit/statistics/signalling all legitimately absent; Core now
-	// reports the block height the deployment activated at.
+	// ACTIVE: has_signal is false, so bit/statistics/signalling are all
+	// legitimately absent; Core now reports the block height the
+	// deployment activated at.
 	return bip9Fixture("active", "active", 104_032, nil, i64Ptr(104_032), nil, nil)
 }
 
 func p2qpkFailedFixture() json.RawMessage {
-	return bip9Fixture("failed", "failed", 102_016, intPtr(21), nil, &bip9StatsJSONFixture{
-		Period: 2016, Threshold: i64Ptr(1815), Elapsed: 2016, Count: 1200, Possible: boolPtr(false),
-	}, nil)
+	// FAILED: has_signal is false, so bit/statistics/signalling are all
+	// legitimately absent.
+	return bip9Fixture("failed", "failed", 102_016, nil, nil, nil, nil)
+}
+
+// p2qpkLockedInActivatingFixture is the LOCKED_IN -> ACTIVE transition
+// boundary: current_state is still LOCKED_IN (so bit/statistics/
+// signalling are all present, with threshold/possible omitted per
+// LOCKED_IN semantics), but next_state is ACTIVE, so the top-level
+// "active" is true and "height" (the activation height) is populated.
+// This proves query/api/web never assume active == (status == "active"):
+// here status is still "locked_in" while active is true.
+func p2qpkLockedInActivatingFixture() json.RawMessage {
+	signalling := "####################"
+	return bip9Fixture("locked_in", "active", 102_016, intPtr(21), i64Ptr(104_032), &bip9StatsJSONFixture{
+		Period: 2016, Elapsed: 2016, Count: 2016,
+	}, &signalling)
 }
 
 // deploymentCandidateOf extracts the (status, since) internal/deployments

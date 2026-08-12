@@ -204,6 +204,9 @@ func TestDeploymentOverview_StatusFixtures(t *testing.T) {
 	}
 
 	lockedIn := byName["locked_in"]
+	if lockedIn.Bit == nil {
+		t.Fatalf("locked_in.Bit = nil, want present (has_signal is true for LOCKED_IN)")
+	}
 	if lockedIn.Statistics == nil {
 		t.Fatalf("locked_in.Statistics = nil, want present")
 	}
@@ -212,6 +215,80 @@ func TestDeploymentOverview_StatusFixtures(t *testing.T) {
 	}
 	if lockedIn.Statistics.Possible != nil {
 		t.Fatalf("locked_in.Statistics.Possible = %v, want nil (legitimately absent once LOCKED_IN)", lockedIn.Statistics.Possible)
+	}
+	if lockedIn.Signalling == nil {
+		t.Fatalf("locked_in.Signalling = nil, want present (has_signal is true for LOCKED_IN)")
+	}
+
+	defined := byName["defined"]
+	if defined.Bit != nil || defined.Statistics != nil || defined.Signalling != nil {
+		t.Fatalf("defined = %+v, want bit/statistics/signalling all nil (has_signal is false)", defined)
+	}
+
+	failed := byName["failed"]
+	if failed.Bit != nil || failed.Statistics != nil || failed.Signalling != nil {
+		t.Fatalf("failed = %+v, want bit/statistics/signalling all nil (has_signal is false)", failed)
+	}
+}
+
+// TestDeploymentOverview_LockedInActivatingBoundary is spec items 6/7: the
+// LOCKED_IN -> ACTIVE transition boundary (current_state LOCKED_IN,
+// next_state ACTIVE) must be reported by the query layer exactly as Core
+// sent it — Active true and ActivationHeight present while Status is
+// still "locked_in" — proving the query never derives Active from Status.
+// It must also still carry Bit/Statistics/Signalling, since has_signal is
+// governed by current_state, which is still LOCKED_IN here.
+func TestDeploymentOverview_LockedInActivatingBoundary(t *testing.T) {
+	ctx := context.Background()
+	q, _, pool := newTestQueryStore(t)
+	dstore := newTestDeploymentsStore(pool)
+
+	observedAt := time.Now().UTC().Truncate(time.Microsecond)
+	cand := deploymentCandidateOf("p2qpk", "locked_in", 102_016, p2qpkLockedInActivatingFixture())
+	if _, err := dstore.ReplaceSnapshot(ctx, deploymentSnapshot(104_032, fakeHash("lockedin-activating-tip"), observedAt, cand)); err != nil {
+		t.Fatalf("ReplaceSnapshot: %v", err)
+	}
+
+	detail, err := q.DeploymentByName(ctx, "p2qpk")
+	if err != nil {
+		t.Fatalf("DeploymentByName: %v", err)
+	}
+	d := detail.Deployment
+	if d.Status != "locked_in" {
+		t.Fatalf("Status = %q, want locked_in", d.Status)
+	}
+	if d.StatusNext != "active" {
+		t.Fatalf("StatusNext = %q, want active", d.StatusNext)
+	}
+	if !d.Active {
+		t.Fatalf("Active = false, want true")
+	}
+	if d.ActivationHeight == nil || *d.ActivationHeight != 104_032 {
+		t.Fatalf("ActivationHeight = %v, want 104032", d.ActivationHeight)
+	}
+	if d.Bit == nil {
+		t.Fatalf("Bit = nil, want present (current_state is still LOCKED_IN)")
+	}
+	if d.Statistics == nil {
+		t.Fatalf("Statistics = nil, want present (current_state is still LOCKED_IN)")
+	}
+	if d.Statistics.Threshold != nil || d.Statistics.Possible != nil {
+		t.Fatalf("Statistics = %+v, want Threshold/Possible nil (LOCKED_IN semantics)", d.Statistics)
+	}
+	if d.Signalling == nil {
+		t.Fatalf("Signalling = nil, want present (current_state is still LOCKED_IN)")
+	}
+
+	overview, err := q.DeploymentOverview(ctx)
+	if err != nil {
+		t.Fatalf("DeploymentOverview: %v", err)
+	}
+	if len(overview.Deployments) != 1 {
+		t.Fatalf("Deployments = %+v, want exactly 1", overview.Deployments)
+	}
+	o := overview.Deployments[0]
+	if o.Status != "locked_in" || o.StatusNext != "active" || !o.Active || o.ActivationHeight == nil {
+		t.Fatalf("overview deployment = %+v, want status=locked_in status_next=active active=true activation_height present", o)
 	}
 }
 

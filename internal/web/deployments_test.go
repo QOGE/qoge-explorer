@@ -135,6 +135,7 @@ func TestDeploymentDetailPage_AllStatusesRenderSafely(t *testing.T) {
 		"locked_in":              {"locked_in", 102_016, p2qpkLockedInFixture()},
 		"active":                 {"active", 104_032, p2qpkActiveFixture()},
 		"failed":                 {"failed", 102_016, p2qpkFailedFixture()},
+		"locked_in_activating":   {"locked_in", 102_016, p2qpkLockedInActivatingFixture()},
 	}
 
 	for name, f := range fixtures {
@@ -154,8 +155,12 @@ func TestDeploymentDetailPage_AllStatusesRenderSafely(t *testing.T) {
 
 			switch name {
 			case "started":
-				// STARTED with possible=true: statistics, threshold, and
-				// an affirmative Possible row must all be visible.
+				// STARTED with possible=true: bit, statistics, threshold,
+				// signalling, and an affirmative Possible row must all be
+				// visible.
+				if !strings.Contains(body, "<th>Bit</th>") {
+					t.Fatalf("started: missing Bit row")
+				}
 				if !strings.Contains(body, "Signalling Statistics") {
 					t.Fatalf("started: missing Signalling Statistics section")
 				}
@@ -165,6 +170,9 @@ func TestDeploymentDetailPage_AllStatusesRenderSafely(t *testing.T) {
 				if !strings.Contains(body, "<th>Possible</th>") {
 					t.Fatalf("started: missing Possible row")
 				}
+				if !strings.Contains(body, "<h2>Signalling</h2>") {
+					t.Fatalf("started: missing Signalling block")
+				}
 			case "started_possible_false":
 				// possible=false must render "no", not be omitted the way
 				// a nil Possible is for LOCKED_IN.
@@ -172,9 +180,14 @@ func TestDeploymentDetailPage_AllStatusesRenderSafely(t *testing.T) {
 					t.Fatalf("started_possible_false: want an explicit 'no' Possible row, got body=%s", body)
 				}
 			case "locked_in":
-				// LOCKED_IN: statistics section exists, but threshold and
-				// possible are structurally absent from Core's response for
-				// this state — never presented as "unknown".
+				// LOCKED_IN: has_signal is still true for this state, so
+				// bit, the statistics section, and signalling are all
+				// present — only threshold/possible are structurally
+				// absent from Core's response — never presented as
+				// "unknown".
+				if !strings.Contains(body, "<th>Bit</th>") {
+					t.Fatalf("locked_in: missing Bit row")
+				}
 				if !strings.Contains(body, "Signalling Statistics") {
 					t.Fatalf("locked_in: missing Signalling Statistics section")
 				}
@@ -187,12 +200,49 @@ func TestDeploymentDetailPage_AllStatusesRenderSafely(t *testing.T) {
 				if strings.Contains(body, "unknown") {
 					t.Fatalf("locked_in: must never render 'unknown' for an omitted BIP9 field, got body=%s", body)
 				}
-			case "defined", "active":
+				if !strings.Contains(body, "<h2>Signalling</h2>") {
+					t.Fatalf("locked_in: missing Signalling block (has_signal is true for LOCKED_IN)")
+				}
+			case "defined", "active", "failed":
+				// has_signal is false for DEFINED/ACTIVE/FAILED: bit,
+				// statistics, and signalling are all legitimately absent.
 				if !strings.Contains(body, "Core did not report signalling statistics for this deployment state.") {
 					t.Fatalf("%s: missing neutral no-statistics wording, got body=%s", name, body)
 				}
 				if strings.Contains(body, "Signalling Statistics") {
 					t.Fatalf("%s: unexpected Signalling Statistics section", name)
+				}
+				if strings.Contains(body, "<th>Bit</th>") {
+					t.Fatalf("%s: unexpected Bit row", name)
+				}
+				if strings.Contains(body, "<h2>Signalling</h2>") {
+					t.Fatalf("%s: unexpected Signalling block", name)
+				}
+			case "locked_in_activating":
+				// The LOCKED_IN -> ACTIVE transition boundary: status is
+				// still locked_in while status_next/active/height already
+				// reflect the upcoming activation. No special-cased
+				// production branch computes Active from Status.
+				if !strings.Contains(body, "<th>Status</th><td>locked_in</td>") {
+					t.Fatalf("locked_in_activating: want Status=locked_in, got body=%s", body)
+				}
+				if !strings.Contains(body, "<th>Status Next</th><td>active</td>") {
+					t.Fatalf("locked_in_activating: want Status Next=active, got body=%s", body)
+				}
+				if !strings.Contains(body, "<th>Active</th><td>yes</td>") {
+					t.Fatalf("locked_in_activating: want Active=yes, got body=%s", body)
+				}
+				if !strings.Contains(body, "<th>Activation Height</th>") {
+					t.Fatalf("locked_in_activating: missing Activation Height row")
+				}
+				if !strings.Contains(body, "Signalling Statistics") {
+					t.Fatalf("locked_in_activating: missing Signalling Statistics section (current_state is still LOCKED_IN)")
+				}
+				if !strings.Contains(body, "<h2>Signalling</h2>") {
+					t.Fatalf("locked_in_activating: missing Signalling block (current_state is still LOCKED_IN)")
+				}
+				if strings.Contains(body, "<th>Threshold</th>") || strings.Contains(body, "<th>Possible</th>") {
+					t.Fatalf("locked_in_activating: Threshold/Possible must be absent (LOCKED_IN semantics), got body=%s", body)
 				}
 			}
 		})

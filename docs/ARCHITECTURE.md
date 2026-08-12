@@ -4171,3 +4171,45 @@ check these specifics per status (STARTED's threshold/possible=yes,
 STARTED with possible=false rendering "no", LOCKED_IN's threshold/possible
 rows being fully absent with no "unknown" text anywhere in the page,
 DEFINED/ACTIVE's neutral no-statistics wording).
+
+### Fixture correction against QOGE Core stable's actual per-status shape
+
+A later review checked the `internal/query`/`internal/api`/`internal/web`
+BIP9 test fixtures against QOGE Core stable's actual
+`SoftForkDescPushBack` (`src/rpc/blockchain.cpp`) rather than an
+inferred shape, and found the fixtures had drifted from it in three
+ways — test-only, no production code was implicated:
+
+- **`has_signal` gates `bit`, `statistics`, AND `signalling` together.**
+  Core computes `has_signal = current_state == STARTED ||
+  current_state == LOCKED_IN` and gates all three fields on it as one
+  unit — not `statistics` alone. The DEFINED and FAILED fixtures
+  incorrectly carried a `bit` (and FAILED also carried `statistics`);
+  both now carry none of the three, matching `has_signal == false` for
+  every state other than STARTED/LOCKED_IN. The LOCKED_IN fixture
+  correctly omitted `statistics.threshold`/`statistics.possible` but
+  incorrectly omitted `signalling` too — LOCKED_IN's `has_signal` is
+  true, so Core still emits `bit` and `signalling`; only
+  `statistics.threshold`/`statistics.possible` are additionally gated
+  on `current_state != LOCKED_IN`. The fixtures now emit `bit` and
+  `signalling` for LOCKED_IN.
+- **Top-level `active` reflects `next_state`, not `current_state`.**
+  `SoftForkDescPushBack` sets `rv["active"] = (next_state ==
+  ThresholdState::ACTIVE)`, entirely independent of what `bip9.status`
+  (`current_state`) says — a deployment can be `status: "locked_in"`
+  with `active: true` in the very block that activates it, since
+  `status_next` is already `"active"` there. The shared `bip9Fixture`
+  test helper in all three packages previously derived `Active` from
+  `status == "active"`; it now derives it from `statusNext ==
+  "active"`, matching Core exactly.
+- **Explicit transition-boundary fixture.** `p2qpkLockedInActivatingFixture`
+  (status `locked_in`, status_next `active`, active `true`, an
+  activation height, and `bit`/`statistics`/`signalling` all present
+  with `threshold`/`possible` absent) is a new fixture proving no layer
+  assumes `active == (status == "active")`.
+  `TestDeploymentOverview_LockedInActivatingBoundary` (query),
+  `TestDeploymentDetailEndpoint_LockedInActivatingBoundary` (API), and
+  the `locked_in_activating` case in
+  `TestDeploymentDetailPage_AllStatusesRenderSafely` (web) each verify
+  the boundary object is reported/serialized/rendered exactly as Core
+  sent it, with no special-cased transition branch in production code.
