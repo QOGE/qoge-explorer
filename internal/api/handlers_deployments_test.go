@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -217,5 +218,34 @@ func TestDeploymentDetailEndpoint_MalformedName(t *testing.T) {
 	rec := doRequest(t, s, "GET", "/api/v1/deployments/"+strings.Repeat("p", 200))
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("oversized name status = %d, want 400", rec.Code)
+	}
+}
+
+// TestDeploymentDetailEndpoint_EncodedNameRoundTrip is spec item 6: a
+// writer-valid deployment name containing a literal '/' must resolve
+// through its percent-encoded path segment to the exact same name. No new
+// API shape or query parameter is introduced — this is ordinary path
+// -segment encoding around the existing /api/v1/deployments/{name} route.
+func TestDeploymentDetailEndpoint_EncodedNameRoundTrip(t *testing.T) {
+	ctx, s, _, dstore := newDeploymentTestServer(t)
+
+	name := "slash/name"
+	cand := deploymentCandidateOf(name, "started", 100_000, p2qpkStartedFixture())
+	if _, err := dstore.ReplaceSnapshot(ctx, deploymentSnapshotCandidate(100, fakeHash("api-encoded-name-tip"), cand)); err != nil {
+		t.Fatalf("ReplaceSnapshot: %v", err)
+	}
+
+	rec := doRequest(t, s, "GET", "/api/v1/deployments/"+url.PathEscape(name))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var detail struct {
+		Deployment struct {
+			Name string `json:"name"`
+		} `json:"deployment"`
+	}
+	decodeBody(t, rec, &detail)
+	if detail.Deployment.Name != name {
+		t.Fatalf("detail.Deployment.Name = %q, want %q", detail.Deployment.Name, name)
 	}
 }

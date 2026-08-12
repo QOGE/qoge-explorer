@@ -10,6 +10,7 @@
 <tr><th>Anchor Height</th><td>{{if .State.CoreTipHeight}}{{.State.CoreTipHeight}}{{end}}</td></tr>
 <tr><th>Anchor Hash</th><td class="mono wrap">{{if .State.CoreTipHash}}{{.State.CoreTipHash}}{{end}}</td></tr>
 <tr><th>Confirmed Indexed Height</th><td>{{.State.ConfirmedIndexedHeight}}</td></tr>
+<tr><th>Confirmed Indexed Hash</th><td class="mono wrap">{{if .State.ConfirmedIndexedHash}}{{.State.ConfirmedIndexedHash}}{{end}}</td></tr>
 <tr><th>Deployment Count</th><td>{{.State.DeploymentCount}}</td></tr>
 </table>
 
@@ -22,7 +23,7 @@
 <tbody>
 {{range .Deployments}}
 <tr>
-  <td><a href="/deployments/{{.Name}}">{{.Name}}</a></td>
+  <td><a href="{{deploymentPath .Name}}">{{.Name}}</a></td>
   <td>{{.Status}}</td>
   <td>{{.StatusNext}}</td>
   <td>{{yesNo .Active}}</td>

@@ -92,6 +92,15 @@ func p2qpkStartedFixture() json.RawMessage {
 	}, &signalling)
 }
 
+// p2qpkStartedPossibleFalseFixture is spec item 13: possible=false must be
+// rendered as "no", never omitted the way a nil Possible is for LOCKED_IN.
+func p2qpkStartedPossibleFalseFixture() json.RawMessage {
+	signalling := "----------------"
+	return bip9Fixture("started", "started", 100_000, intPtr(21), nil, &bip9StatsJSONFixture{
+		Period: 2016, Threshold: i64Ptr(1815), Elapsed: 500, Count: 10, Possible: boolPtr(false),
+	}, &signalling)
+}
+
 func p2qpkLockedInFixture() json.RawMessage {
 	return bip9Fixture("locked_in", "locked_in", 102_016, intPtr(21), nil, &bip9StatsJSONFixture{
 		Period: 2016, Elapsed: 2016, Count: 2000,

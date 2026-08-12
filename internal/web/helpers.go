@@ -2,6 +2,8 @@ package web
 
 import (
 	"html/template"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -17,6 +19,7 @@ var templateFuncs = template.FuncMap{
 	"replaceableLabel": replaceableLabel,
 	"prevOutLink":      prevOutLink,
 	"optionalYesNo":    optionalYesNo,
+	"deploymentPath":   deploymentPath,
 }
 
 // formatTimeUTC renders a block header's Unix timestamp as an unambiguous
@@ -86,14 +89,34 @@ func replaceableLabel(b *bool) string {
 	return optionalYesNo(b)
 }
 
-// optionalYesNo renders a tri-state *bool (Core did not report it / true /
-// false) as "unknown"/"yes"/"no" — the same tri-state pattern
-// replaceableLabel uses for BIP125 metadata, reused here for BIP9
-// bip9.statistics.possible, which Core omits under the exact same
-// "not reliably known yet" circumstances (e.g. once LOCKED_IN).
+// optionalYesNo renders a tri-state *bool (nil / true / false) as
+// "unknown"/"yes"/"no". Only use this where nil genuinely means "not
+// reliably known" — e.g. BIP125 replaceability metadata. It is NOT
+// appropriate for BIP9 bip9.statistics.possible: Core omits that field for
+// LOCKED_IN deployments as a structural consequence of that state, not
+// because the value is unknown (see deployment.tmpl, which renders the
+// Possible row conditionally instead of calling this helper).
 func optionalYesNo(b *bool) string {
 	if b == nil {
 		return "unknown"
 	}
 	return yesNo(*b)
+}
+
+// deploymentPath returns the URL for a deployment's detail page such that
+// the {name} wildcard in "GET /deployments/{name}" decodes back to the
+// exact original name. The Phase 2G.1 writer accepts any non-empty name up
+// to the length bound (internal/deployments' validateDeploymentName) — this
+// helper must not narrow that namespace, only encode it safely for a
+// single URL path segment.
+//
+// url.PathEscape handles ordinary reserved characters (/, ?, #, %, ...).
+// It leaves '.' unescaped, which is not enough on its own: a segment that
+// is exactly "." or ".." is collapsed by net/http.ServeMux's canonical
+// -path redirect before the {name} route ever sees it. Percent-encoding
+// every literal '.' as %2E sidesteps that unconditionally, for any name.
+func deploymentPath(name string) string {
+	escaped := url.PathEscape(name)
+	escaped = strings.ReplaceAll(escaped, ".", "%2E")
+	return "/deployments/" + escaped
 }

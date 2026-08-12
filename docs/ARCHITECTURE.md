@@ -4114,3 +4114,60 @@ reachable at all, was exercised end to end: `/`, `/blocks`, `/mempool`,
 `/api/v1/mempool`, `/api/v1/deployments`,
 `/api/v1/deployments/{seeded-name}`, `/healthz`, `/readyz` all served
 correctly from PostgreSQL alone — mirroring §23's own serve smoke.
+
+### Internal review corrections
+
+An internal review of the initial Phase 2G.2 implementation found four
+presentation-layer defects, all fixed without touching the query
+architecture above:
+
+- **Deployment-name URL encoding.** The Phase 2G.1 writer deliberately
+  accepts any non-empty name up to its length bound — including names
+  containing `/`, `?`, `#`, `%`, or literal dot-segments (`.`, `..`). The
+  original list template built links as `href="/deployments/{{.Name}}"`,
+  which is HTML-safe but not URL-path-segment-safe: such names could
+  change routing semantics instead of round-tripping. `internal/web`'s
+  `deploymentPath` helper (`internal/web/helpers.go`) now builds this
+  link with `url.PathEscape` plus an unconditional `.` -> `%2E`
+  replacement. Plain `url.PathEscape` alone is not sufficient: it leaves
+  `.` unescaped, and a path segment that is exactly `.` or `..` is
+  collapsed by `net/http.ServeMux`'s canonical-path redirect before the
+  `{name}` route ever sees it — percent-encoding every literal `.`
+  sidesteps that unconditionally. The read surface was never narrowed to
+  a smaller name alphabet; only its link generation was fixed.
+  `TestDeploymentsPage_URLRoundTrip` and
+  `TestDeploymentDetailEndpoint_EncodedNameRoundTrip` prove writer name ->
+  PostgreSQL -> query -> generated URL -> `ServeMux` `PathValue` -> exact
+  DB lookup round-trips for `/`, `?`, `#`, `%`, `.`, and `..`.
+- **Confirmed indexed hash.** Both snapshot tables (`/deployments` and
+  `/deployments/{name}`) now show `Confirmed Indexed Hash` alongside the
+  height it already showed, matching the anchor height/hash pair — the
+  query/API layer already exposed this field; only the templates were
+  incomplete. `TestDeploymentsPage_SameHeightReorgPresentation` proves a
+  same-height, different-hash mismatch renders both hashes and both
+  heights together so it is actually diagnosable, without directional
+  wording ("ahead"/"newer"/"advanced past").
+- **BIP9 `possible` semantics.** QOGE Core stable's `getdeploymentinfo`
+  omits `bip9.statistics.threshold` and `bip9.statistics.possible`
+  entirely once a deployment reaches LOCKED_IN — that omission is not
+  "unknown", it is a structural consequence of the state. The detail
+  template now renders the `Possible` row only when Core actually
+  reported the field (`{{if .Deployment.Statistics.Possible}}`, which
+  checks pointer-nilness, not the boolean value — `possible=false` still
+  renders "no"), and omits the row entirely otherwise instead of
+  displaying "Possible: unknown". `optionalYesNo`'s doc comment was
+  corrected to stop claiming this "unknown" semantics for BIP9 data; it
+  remains valid for genuinely tri-state fields such as BIP125
+  replaceability.
+- **No-statistics wording.** Core reports signalling statistics only for
+  STARTED and LOCKED_IN — DEFINED (before tallying begins), ACTIVE, and
+  FAILED all legitimately have none. The prior wording ("Core omits this
+  once no longer actively tallying a period") implied a deployment
+  necessarily had statistics before; it now reads "Core did not report
+  signalling statistics for this deployment state."
+
+`TestDeploymentDetailPage_AllStatusesRenderSafely` was strengthened to
+check these specifics per status (STARTED's threshold/possible=yes,
+STARTED with possible=false rendering "no", LOCKED_IN's threshold/possible
+rows being fully absent with no "unknown" text anywhere in the page,
+DEFINED/ACTIVE's neutral no-statistics wording).
