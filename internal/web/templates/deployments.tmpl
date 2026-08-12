@@ -1,0 +1,38 @@
+{{define "body"}}
+<h1>Consensus Deployments</h1>
+{{if not .State.Initialized}}
+<p class="status-line">Deployment cache has not synchronized yet.</p>
+{{else}}
+<table class="kv-table">
+<tr><th>Status</th><td>{{if eq .State.Status "fresh"}}Fresh &mdash; cached Core deployment observation from the latest snapshot{{else}}Stale &mdash; the confirmed indexed tip no longer matches this deployment snapshot's anchor{{end}}</td></tr>
+<tr><th>Generation</th><td>{{.State.Generation}}</td></tr>
+<tr><th>Observed</th><td>{{formatObservedAt .State.ObservedAt}}</td></tr>
+<tr><th>Anchor Height</th><td>{{if .State.CoreTipHeight}}{{.State.CoreTipHeight}}{{end}}</td></tr>
+<tr><th>Anchor Hash</th><td class="mono wrap">{{if .State.CoreTipHash}}{{.State.CoreTipHash}}{{end}}</td></tr>
+<tr><th>Confirmed Indexed Height</th><td>{{.State.ConfirmedIndexedHeight}}</td></tr>
+<tr><th>Deployment Count</th><td>{{.State.DeploymentCount}}</td></tr>
+</table>
+
+{{if not .Deployments}}
+<p class="muted">This synchronized snapshot contains zero BIP9 deployments.</p>
+{{else}}
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>Name</th><th>Status</th><th>Status Next</th><th>Active</th><th>Since</th><th>Bit</th></tr></thead>
+<tbody>
+{{range .Deployments}}
+<tr>
+  <td><a href="/deployments/{{.Name}}">{{.Name}}</a></td>
+  <td>{{.Status}}</td>
+  <td>{{.StatusNext}}</td>
+  <td>{{yesNo .Active}}</td>
+  <td>{{.Since}}</td>
+  <td>{{if .Bit}}{{.Bit}}{{end}}</td>
+</tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{end}}
+{{end}}
+{{end}}

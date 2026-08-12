@@ -53,6 +53,18 @@ func parseHeight(s string) (int64, bool) {
 	return n, true
 }
 
+// maxDeploymentNameLength mirrors internal/deployments' own bound
+// (maxDeploymentNameLength in internal/deployments/model.go) — a
+// deployment name shape check deliberately goes no further than this:
+// non-empty and no longer than the writer itself ever allows. It must
+// never invent a narrower character set than the writer accepts (spec:
+// docs/ARCHITECTURE.md §25 "Deployment name lookup").
+const maxDeploymentNameLength = 128
+
+func isValidDeploymentNameShape(s string) bool {
+	return s != "" && len(s) <= maxDeploymentNameLength
+}
+
 // blockIdentifierKind reports how to interpret a GET /api/v1/block/{id}
 // path segment: exactly 64 lowercase hex chars is a hash; otherwise, if it
 // parses as a non-negative decimal integer, it's a height. Anything else is

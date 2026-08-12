@@ -16,6 +16,7 @@ var templateFuncs = template.FuncMap{
 	"formatObservedAt": formatObservedAt,
 	"replaceableLabel": replaceableLabel,
 	"prevOutLink":      prevOutLink,
+	"optionalYesNo":    optionalYesNo,
 }
 
 // formatTimeUTC renders a block header's Unix timestamp as an unambiguous
@@ -82,6 +83,15 @@ func prevOutLink(prevTxid string, depends []string) string {
 // doc comments): nil means Core did not report reliable RBF metadata for
 // this transaction — never presented as a false "no".
 func replaceableLabel(b *bool) string {
+	return optionalYesNo(b)
+}
+
+// optionalYesNo renders a tri-state *bool (Core did not report it / true /
+// false) as "unknown"/"yes"/"no" — the same tri-state pattern
+// replaceableLabel uses for BIP125 metadata, reused here for BIP9
+// bip9.statistics.possible, which Core omits under the exact same
+// "not reliably known yet" circumstances (e.g. once LOCKED_IN).
+func optionalYesNo(b *bool) string {
 	if b == nil {
 		return "unknown"
 	}
