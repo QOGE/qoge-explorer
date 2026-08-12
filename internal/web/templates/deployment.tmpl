@@ -1,0 +1,58 @@
+{{define "body"}}
+<h1>Deployment: {{.Deployment.Name}}</h1>
+
+{{if eq .State.Status "stale"}}
+<p class="status-line">This page shows a cached Core deployment observation. The snapshot is stale and may not represent Core's current deployment state.</p>
+{{else}}
+<p class="status-line">Core deployment status from the latest cached observation.</p>
+{{end}}
+
+<table class="kv-table">
+<tr><th>Type</th><td>{{.Deployment.Type}}</td></tr>
+<tr><th>Active</th><td>{{yesNo .Deployment.Active}}</td></tr>
+<tr><th>Status</th><td>{{.Deployment.Status}}</td></tr>
+<tr><th>Status Next</th><td>{{.Deployment.StatusNext}}</td></tr>
+<tr><th>Since</th><td>{{.Deployment.Since}}</td></tr>
+{{if .Deployment.Bit}}<tr><th>Bit</th><td>{{.Deployment.Bit}}</td></tr>{{end}}
+<tr><th>Start Time Parameter</th><td>{{.Deployment.StartTime}} <span class="muted">({{formatTimeUTC .Deployment.StartTime}})</span></td></tr>
+<tr><th>Timeout Parameter</th><td>{{.Deployment.Timeout}} <span class="muted">({{formatTimeUTC .Deployment.Timeout}})</span></td></tr>
+<tr><th>Min Activation Height</th><td>{{.Deployment.MinActivationHeight}}</td></tr>
+{{if .Deployment.ActivationHeight}}<tr><th>Activation Height</th><td>{{.Deployment.ActivationHeight}}</td></tr>{{end}}
+</table>
+
+{{if .Deployment.Statistics}}
+<h2>Signalling Statistics</h2>
+<table class="kv-table">
+<tr><th>Period</th><td>{{.Deployment.Statistics.Period}}</td></tr>
+{{if .Deployment.Statistics.Threshold}}<tr><th>Threshold</th><td>{{.Deployment.Statistics.Threshold}}</td></tr>{{end}}
+<tr><th>Elapsed</th><td>{{.Deployment.Statistics.Elapsed}}</td></tr>
+<tr><th>Count</th><td>{{.Deployment.Statistics.Count}} <span class="muted">of {{.Deployment.Statistics.Elapsed}} elapsed blocks</span></td></tr>
+{{if .Deployment.Statistics.Threshold}}<tr><th>Count / Threshold</th><td>{{.Deployment.Statistics.Count}} / {{.Deployment.Statistics.Threshold}}</td></tr>{{end}}
+{{if .Deployment.Statistics.Possible}}<tr><th>Possible</th><td>{{optionalYesNo .Deployment.Statistics.Possible}}</td></tr>{{end}}
+</table>
+{{else}}
+<p class="muted">Core did not report signalling statistics for this deployment state.</p>
+{{end}}
+
+{{if .Deployment.Signalling}}
+<h2>Signalling</h2>
+<pre class="mono wrap">{{.Deployment.Signalling}}</pre>
+{{end}}
+
+<h2>Snapshot</h2>
+<table class="kv-table">
+<tr><th>Status</th><td>{{.State.Status}}</td></tr>
+<tr><th>Generation</th><td>{{.State.Generation}}</td></tr>
+<tr><th>Observed</th><td>{{formatObservedAt .State.ObservedAt}}</td></tr>
+<tr><th>Anchor Height</th><td>{{if .State.CoreTipHeight}}{{.State.CoreTipHeight}}{{end}}</td></tr>
+<tr><th>Anchor Hash</th><td class="mono wrap">{{if .State.CoreTipHash}}{{.State.CoreTipHash}}{{end}}</td></tr>
+<tr><th>Confirmed Indexed Height</th><td>{{.State.ConfirmedIndexedHeight}}</td></tr>
+<tr><th>Confirmed Indexed Hash</th><td class="mono wrap">{{if .State.ConfirmedIndexedHash}}{{.State.ConfirmedIndexedHash}}{{end}}</td></tr>
+</table>
+
+<h2>Raw Core Response</h2>
+<details>
+<summary>Show raw getdeploymentinfo object</summary>
+<pre class="mono wrap">{{.RawJSON}}</pre>
+</details>
+{{end}}

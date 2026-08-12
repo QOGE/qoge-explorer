@@ -3910,3 +3910,306 @@ was opened, exactly as §23 did against the Phase 2F.1 baseline. This
 phase's only job is making sure Core's deployment state is being
 observed, strictly validated, and safely cached; giving anyone a way to
 actually SEE that cache is Phase 2G.2's job.
+
+## 25. Read-only consensus deployment explorer: query layer, JSON API, SSR pages (Phase 2G.2)
+
+Phase 2G.1 built the isolated, atomic `chain_deployments`/
+`deployment_state` PostgreSQL cache and its Core observer. Phase 2G.2
+makes that cache READABLE, adding nothing to the write side:
+`migrations/`, `internal/deployments/`, `internal/rpc/`, `internal/store/`,
+`internal/indexer/`, `internal/mempool/`, `internal/decode/`,
+`internal/script/`, `internal/chain/`, and `cmd/qoge-explorer/main.go` are
+all byte-for-byte unchanged by this phase — verified by an explicit
+`git diff --stat` against the Phase 2G.1 baseline before this phase's PR
+was opened, exactly as §23 did for Phase 2F.1. All new production code
+lives in `internal/query/deployments.go`,
+`internal/api/handlers_deployments.go`, and
+`internal/web/handlers_deployments.go` + two new templates.
+
+### `serve` remains Core-independent
+
+`internal/query`, `internal/api`, and `internal/web` never call
+`getdeploymentinfo`, `getblockcount`, `getblockhash`, or any other Core
+RPC method — every deployment read in this phase is an ordinary `SELECT`
+against `deployment_state`/`chain_deployments`, using the same
+`querier`/`readTx` machinery `internal/query`'s confirmed-chain and
+mempool code already use (§19, §23). `runServe` is unchanged: it never
+constructs an `internal/rpc.Client`.
+
+### Read model: `internal/query/deployments.go`
+
+Deliberately NOT depending on `internal/deployments.Store` (the Phase
+2G.1 writer) — it reads `deployment_state`/`chain_deployments` directly.
+The only cross-package test-time dependency is in `*_test.go` files
+(`deployment_fixtures_test.go` in each of `internal/query`,
+`internal/api`, `internal/web`), which build real rows through the real
+`internal/deployments.Store.ReplaceSnapshot` writer — never ad-hoc SQL —
+mirroring the mempool fixture pattern exactly.
+
+`DeploymentOverview` and `DeploymentByName` are the only two entry
+points, each reading its `DeploymentState` and deployment row(s) from one
+`readTx` (READ ONLY, REPEATABLE READ) snapshot — never two independent
+queries — so a concurrent `ReplaceSnapshot` can never produce a response
+mixing state from two generations. No pagination exists: the deployment
+set is small by construction.
+
+### `DeploymentState`: uninitialized vs. fresh vs. stale
+
+Mirrors `MempoolState`'s three-way freshness model exactly (§23):
+
+- **UNINITIALIZED** (`Initialized=false`): the observer has never
+  successfully published a snapshot. `Status="uninitialized"`,
+  `Stale=false` always — a distinct state, never a degenerate case of the
+  other two.
+- **FRESH**: `Initialized=true` and the snapshot's Core anchor
+  (`core_tip_height`/`core_tip_hash`) exactly matches the confirmed
+  indexed tip (`sync_state`), read from the SAME snapshot. This means
+  only that the cached observation and the confirmed tip currently agree
+  — it does NOT mean this HTTP request queried Core live. The observer
+  polls asynchronously; a "fresh" page is a cached Core deployment
+  observation, never a live Core status page. Wording throughout the UI
+  says "cached Core deployment observation" / "latest cached
+  observation", never "live" or "queried live".
+- **STALE**: `Initialized=true` and the anchor does not match the
+  confirmed tip — by height, by hash, or both. This does NOT imply the
+  confirmed chain advanced forward: an identical-height, different-hash
+  mismatch (a same-height canonical reorg) is exactly as stale as a
+  height mismatch in either direction, and neither the query layer nor
+  the UI ever says "advanced past"/"ahead of"/"newer than". The only
+  claim `Stale=true` makes is "the deployment snapshot's anchor and the
+  confirmed indexed tip disagree right now" — never a direction, and
+  never an implication that indexing is behind.
+
+### Repeatable-read snapshots
+
+Every `DeploymentOverview`/`DeploymentByName` call opens a READ ONLY
+REPEATABLE READ transaction before its first statement and reads
+`deployment_state`, `sync_state`, and every relevant `chain_deployments`
+row from that one fixed snapshot — the same property §19/§23 already
+established for confirmed and mempool reads, extended here.
+`TestSnapshotConsistency_DeploymentOverview_ConcurrentReplacement` and
+`TestSnapshotConsistency_DeploymentDetail_ConcurrentReplacement` prove
+this against a REAL concurrent `internal/deployments.Store.
+ReplaceSnapshot`, using the package's existing `snapshotTestHook`
+synchronization point — never a sleep.
+
+### Raw JSON decoding and normalized/raw consistency checks
+
+`chain_deployments.raw_json` is decoded into a small, package-LOCAL
+shape (`rawDeploymentJSON`/`rawBIP9JSON`/`rawBIP9StatisticsJSON` in
+`internal/query/deployments.go`) — deliberately NOT
+`internal/rpc.RawDeployment`/`RawBIP9Deployment`/`RawBIP9Statistics`.
+`internal/query` never imports `internal/rpc`: the presence-aware
+pointer rigor Phase 2G.1's decoder enforces at ACQUISITION time
+(`internal/deployments.DecodeDeploymentInfo`) is not re-litigated at
+read time — a query-time decode failure means the persisted data is
+corrupt, not that a field is "legitimately absent".
+
+Because a normalized column (`status`, `since_height`) and the
+persisted `raw_json` are two representations of facts Phase 2G.1 wrote
+together, every read cross-checks them rather than trusting either
+blindly:
+
+- `raw_json.type` must be `"bip9"` (Phase 2G.1 never persists a buried
+  deployment).
+- `chain_deployments.status` must equal `raw_json.bip9.status`.
+- `chain_deployments.since_height` must be non-NULL and equal
+  `raw_json.bip9.since`.
+- every row's `checked_at` must equal `deployment_state.observed_at` —
+  Phase 2G.1 writes every row of one generation with the same
+  `Candidate.ObservedAt`.
+- `DeploymentOverview` additionally requires the number of rows read to
+  equal `deployment_state.deployment_count`.
+
+Any disagreement returns `ErrDeploymentCacheIntegrity` — never a
+silent pick-one-side resolution. This can only happen from
+database-level corruption or a bug elsewhere; Phase 2G.1's own writer
+and decoder never produce a state that would trigger it, which is why
+this phase's integrity tests (`internal/query/deployments_test.go`)
+simulate it with direct test SQL, never through the real writer.
+
+### No independent BIP9/VersionBits logic; STARTED/LOCKED_IN/ACTIVE handled generically
+
+`Deployment.Status`, `.StatusNext`, `.Active`, and `.Statistics` are read
+directly from the cached Core object — this phase never recomputes
+`ACTIVE`/`LOCKED_IN`, never independently counts signalling blocks, and
+never predicts an activation date or "probability of activation".
+`Bit`/`ActivationHeight`/`Statistics`/`Statistics.Threshold`/
+`Statistics.Possible`/`Signalling` are all pointers matching Core's own
+optionality (e.g. `Statistics` and `Signalling` become `nil` once a
+deployment is ACTIVE) — the query layer, API, and templates all handle
+every BIP9 status (`defined`/`started`/`locked_in`/`active`/`failed`)
+through the exact same code path with no P2QPK-specific branch anywhere,
+proven by `TestDeploymentDetailPage_AllStatusesRenderSafely` and its API
+equivalent. The one presentation-only arithmetic shown (count/threshold)
+is labeled as such, never as a "Core-computed" or "guaranteed" figure.
+
+### `GET /api/v1/deployments` and `GET /api/v1/deployments/{name}`
+
+- **List**: always HTTP 200. An uninitialized cache reports
+  `initialized=false`, `status="uninitialized"`, `deployments=[]` — a
+  real, valid state, never an error.
+- **Detail**: an uninitialized cache returns HTTP 503 with stable code
+  `deployment_cache_uninitialized` — it cannot truthfully claim a name
+  does not exist. An initialized cache with no matching name returns
+  HTTP 404 `deployment_not_found_in_snapshot` — "not present in the
+  cached snapshot", never "Core guarantees this does not exist". Neither
+  path ever falls back to Core RPC.
+- **Stale**: both endpoints still return the cached data (HTTP 200) with
+  `stale=true` and both the anchor and confirmed tip visible — a stale
+  cache is not hidden, only labeled.
+- Deployment name lookup uses exact database equality; the only shape
+  check ahead of the query (`isValidDeploymentNameShape` in
+  `internal/api/validate.go` and `internal/web/validate.go`) is
+  non-empty and no longer than `internal/deployments`' own writer bound
+  — never a narrower invented character set.
+- `raw` is embedded as a real JSON object (`json.RawMessage`), never a
+  quoted string.
+
+### `GET /deployments` and `GET /deployments/{name}` (SSR)
+
+Mirror the JSON API's semantics with HTML instead: an uninitialized
+`/deployments` page says "Deployment cache has not synchronized yet." —
+never "0 deployments", which would misrepresent a real successful
+observation. An uninitialized `/deployments/{name}` renders a
+service-unavailable page, not a 404. A stale snapshot renders with
+neutral wording ("the confirmed indexed tip no longer matches this
+deployment snapshot's anchor" on the list page; "This page shows a
+cached Core deployment observation. The snapshot is stale…" on detail) —
+never "currently started"/"currently active" without that
+qualification. The raw Core JSON is shown inside a collapsed
+`<details>`/`<pre>` block using ordinary `html/template` escaping —
+`template.HTML` is never used for it. A single "Deployments" link was
+added to the shared navigation; no other navigation change, no homepage
+integration.
+
+### `/deployments/p2qpk` is the generic route, not a special case
+
+Core reporting a deployment named `p2qpk` makes `/deployments/p2qpk` (and
+`GET /api/v1/deployments/p2qpk`) resolve through the exact same generic
+`{name}` handler and template every other deployment uses — there is no
+P2QPK-specific handler, template branch, or route anywhere in this
+phase. The real mainnet P2QPK transition through
+`started -> locked_in -> active` (or `failed`) requires no code change,
+only a changed cached database row — proven directly by
+`TestDeploymentDetailPage_AllStatusesRenderSafely` and
+`TestDeploymentsEndpoint_ActiveFixture` (statistics/bit/signalling all
+legitimately absent once ACTIVE).
+
+### Explicitly NOT added in this phase
+
+No homepage P2QPK/deployment status summary, no browser polling
+(SSE/WebSocket/AJAX) of deployment state — `live.js`'s existing behavior
+is preserved unchanged but not extended here — no activation-date
+prediction, no charting/visualization library, no elaborate progress
+graphics. Final explorer visual polishing remains deferred, exactly as
+§23 deferred it for the mempool pages.
+
+### Serve smoke
+
+The real `qoge-explorer serve` binary, run against an isolated PostgreSQL
+schema seeded through the real Phase 2G.1 writer with no Core process
+reachable at all, was exercised end to end: `/`, `/blocks`, `/mempool`,
+`/deployments`, `/deployments/{seeded-name}`, `/api/v1/status`,
+`/api/v1/mempool`, `/api/v1/deployments`,
+`/api/v1/deployments/{seeded-name}`, `/healthz`, `/readyz` all served
+correctly from PostgreSQL alone — mirroring §23's own serve smoke.
+
+### Internal review corrections
+
+An internal review of the initial Phase 2G.2 implementation found four
+presentation-layer defects, all fixed without touching the query
+architecture above:
+
+- **Deployment-name URL encoding.** The Phase 2G.1 writer deliberately
+  accepts any non-empty name up to its length bound — including names
+  containing `/`, `?`, `#`, `%`, or literal dot-segments (`.`, `..`). The
+  original list template built links as `href="/deployments/{{.Name}}"`,
+  which is HTML-safe but not URL-path-segment-safe: such names could
+  change routing semantics instead of round-tripping. `internal/web`'s
+  `deploymentPath` helper (`internal/web/helpers.go`) now builds this
+  link with `url.PathEscape` plus an unconditional `.` -> `%2E`
+  replacement. Plain `url.PathEscape` alone is not sufficient: it leaves
+  `.` unescaped, and a path segment that is exactly `.` or `..` is
+  collapsed by `net/http.ServeMux`'s canonical-path redirect before the
+  `{name}` route ever sees it — percent-encoding every literal `.`
+  sidesteps that unconditionally. The read surface was never narrowed to
+  a smaller name alphabet; only its link generation was fixed.
+  `TestDeploymentsPage_URLRoundTrip` and
+  `TestDeploymentDetailEndpoint_EncodedNameRoundTrip` prove writer name ->
+  PostgreSQL -> query -> generated URL -> `ServeMux` `PathValue` -> exact
+  DB lookup round-trips for `/`, `?`, `#`, `%`, `.`, and `..`.
+- **Confirmed indexed hash.** Both snapshot tables (`/deployments` and
+  `/deployments/{name}`) now show `Confirmed Indexed Hash` alongside the
+  height it already showed, matching the anchor height/hash pair — the
+  query/API layer already exposed this field; only the templates were
+  incomplete. `TestDeploymentsPage_SameHeightReorgPresentation` proves a
+  same-height, different-hash mismatch renders both hashes and both
+  heights together so it is actually diagnosable, without directional
+  wording ("ahead"/"newer"/"advanced past").
+- **BIP9 `possible` semantics.** QOGE Core stable's `getdeploymentinfo`
+  omits `bip9.statistics.threshold` and `bip9.statistics.possible`
+  entirely once a deployment reaches LOCKED_IN — that omission is not
+  "unknown", it is a structural consequence of the state. The detail
+  template now renders the `Possible` row only when Core actually
+  reported the field (`{{if .Deployment.Statistics.Possible}}`, which
+  checks pointer-nilness, not the boolean value — `possible=false` still
+  renders "no"), and omits the row entirely otherwise instead of
+  displaying "Possible: unknown". `optionalYesNo`'s doc comment was
+  corrected to stop claiming this "unknown" semantics for BIP9 data; it
+  remains valid for genuinely tri-state fields such as BIP125
+  replaceability.
+- **No-statistics wording.** Core reports signalling statistics only for
+  STARTED and LOCKED_IN — DEFINED (before tallying begins), ACTIVE, and
+  FAILED all legitimately have none. The prior wording ("Core omits this
+  once no longer actively tallying a period") implied a deployment
+  necessarily had statistics before; it now reads "Core did not report
+  signalling statistics for this deployment state."
+
+`TestDeploymentDetailPage_AllStatusesRenderSafely` was strengthened to
+check these specifics per status (STARTED's threshold/possible=yes,
+STARTED with possible=false rendering "no", LOCKED_IN's threshold/possible
+rows being fully absent with no "unknown" text anywhere in the page,
+DEFINED/ACTIVE's neutral no-statistics wording).
+
+### Fixture correction against QOGE Core stable's actual per-status shape
+
+A later review checked the `internal/query`/`internal/api`/`internal/web`
+BIP9 test fixtures against QOGE Core stable's actual
+`SoftForkDescPushBack` (`src/rpc/blockchain.cpp`) rather than an
+inferred shape, and found the fixtures had drifted from it in three
+ways — test-only, no production code was implicated:
+
+- **`has_signal` gates `bit`, `statistics`, AND `signalling` together.**
+  Core computes `has_signal = current_state == STARTED ||
+  current_state == LOCKED_IN` and gates all three fields on it as one
+  unit — not `statistics` alone. The DEFINED and FAILED fixtures
+  incorrectly carried a `bit` (and FAILED also carried `statistics`);
+  both now carry none of the three, matching `has_signal == false` for
+  every state other than STARTED/LOCKED_IN. The LOCKED_IN fixture
+  correctly omitted `statistics.threshold`/`statistics.possible` but
+  incorrectly omitted `signalling` too — LOCKED_IN's `has_signal` is
+  true, so Core still emits `bit` and `signalling`; only
+  `statistics.threshold`/`statistics.possible` are additionally gated
+  on `current_state != LOCKED_IN`. The fixtures now emit `bit` and
+  `signalling` for LOCKED_IN.
+- **Top-level `active` reflects `next_state`, not `current_state`.**
+  `SoftForkDescPushBack` sets `rv["active"] = (next_state ==
+  ThresholdState::ACTIVE)`, entirely independent of what `bip9.status`
+  (`current_state`) says — a deployment can be `status: "locked_in"`
+  with `active: true` in the very block that activates it, since
+  `status_next` is already `"active"` there. The shared `bip9Fixture`
+  test helper in all three packages previously derived `Active` from
+  `status == "active"`; it now derives it from `statusNext ==
+  "active"`, matching Core exactly.
+- **Explicit transition-boundary fixture.** `p2qpkLockedInActivatingFixture`
+  (status `locked_in`, status_next `active`, active `true`, an
+  activation height, and `bit`/`statistics`/`signalling` all present
+  with `threshold`/`possible` absent) is a new fixture proving no layer
+  assumes `active == (status == "active")`.
+  `TestDeploymentOverview_LockedInActivatingBoundary` (query),
+  `TestDeploymentDetailEndpoint_LockedInActivatingBoundary` (API), and
+  the `locked_in_activating` case in
+  `TestDeploymentDetailPage_AllStatusesRenderSafely` (web) each verify
+  the boundary object is reported/serialized/rendered exactly as Core
+  sent it, with no special-cased transition branch in production code.

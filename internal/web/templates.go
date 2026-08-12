@@ -27,15 +27,17 @@ var sharedTemplateFiles = []string{
 }
 
 var pageTemplateFiles = map[string]string{
-	"home":      "templates/home.tmpl",
-	"blocks":    "templates/blocks.tmpl",
-	"block":     "templates/block.tmpl",
-	"tx":        "templates/tx.tmpl",
-	"address":   "templates/address.tmpl",
-	"search":    "templates/search.tmpl",
-	"error":     "templates/error.tmpl",
-	"mempool":   "templates/mempool.tmpl",
-	"mempooltx": "templates/mempooltx.tmpl",
+	"home":        "templates/home.tmpl",
+	"blocks":      "templates/blocks.tmpl",
+	"block":       "templates/block.tmpl",
+	"tx":          "templates/tx.tmpl",
+	"address":     "templates/address.tmpl",
+	"search":      "templates/search.tmpl",
+	"error":       "templates/error.tmpl",
+	"mempool":     "templates/mempool.tmpl",
+	"mempooltx":   "templates/mempooltx.tmpl",
+	"deployments": "templates/deployments.tmpl",
+	"deployment":  "templates/deployment.tmpl",
 }
 
 // pages maps a page name to its fully-parsed layout+page *template.Template

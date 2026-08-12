@@ -127,3 +127,21 @@ type mempoolTxView struct {
 	query.MempoolTransactionDetail
 	IncludeWitness bool
 }
+
+// deploymentsView backs templates/deployments.tmpl.
+type deploymentsView struct {
+	State       query.DeploymentState
+	Deployments []query.Deployment
+}
+
+// deploymentView backs templates/deployment.tmpl. RawJSON is the
+// deployment's persisted raw_json rendered as a plain string, computed
+// once here so the template never handles the json.RawMessage byte slice
+// directly — it is rendered with ordinary html/template escaping (never
+// template.HTML), see docs/ARCHITECTURE.md §25 "Raw JSON never
+// unescaped".
+type deploymentView struct {
+	State      query.DeploymentState
+	Deployment query.Deployment
+	RawJSON    string
+}

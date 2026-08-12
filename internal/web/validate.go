@@ -103,6 +103,16 @@ func parseBeforeHeight(r *http.Request) (before *int64, ok bool) {
 	return &n, true
 }
 
+// maxDeploymentNameLength mirrors internal/api's own duplicate of
+// internal/deployments' writer bound — non-empty and no longer than the
+// writer itself ever allows, never a narrower invented character set
+// (docs/ARCHITECTURE.md §25 "Deployment name lookup").
+const maxDeploymentNameLength = 128
+
+func isValidDeploymentNameShape(s string) bool {
+	return s != "" && len(s) <= maxDeploymentNameLength
+}
+
 // maxSearchLength bounds /search?q= input — a courtesy shape check, not an
 // attempt at full consensus address validation (see
 // isValidAddressShape's doc comment).
