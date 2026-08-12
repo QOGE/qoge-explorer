@@ -147,8 +147,21 @@ func DecodeDeploymentInfo(info rpc.RawDeploymentInfo) (DecodedResponse, error) {
 	if err := validateHexHash(info.Hash); err != nil {
 		return DecodedResponse{}, fmt.Errorf("deployments: response hash: %w", err)
 	}
-	if info.Height < 0 {
-		return DecodedResponse{}, fmt.Errorf("deployments: response height %d is negative", info.Height)
+	if info.Height == nil {
+		return DecodedResponse{}, fmt.Errorf("deployments: response height is missing or null")
+	}
+	height := *info.Height
+	if height < 0 {
+		return DecodedResponse{}, fmt.Errorf("deployments: response height %d is negative", height)
+	}
+	// Core always emits a "deployments" object, even when — hypothetically
+	// — it were empty. A plain Go map field already lets us tell "absent
+	// or explicit null" (nil map) apart from "present as {}" (non-nil,
+	// empty map): see rpc.RawDeploymentInfo's doc comment. Only the nil
+	// case is rejected here; a non-nil empty map legitimately produces a
+	// successful zero-BIP9 snapshot (spec item 7/12).
+	if info.Deployments == nil {
+		return DecodedResponse{}, fmt.Errorf("deployments: response deployments object is missing or null")
 	}
 
 	out := make([]CandidateDeployment, 0, len(info.Deployments))
@@ -161,14 +174,24 @@ func DecodeDeploymentInfo(info rpc.RawDeploymentInfo) (DecodedResponse, error) {
 		if err := json.Unmarshal(raw, &d); err != nil {
 			return DecodedResponse{}, fmt.Errorf("deployments: deployment %q: decode: %w", name, err)
 		}
+		if d.Active == nil {
+			return DecodedResponse{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "active")
+		}
 
 		switch d.Type {
 		case "buried":
 			// Decoded enough to prove it isn't malformed; intentionally
 			// not persisted here — buried deployments are static
 			// historical consensus rules with no BIP9 status model
-			// (spec item 3; docs/ARCHITECTURE.md §24).
-			if d.Height != nil && *d.Height < 0 {
+			// (spec item 3; docs/ARCHITECTURE.md §24). Core's
+			// SoftForkDescPushBack unconditionally emits "height" for
+			// buried deployments (confirmed against QOGE/qogecoin
+			// stable's rpc/blockchain.cpp), so its absence is a
+			// strict-decode failure even though the value is dropped.
+			if d.Height == nil {
+				return DecodedResponse{}, fmt.Errorf("deployments: buried deployment %q has missing or null %q", name, "height")
+			}
+			if *d.Height < 0 {
 				return DecodedResponse{}, fmt.Errorf("deployments: buried deployment %q has negative height %d", name, *d.Height)
 			}
 		case "bip9":
@@ -182,7 +205,7 @@ func DecodeDeploymentInfo(info rpc.RawDeploymentInfo) (DecodedResponse, error) {
 		}
 	}
 
-	return DecodedResponse{Hash: info.Hash, Height: info.Height, Deployments: out}, nil
+	return DecodedResponse{Hash: info.Hash, Height: height, Deployments: out}, nil
 }
 
 // decodeBIP9Deployment strictly validates one type=="bip9" deployment
@@ -204,14 +227,33 @@ func decodeBIP9Deployment(name string, d rpc.RawDeployment, raw json.RawMessage)
 	if !validBIP9Statuses[b.StatusNext] {
 		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has invalid bip9.status_next %q", name, b.StatusNext)
 	}
-	if b.Since < 0 {
-		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has negative bip9.since %d", name, b.Since)
+
+	// start_time/timeout/min_activation_height/since are present on every
+	// bip9 deployment Core reports (confirmed against
+	// QOGE/qogecoin stable's rpc/blockchain.cpp SoftForkDescPushBack,
+	// which pushes all four unconditionally) — a missing/null value is a
+	// strict-decode failure, never silently treated as 0.
+	if b.StartTime == nil {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.start_time")
+	}
+	if b.Timeout == nil {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.timeout")
+	}
+	if b.MinActivationHeight == nil {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.min_activation_height")
+	}
+	if b.Since == nil {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.since")
+	}
+	since := *b.Since
+	if since < 0 {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has negative bip9.since %d", name, since)
 	}
 	if b.Bit != nil && (*b.Bit < 0 || *b.Bit > 28) {
 		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.bit %d out of range [0,28]", name, *b.Bit)
 	}
-	if b.MinActivationHeight < 0 {
-		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has negative bip9.min_activation_height %d", name, b.MinActivationHeight)
+	if *b.MinActivationHeight < 0 {
+		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has negative bip9.min_activation_height %d", name, *b.MinActivationHeight)
 	}
 	if d.Height != nil && *d.Height < 0 {
 		return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has negative top-level height %d", name, *d.Height)
@@ -219,17 +261,31 @@ func decodeBIP9Deployment(name string, d rpc.RawDeployment, raw json.RawMessage)
 
 	if b.Statistics != nil {
 		st := b.Statistics
-		if st.Period <= 0 {
-			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.period %d, want > 0", name, st.Period)
+		// period/elapsed/count are present on every bip9.statistics
+		// object Core emits — only threshold/possible are conditionally
+		// omitted (LOCKED_IN status). A missing/null value here must not
+		// silently pass the range checks below as a legitimate 0.
+		if st.Period == nil {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.statistics.period")
 		}
-		if st.Elapsed < 0 || st.Elapsed > st.Period {
-			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.elapsed %d out of range [0,%d]", name, st.Elapsed, st.Period)
+		if st.Elapsed == nil {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.statistics.elapsed")
 		}
-		if st.Count < 0 || st.Count > st.Elapsed {
-			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.count %d out of range [0,%d]", name, st.Count, st.Elapsed)
+		if st.Count == nil {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has missing or null %q", name, "bip9.statistics.count")
 		}
-		if st.Threshold != nil && (*st.Threshold <= 0 || *st.Threshold > st.Period) {
-			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.threshold %d out of range (0,%d]", name, *st.Threshold, st.Period)
+		period, elapsed, count := *st.Period, *st.Elapsed, *st.Count
+		if period <= 0 {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.period %d, want > 0", name, period)
+		}
+		if elapsed < 0 || elapsed > period {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.elapsed %d out of range [0,%d]", name, elapsed, period)
+		}
+		if count < 0 || count > elapsed {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.count %d out of range [0,%d]", name, count, elapsed)
+		}
+		if st.Threshold != nil && (*st.Threshold <= 0 || *st.Threshold > period) {
+			return CandidateDeployment{}, fmt.Errorf("deployments: deployment %q has bip9.statistics.threshold %d out of range (0,%d]", name, *st.Threshold, period)
 		}
 	}
 
@@ -244,7 +300,7 @@ func decodeBIP9Deployment(name string, d rpc.RawDeployment, raw json.RawMessage)
 	return CandidateDeployment{
 		Name:        name,
 		Status:      b.Status,
-		SinceHeight: b.Since,
+		SinceHeight: since,
 		RawJSON:     raw,
 	}, nil
 }

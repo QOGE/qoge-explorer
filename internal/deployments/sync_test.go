@@ -288,7 +288,7 @@ func TestRefreshOnce_HappyPathPublishes(t *testing.T) {
 		blockHashSeq:  []string{tipHash},
 		deploymentInfo: deploymentInfoResponse(tipHash, 42, map[string]json.RawMessage{
 			"p2qpk":  p2qpkStartedFixture(),
-			"segwit": buriedFixture(true, nil),
+			"segwit": buriedFixture(true, i64Ptr(400_000)),
 		}),
 	}
 	s := newTestSynchronizer(client, confirmed, dstore)

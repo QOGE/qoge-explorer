@@ -125,5 +125,5 @@ func p2qpkFailedFixture() json.RawMessage {
 // deploymentInfoResponse builds a realistic top-level getdeploymentinfo
 // rpc.RawDeploymentInfo response.
 func deploymentInfoResponse(hash string, height int64, deployments map[string]json.RawMessage) rpc.RawDeploymentInfo {
-	return rpc.RawDeploymentInfo{Hash: hash, Height: height, Deployments: deployments}
+	return rpc.RawDeploymentInfo{Hash: hash, Height: i64Ptr(height), Deployments: deployments}
 }

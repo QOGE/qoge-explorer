@@ -3811,8 +3811,8 @@ present, and `statistics` internal consistency (`period > 0`,
 a `statistics` object at all. Crucially, the decoder never REQUIRES a
 field in a state where Core legitimately omits it: `bit`, `statistics`,
 `statistics.threshold`, `statistics.possible`, `signalling`, and the
-top-level `height` are all optional and decoded as such — DEFINED
-carries no signalling statistics, LOCKED_IN may omit
+top-level `height` (on `bip9`-type entries) are all optional and decoded
+as such — DEFINED carries no signalling statistics, LOCKED_IN may omit
 `threshold`/`possible`, and ACTIVE may omit `bit`/`statistics`/
 `signalling` entirely. Fixtures covering every BIP9 status
 (defined/started/locked_in/active/failed) deliberately do NOT give every
@@ -3822,6 +3822,37 @@ shape. (Fixture note: any deployment JSON used in this phase's tests,
 including the `p2qpk`-named fixtures, uses synthetic constants for
 illustration — none are asserted as real Qogecoin mainnet consensus
 values.)
+
+**Required-field presence, not just value ranges.** A field Core always
+emits (top-level `height`/`deployments`; per-deployment `active`; every
+`bip9` deployment's `start_time`/`timeout`/`min_activation_height`/
+`status`/`status_next`/`since`; `bip9.statistics`'s `period`/`elapsed`/
+`count` whenever `statistics` itself is present; a buried deployment's
+`height`) is decoded through a `*T` field in `internal/rpc`'s DTOs
+(`RawDeploymentInfo.Height`, `RawDeployment.Active`,
+`RawBIP9Deployment.StartTime`/`Timeout`/`MinActivationHeight`/`Since`,
+`RawBIP9Statistics.Period`/`Elapsed`/`Count`), never a bare Go scalar.
+This matters because encoding/json cannot otherwise tell "the field is
+absent, or explicitly `null`" apart from "the field is present with its
+legitimate zero value" — several of these fields (`since`, `start_time`,
+`elapsed`, `count`, buried `height`) can genuinely BE zero, so a bare
+`int64`/`bool` would let a malformed or truncated Core response pass
+strict decoding by silently becoming its zero value. `Deployments`
+itself stays a plain (non-pointer) map: Go's own `encoding/json`
+already leaves a map field `nil` for both a missing key and an explicit
+`null`, while allocating a non-nil (possibly empty) map for a present
+`{}` — exactly the three-way distinction needed to reject a
+missing/null `deployments` object while still accepting Core's
+legitimate `"deployments": {}` (an initialized, zero-BIP9-deployment
+snapshot; see the STATE section above). `Status`/`StatusNext` stay
+plain strings deliberately: their missing/null zero value (`""`) is
+already outside `validBIP9Statuses` and is rejected by the existing
+enum check without needing a pointer. This required/optional split is
+verified directly against `QOGE/qogecoin` stable's
+`rpc/blockchain.cpp` (`SoftForkDescPushBack`), not inferred from
+observed responses alone, and re-confirmed by feeding a real captured
+`getdeploymentinfo` response from a synced mainnet node through the
+corrected decoder.
 
 ### Non-mutation of confirmed and mempool state
 

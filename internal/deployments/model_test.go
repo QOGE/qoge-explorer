@@ -146,10 +146,26 @@ func TestDecodeDeploymentInfo_RawJSONRoundTrip(t *testing.T) {
 	}
 }
 
+// mustUnmarshalInfo decodes a raw top-level getdeploymentinfo JSON string
+// through the SAME real encoding/json path a live RPC response would take
+// (internal/rpc.Client.CallInto), rather than constructing
+// rpc.RawDeploymentInfo directly — this is what actually proves a
+// missing/null field decodes to a nil pointer instead of just asserting
+// it by construction.
+func mustUnmarshalInfo(t *testing.T, raw string) rpc.RawDeploymentInfo {
+	t.Helper()
+	var info rpc.RawDeploymentInfo
+	if err := json.Unmarshal([]byte(raw), &info); err != nil {
+		t.Fatalf("mustUnmarshalInfo: %v", err)
+	}
+	return info
+}
+
 func TestDecodeDeploymentInfo_RejectsMalformedResponse(t *testing.T) {
 	validBIP9 := func() *bip9StatisticsFixture {
 		return &bip9StatisticsFixture{Period: 2016, Threshold: i64Ptr(1815), Elapsed: 500, Count: 480}
 	}
+	hash := fakeHash("tip")
 
 	cases := []struct {
 		name string
@@ -159,6 +175,77 @@ func TestDecodeDeploymentInfo_RejectsMalformedResponse(t *testing.T) {
 		{"negative response height", deploymentInfoResponse(fakeHash("tip"), -1, nil)},
 		{"empty deployment name", deploymentInfoResponse(fakeHash("tip"), 100, map[string]json.RawMessage{
 			"": p2qpkStartedFixture(),
+		})},
+
+		// --- Required-field presence (internal review fix) ---
+
+		{"missing height", mustUnmarshalInfo(t, `{"hash":"`+hash+`","deployments":{}}`)},
+		{"height null", mustUnmarshalInfo(t, `{"hash":"`+hash+`","height":null,"deployments":{}}`)},
+		{"missing deployments", mustUnmarshalInfo(t, `{"hash":"`+hash+`","height":100}`)},
+		{"deployments null", mustUnmarshalInfo(t, `{"hash":"`+hash+`","height":100,"deployments":null}`)},
+
+		{"deployment missing active", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"deployment active null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":null,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+
+		{"bip9 missing start_time", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 start_time null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":null,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 missing timeout", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 timeout null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":null,"min_activation_height":0,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 missing min_activation_height", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 min_activation_height null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":null,"status":"started","status_next":"started","since":0}}`),
+		})},
+		{"bip9 missing since", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started"}}`),
+		})},
+		{"bip9 since null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":null}}`),
+		})},
+		{"bip9 missing status", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status_next":"started","since":0}}`),
+		})},
+		{"bip9 missing status_next", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","since":0}}`),
+		})},
+
+		{"statistics missing period", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0,"statistics":{"elapsed":0,"count":0}}}`),
+		})},
+		{"statistics missing elapsed", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0,"statistics":{"period":2016,"count":0}}}`),
+		})},
+		{"statistics elapsed null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0,"statistics":{"period":2016,"elapsed":null,"count":0}}}`),
+		})},
+		{"statistics missing count", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0,"statistics":{"period":2016,"elapsed":0}}}`),
+		})},
+		{"statistics count null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"p2qpk": json.RawMessage(`{"type":"bip9","active":false,"bip9":{"start_time":1,"timeout":2,"min_activation_height":0,"status":"started","status_next":"started","since":0,"statistics":{"period":2016,"elapsed":0,"count":null}}}`),
+		})},
+
+		{"buried missing height", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"segwit": json.RawMessage(`{"type":"buried","active":true}`),
+		})},
+		{"buried height null", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"segwit": json.RawMessage(`{"type":"buried","active":true,"height":null}`),
+		})},
+		{"buried missing active", deploymentInfoResponse(hash, 100, map[string]json.RawMessage{
+			"segwit": json.RawMessage(`{"type":"buried","height":0}`),
 		})},
 		{"unrecognized type", deploymentInfoResponse(fakeHash("tip"), 100, map[string]json.RawMessage{
 			"mystery": json.RawMessage(`{"type":"unknown","active":false}`),
@@ -210,6 +297,25 @@ func TestDecodeDeploymentInfo_RejectsMalformedResponse(t *testing.T) {
 				t.Fatalf("DecodeDeploymentInfo: expected error, got nil")
 			}
 		})
+	}
+}
+
+// TestDecodeDeploymentInfo_EmptyDeploymentsObjectSucceeds is the internal
+// review fix's item 12: an explicit "deployments": {} must remain
+// distinguishable from a missing/null deployments object and must decode
+// successfully with zero BIP9 deployments — this is what lets
+// Store.ReplaceSnapshot legitimately publish an initialized=true,
+// deployment_count=0 snapshot (see TestReplaceSnapshot_NonEmptyToEmpty /
+// TestReplaceSnapshot_EmptyToNonEmpty in store_test.go), never confused
+// with "response deployments object is missing or null" above.
+func TestDecodeDeploymentInfo_EmptyDeploymentsObjectSucceeds(t *testing.T) {
+	info := mustUnmarshalInfo(t, `{"hash":"`+fakeHash("tip")+`","height":100,"deployments":{}}`)
+	decoded, err := DecodeDeploymentInfo(info)
+	if err != nil {
+		t.Fatalf("DecodeDeploymentInfo: %v", err)
+	}
+	if len(decoded.Deployments) != 0 {
+		t.Fatalf("got %d deployments, want 0 for explicit empty deployments object", len(decoded.Deployments))
 	}
 }
 
