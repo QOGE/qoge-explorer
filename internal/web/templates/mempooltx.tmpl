@@ -3,7 +3,7 @@
 {{if eq .Snapshot.Status "fresh"}}
 <p class="status-line"><strong>UNCONFIRMED / MEMPOOL</strong></p>
 {{else}}
-<p class="status-line">Present in cached mempool snapshot &mdash; snapshot stale (confirmed indexing has advanced past this snapshot's anchor). Membership in Core's CURRENT mempool is not confirmed by this page.</p>
+<p class="status-line">Present in cached mempool snapshot &mdash; the confirmed indexed tip no longer matches this snapshot's anchor. Membership in Core's current mempool is not confirmed by this page.</p>
 {{end}}
 
 <table class="kv-table">
@@ -41,7 +41,7 @@
 {{range .Inputs}}
 <div class="io-card">
   <div class="io-title">Input #{{.VinIndex}}</div>
-  <div>Previous output: <a class="mono wrap" href="/mempool/tx/{{.PrevTxID}}">{{.PrevTxID}}</a>:{{.PrevVoutIndex}}</div>
+  <div>Previous output: <a class="mono wrap" href="{{prevOutLink .PrevTxID $.Depends}}">{{.PrevTxID}}</a>:{{.PrevVoutIndex}}</div>
   <div>ScriptSig: <code class="mono wrap">{{.ScriptSigHex}}</code></div>
   <div>Sequence: {{.Sequence}}</div>
   {{if .Witness}}

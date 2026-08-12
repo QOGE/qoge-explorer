@@ -3385,16 +3385,28 @@ uses). The two are compared to derive `Status`/`Stale`:
   `core_tip_hash` == `sync_state.indexed_height`/`indexed_block_hash`
   exactly): the cached rows were observed against the exact confirmed
   chain state a reader is also seeing right now.
-- **`"stale"`** (`Initialized=true`, anchor != confirmed tip): real,
-  previously-observed mempool state, but confirmed indexing has since
-  advanced past the snapshot's anchor. **This is normal asynchronous
-  operation, not corruption** — Phase 2F.1's synchronizer publishes a
-  snapshot anchored at whatever tip it observed at acquisition time
-  (§22 "Snapshot acquisition: anchored, not atomic"), and confirmed
-  indexing can advance again before the NEXT mempool cycle runs. A
-  reader must never be left to assume a stale snapshot is current — every
-  mempool response, JSON or HTML, surfaces `stale`/`status` explicitly
-  rather than silently presenting cached rows as live.
+- **`"stale"`** (`Initialized=true`, anchor != confirmed tip): the
+  confirmed indexed tip no longer matches the snapshot's anchor. The only
+  fact this state asserts is that inequality — **it does NOT imply
+  forward advancement**. The common case is confirmed indexing having
+  advanced past the anchor since the snapshot was acquired, but the same
+  mismatch can equally result from a same-height canonical reorg (a
+  different hash at the same height), a rollback to a lower height, or a
+  replacement tip at another hash entirely — `query.MempoolState`'s
+  comparison (`mempoolStateFrom`) only ever checks `!=`, never an
+  ordering relationship, and the wording used everywhere this state is
+  surfaced (JSON, HTML) is written to match: "the confirmed indexed tip
+  no longer matches this mempool snapshot's anchor", never "advanced
+  past"/"ahead of"/"newer than". Either way, **this is normal
+  asynchronous operation, not corruption** — Phase 2F.1's synchronizer
+  publishes a snapshot anchored at whatever tip it observed at
+  acquisition time (§22 "Snapshot acquisition: anchored, not atomic"),
+  and the confirmed checkpoint can move again (forward, or sideways via
+  reorg) before the NEXT mempool cycle runs. A reader must never be left
+  to assume a stale snapshot is current, nor that it proves current Core
+  mempool membership — every mempool response, JSON or HTML, surfaces
+  `stale`/`status` explicitly rather than silently presenting cached rows
+  as live.
 
 Both `MempoolOverview` (list) and `mempoolTransactionDetail` (detail)
 call the same `mempoolStateFrom` helper against their own already-open
@@ -3550,14 +3562,27 @@ output value (`TestMempoolTransaction_Multisig`,
 `/search`'s fixed 64-hex lookup order gained two new steps at the END:
 `BlockByHash` -> `TransactionByTxID` -> `TransactionByWTxID` ->
 `MempoolTransactionByTxID` -> `MempoolTransactionByWTxID` — the first hit
-redirects there. Confirmed data always takes priority: a mempool match is
-only ever tried once every confirmed lookup has already missed, so a
-transaction that has since confirmed (but whose mempool row a later
-`ReplaceSnapshot` hasn't cleared away yet) is never shadowed by a stale
-mempool hit (`TestSearch_ConfirmedTakesPriorityOverMempool`). A mempool
-hit's destination page carries its own honest fresh/stale qualification
-(§ above) — search performs no additional filtering of its own
-(`TestSearch_MempoolFallback`).
+redirects there, and confirmed lookups are always attempted before
+mempool lookups. `handleSearch` issues these as separate, sequential
+`query.Store` calls (not one cross-domain `REPEATABLE READ` composite
+read spanning confirmed AND mempool tables together — no such composite
+exists), so this guarantees confirmed precedence WITHIN one stable
+database state, not an absolute point-in-time guarantee across an
+arbitrary concurrent transition between the individual calls. Within a
+stable state this ordering is deterministic:
+`TestSearch_ConfirmedTakesPriorityOverMempool` seeds the SAME txid as
+both a real confirmed transaction (via `Store.ApplyBlock`) and a cached
+mempool row (via `mempool.Store.ReplaceSnapshot`) — the exact state that
+can genuinely arise during the asynchronous interval after confirmed
+indexing observes a transaction but before the next mempool
+`ReplaceSnapshot` clears its now-stale cached row — and requires the
+redirect still lands on `/tx/{id}`, never `/mempool/tx/{id}`. A
+concurrent transition landing between the individual confirmed and
+mempool calls is out of scope for Phase 2F.2: a mempool hit's destination
+page always carries its own honest fresh/stale qualification (§ above)
+regardless, so worst case a transiently-stale mempool redirect still
+never claims current mempool membership — search itself performs no
+additional filtering (`TestSearch_MempoolFallback`).
 
 ### Explicitly NOT added in this phase
 

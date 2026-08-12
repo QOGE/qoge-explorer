@@ -38,11 +38,16 @@ var ErrMempoolGenerationChanged = errors.New("query: mempool generation changed"
 //   - FRESH (Initialized=true, anchor == confirmed tip): the cached
 //     mempool rows were observed against the exact confirmed chain state a
 //     reader is also seeing right now.
-//   - STALE (Initialized=true, anchor != confirmed tip): the cached
-//     mempool rows are real, previously-observed mempool state, but
-//     confirmed indexing has since advanced past the tip the snapshot was
-//     anchored to. This is normal asynchronous operation, NOT corruption —
-//     see internal/mempool/sync.go's anchor-acquisition comments — but a
+//   - STALE (Initialized=true, anchor != confirmed tip): the confirmed
+//     indexed tip no longer matches the snapshot's anchor. The common case
+//     is confirmed indexing advancing past the anchor, but a mismatch does
+//     NOT imply forward advancement — it can equally result from a
+//     same-height canonical reorg (a different hash at the same height),
+//     a rollback to a lower height, or a replacement tip at another hash
+//     entirely; anchor != confirmed tip is the only fact this state
+//     asserts. Either way the cached mempool rows are real,
+//     previously-observed mempool state, not corruption — see
+//     internal/mempool/sync.go's anchor-acquisition comments — but a
 //     reader must never be left to assume a stale snapshot is current.
 type MempoolState struct {
 	Initialized bool  `json:"initialized"`

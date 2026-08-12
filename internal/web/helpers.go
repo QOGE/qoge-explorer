@@ -15,6 +15,7 @@ var templateFuncs = template.FuncMap{
 	"yesNo":            yesNo,
 	"formatObservedAt": formatObservedAt,
 	"replaceableLabel": replaceableLabel,
+	"prevOutLink":      prevOutLink,
 }
 
 // formatTimeUTC renders a block header's Unix timestamp as an unambiguous
@@ -55,6 +56,24 @@ func formatObservedAt(t *time.Time) string {
 		return "never"
 	}
 	return t.UTC().Format("2006-01-02 15:04:05 UTC")
+}
+
+// prevOutLink returns the correct navigation target for a mempool
+// transaction input's previous output. A mempool transaction input can
+// spend EITHER another current mempool transaction OR an already-confirmed
+// one — Core's "depends" list (query.MempoolTransactionDetail.Depends,
+// already loaded into every detail response) is the only reliable, already
+// -available signal for which: prevTxid links to "/mempool/tx/{prevTxid}"
+// only when it's one of THIS transaction's own in-mempool parents,
+// otherwise "/tx/{prevTxid}" (confirmed). This never queries the database
+// merely to choose a link — see docs/ARCHITECTURE.md §23.
+func prevOutLink(prevTxid string, depends []string) string {
+	for _, d := range depends {
+		if d == prevTxid {
+			return "/mempool/tx/" + prevTxid
+		}
+	}
+	return "/tx/" + prevTxid
 }
 
 // replaceableLabel distinguishes the three states Core's

@@ -138,6 +138,48 @@ func TestMempoolState_Staleness(t *testing.T) {
 	}
 }
 
+// TestMempoolState_StaleOnSameHeightMismatch is spec item 7: a mempool
+// anchor and the confirmed indexed tip can disagree at the SAME height —
+// a different hash at height H (e.g. a same-height canonical reorg,
+// distinct from the "confirmed tip hasn't caught up yet" scenario
+// TestMempoolState_Staleness covers). query.MempoolState's comparison only
+// ever checks anchor != confirmed tip, never an ordering relationship, so
+// this must still read stale — proving Stale/Status do not encode any
+// forward-advancement assumption.
+func TestMempoolState_StaleOnSameHeightMismatch(t *testing.T) {
+	ctx := context.Background()
+	q, st, pool := newTestQueryStore(t)
+	mstore := newTestMempoolStore(pool)
+
+	anchorHash := fakeHash("same-height-reorg-A")
+	confirmedHash := fakeHash("same-height-reorg-B")
+	if anchorHash == confirmedHash {
+		t.Fatalf("fixture bug: anchor and confirmed hashes must differ")
+	}
+
+	if _, err := mstore.ReplaceSnapshot(ctx, mempoolCandidate(0, anchorHash)); err != nil {
+		t.Fatalf("ReplaceSnapshot: %v", err)
+	}
+	g := block("same-height-reorg-B", 0, "", coinbaseTx("same-height-reorg-B", 100_00000000, "qSameHeightReorgB"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("ApplyBlock: %v", err)
+	}
+	if g.Hash != confirmedHash {
+		t.Fatalf("fixture bug: g.Hash = %s, want %s", g.Hash, confirmedHash)
+	}
+
+	got, err := q.MempoolState(ctx)
+	if err != nil {
+		t.Fatalf("MempoolState: %v", err)
+	}
+	if got.CoreTipHeight == nil || *got.CoreTipHeight != 0 || got.ConfirmedIndexedHeight != 0 {
+		t.Fatalf("heights = anchor:%v confirmed:%d, want both 0 (same-height mismatch)", got.CoreTipHeight, got.ConfirmedIndexedHeight)
+	}
+	if !got.Stale || got.Status != "stale" {
+		t.Fatalf("Status/Stale = %q/%v, want stale/true (same height, different hash)", got.Status, got.Stale)
+	}
+}
+
 // TestMempoolOverview_GenerationSafePagination is spec item 37: a cursor
 // minted against generation N must be explicitly rejected
 // (ErrMempoolGenerationChanged) once the mempool has been replaced with

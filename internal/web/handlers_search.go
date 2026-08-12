@@ -22,14 +22,18 @@ import (
 //     TransactionByWTxID, MempoolTransactionByTxID,
 //     MempoolTransactionByWTxID — the first hit redirects there; no hit
 //     renders an explicit "nothing found" result page, never a guess.
-//     Confirmed data always takes priority: a mempool match is only ever
-//     tried once every confirmed lookup has missed, so a mempool entry can
-//     never shadow a confirmed transaction (e.g. one that just confirmed
-//     but whose mempool row hasn't been cleared by the next snapshot yet).
-//     A mempool hit's destination page shows its own fresh/stale
-//     qualification (see templates/mempooltx.tmpl) — search itself performs
-//     no additional staleness filtering, it simply redirects to whatever
-//     the current cached snapshot has;
+//     Confirmed lookups are always attempted before mempool lookups: a
+//     mempool match is only ever tried once every confirmed lookup has
+//     missed. These are separate, sequential query.Store calls, not one
+//     atomic cross-domain snapshot, so this is a deterministic ordering
+//     guarantee WITHIN one stable database state, not an absolute
+//     point-in-time guarantee across a concurrent transition between the
+//     calls — see docs/ARCHITECTURE.md §23 "Search: mempool as a
+//     lower-priority fallback". A mempool hit's destination page shows its
+//     own fresh/stale qualification regardless (see
+//     templates/mempooltx.tmpl) — search itself performs no additional
+//     staleness filtering, it simply redirects to whatever the current
+//     cached snapshot has;
 //   - anything else within the ordinary address-shape bound is treated as
 //     an address and redirected to /address/{address}.
 func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {

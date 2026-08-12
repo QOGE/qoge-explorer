@@ -4,7 +4,7 @@
 <p class="status-line">Mempool cache not synchronized yet.</p>
 {{else}}
 <table class="kv-table">
-<tr><th>Status</th><td>{{if eq .Overview.State.Status "fresh"}}Fresh{{else}}Stale &mdash; confirmed indexing has advanced past this snapshot's anchor{{end}}</td></tr>
+<tr><th>Status</th><td>{{if eq .Overview.State.Status "fresh"}}Fresh{{else}}Stale &mdash; the confirmed indexed tip no longer matches this mempool snapshot's anchor{{end}}</td></tr>
 <tr><th>Generation</th><td>{{.Overview.State.Generation}}</td></tr>
 <tr><th>Observed</th><td>{{formatObservedAt .Overview.State.ObservedAt}}</td></tr>
 <tr><th>Anchor Height</th><td>{{if .Overview.State.CoreTipHeight}}{{.Overview.State.CoreTipHeight}}{{end}}</td></tr>
