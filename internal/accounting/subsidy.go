@@ -21,11 +21,11 @@ var ErrUnknownNetwork = errors.New("accounting: unknown network")
 
 // SubsidySchedule holds the consensus subsidy parameters for one QOGE
 // network. Every QOGE network shares the same 100 QOGE initial subsidy and
-// 64-halving exhaustion point; only HalvingInterval differs between them.
-// This was verified directly against Qogecoin Core stable's
-// src/chainparams.cpp (not merely assumed from mainnet — a prior version of
-// this package hardcoded mainnet's interval as if it were universal, which
-// was wrong for regtest):
+// the same MaxHalvings=64 Core shift-safety guard; only HalvingInterval
+// differs between them. This was verified directly against Qogecoin Core
+// stable's src/chainparams.cpp (not merely assumed from mainnet — a prior
+// version of this package hardcoded mainnet's interval as if it were
+// universal, which was wrong for regtest):
 //
 //   - CMainParams:    nSubsidyHalvingInterval = 500000  (strNetworkID "main")
 //   - CTestNetParams: nSubsidyHalvingInterval = 500000  (strNetworkID "test")
@@ -36,8 +36,24 @@ var ErrUnknownNetwork = errors.New("accounting: unknown network")
 // src/validation.cpp's GetBlockSubsidy, which takes consensusParams (and
 // therefore the halving interval) as a parameter but otherwise applies
 // identically across networks: `CAmount nSubsidy = 100 * COIN; nSubsidy >>=
-// halvings;` with `if (halvings >= 64) return 0;`. src/consensus/amount.h:
-// COIN = 100000000 (100,000,000 satoshis/QOGE).
+// halvings;` with `if (halvings >= 64) return 0;` (Core's own comment on
+// that guard: "Force block reward to zero when right shift is undefined").
+// src/consensus/amount.h: COIN = 100000000 (100,000,000 satoshis/QOGE).
+//
+// IMPORTANT — two distinct concepts, do not conflate them:
+//
+//   - Core's `halvings >= 64` guard exists ONLY because right-shifting a
+//     64-bit value by 64 or more bit positions is undefined behavior in
+//     C++. It is a shift-safety guard, not a statement about when the
+//     subsidy runs out.
+//   - QOGE's EFFECTIVE monetary exhaustion happens far earlier, as a direct
+//     consequence of finite satoshi precision: InitialSubsidySatoshis is
+//     10,000,000,000 (100 QOGE), and 10,000,000,000 >> 33 = 1 satoshi while
+//     10,000,000,000 >> 34 = 0. So the subsidy is already, naturally, zero
+//     from era 34 onward — 30 full eras before the shift guard would ever
+//     matter. BlockSubsidy needs no special-case for this: integer
+//     right-shift already produces 0 at era 34 on its own; the `>= 64`
+//     guard is simply never the reason era-34-and-later blocks pay zero.
 type SubsidySchedule struct {
 	InitialSubsidySatoshis int64
 	HalvingInterval        int64
@@ -95,9 +111,14 @@ func ScheduleForNetwork(network string) (SubsidySchedule, error) {
 // integer satoshis, computed by the exact formula verified against Core's
 // GetBlockSubsidy: the initial subsidy right-shifted once per
 // sch.HalvingInterval-block halving era, forced to zero once
-// sch.MaxHalvings halvings have elapsed. height must be non-negative; a
-// negative height is rejected rather than silently treated as height 0
-// (which would misreport a caller's bug as valid consensus data).
+// sch.MaxHalvings halvings have elapsed (Core's shift-safety guard — see
+// SubsidySchedule's doc comment). In practice the plain right-shift already
+// reaches 0 at era 34 (10,000,000,000 >> 34 == 0) on every QOGE network,
+// long before the sch.MaxHalvings=64 guard would ever trigger; that guard
+// exists for shift-safety, not because era 34 alone wouldn't already be
+// zero. height must be non-negative; a negative height is rejected rather
+// than silently treated as height 0 (which would misreport a caller's bug
+// as valid consensus data).
 func (sch SubsidySchedule) BlockSubsidy(height int64) (int64, error) {
 	if height < 0 {
 		return 0, fmt.Errorf("%w: block subsidy height %d", ErrNegativeHeight, height)
@@ -165,6 +186,16 @@ func (sch SubsidySchedule) ScheduledSubsidyThroughHeight(height int64) (int64, e
 		}
 
 		subsidy := sch.InitialSubsidySatoshis >> uint(era)
+		if subsidy == 0 {
+			// Effective monetary exhaustion (era 34 for QOGE's 100 QOGE
+			// initial subsidy — see SubsidySchedule's doc comment): every
+			// later era's right-shifted subsidy is also 0, so no further
+			// era can contribute. This is purely a loop-count optimization,
+			// not a correctness dependency — the loop would reach the same
+			// total by running all the way to sch.MaxHalvings, since a
+			// zero-subsidy era's contribution is zero either way.
+			break
+		}
 
 		contribution, ok := checkedMul(subsidy, blocksInEra)
 		if !ok {

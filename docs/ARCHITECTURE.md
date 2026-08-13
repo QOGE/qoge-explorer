@@ -836,8 +836,19 @@ contaminate another:
 - **Block subsidy** — a pure function of height AND network, confirmed
   directly from Qogecoin Core source (`src/validation.cpp`,
   `GetBlockSubsidy`): `subsidy(height) = 100 QOGE >> (height /
-  halvingInterval)`, zero once the shift exceeds 63 halvings.
-  `halvingInterval` is **not** a single global constant — `src/chainparams.cpp`
+  halvingInterval)`. Core additionally forces the result to zero without
+  performing the shift once `halvings >= 64` ("Force block reward to zero
+  when right shift is undefined" — a C++ shift-safety guard, since
+  right-shifting a 64-bit value by 64+ bits is undefined behavior). That
+  guard is NOT where QOGE's subsidy actually reaches zero: with a 100 QOGE
+  (10,000,000,000 satoshi) initial subsidy, plain integer right-shift
+  already yields 0 from era 34 onward (`10,000,000,000 >> 33 = 1` satoshi,
+  `>> 34 = 0`) — 30 full eras before Core's guard would ever matter. An
+  earlier version of this document conflated the two, describing era 64 as
+  the exhaustion point; see §26 "Network-aware subsidy schedule" for the
+  correction and `internal/accounting.TestBlockSubsidy_EffectiveExhaustion_Mainnet`
+  / `TestBlockSubsidy_CoreShiftGuardBoundary` for the tests that keep the
+  two concepts distinct. `halvingInterval` is **not** a single global constant — `src/chainparams.cpp`
   sets `nSubsidyHalvingInterval = 500000` for `CMainParams`, `CTestNetParams`,
   and `CSigNetParams`, but `150` for `CRegTestParams`. An earlier version of
   this codebase hardcoded 500,000 as if it applied everywhere, which would
@@ -4263,6 +4274,16 @@ architecture this review examined — immutable per-block accounting, no
 additive global counter, atomic `ApplyBlock` integration, reorg audit
 trail, explicit PostgreSQL backfill — was found sound and is unchanged.
 
+**Second internal review correction (still Phase 2H.1, pre-merge):** a
+follow-up review found one further test/documentation grounding issue, not
+a code defect — production `BlockSubsidy` already computed correct values.
+This document and one test described `MaxHalvings = 64` (Core's C++
+shift-safety guard) as if it were the point QOGE's subsidy actually
+exhausts. It isn't: with a 10,000,000,000-satoshi initial subsidy, plain
+integer right-shift already reaches 0 at era 34, 30 eras before the guard
+would matter. See "Network-aware subsidy schedule" below for the corrected
+explanation and exact per-network heights.
+
 ### Monetary terms
 
 Six distinct concepts, kept structurally separate (`internal/accounting`)
@@ -4274,14 +4295,17 @@ so a bug in one can never silently contaminate another:
   below). Verified directly against Qogecoin Core `stable` (not merely
   trusted from this document): `src/validation.cpp`'s `GetBlockSubsidy`
   computes `CAmount nSubsidy = 100 * COIN; nSubsidy >>= halvings;` with
-  `if (halvings >= 64) return 0;`; `src/consensus/amount.h` defines `COIN
+  `if (halvings >= 64) return 0;` (Core's own comment: "Force block reward
+  to zero when right shift is undefined" — a C++ shift-safety guard, not a
+  monetary-exhaustion statement); `src/consensus/amount.h` defines `COIN
   = 100000000`. The halving interval itself is NOT one global constant —
   `src/chainparams.cpp` sets `nSubsidyHalvingInterval = 500000` for
   `CMainParams`/`CTestNetParams`/`CSigNetParams`, but `150` for
   `CRegTestParams`. This confirms the formula already stated in §6 —
-  `subsidy(height) = 100 QOGE >> (height / halvingInterval)`, zero once 64
-  halvings have elapsed — with the exact Core source locations that
-  formula is drawn from.
+  `subsidy(height) = 100 QOGE >> (height / halvingInterval)` — with the
+  exact Core source locations that formula is drawn from. See
+  "Network-aware subsidy schedule" below for why this reaches zero at era
+  34 in practice, 30 eras before Core's `>= 64` guard would ever trigger.
 - **Transaction fees** — the exact sum of a block's non-coinbase
   transaction fees, using the SAME `inputSum - outputSum` figure already
   persisted to `transactions.fee_satoshis` by `applyTransaction` (§16
@@ -4406,6 +4430,40 @@ once at construction:
   it needed only `QOGE_DATABASE_URL`) — the schedule backfill reconstructs
   accounting from is exactly as network-specific as the schedule live
   indexing uses, and both must agree.
+
+**`MaxHalvings = 64` is Core's shift-safety guard, not where the subsidy
+actually reaches zero.** A second internal review caught this document (and
+a test) describing 64 halvings as "the exhaustion point." Core's `>= 64`
+check exists purely because right-shifting a 64-bit `CAmount` by 64 or more
+bit positions is undefined behavior in C++; it is not a claim about when
+QOGE's subsidy runs out monetarily. `SubsidySchedule.InitialSubsidySatoshis`
+is `10,000,000,000` (100 QOGE): `10,000,000,000 >> 33 = 1` satoshi, and
+`10,000,000,000 >> 34 = 0`. So the subsidy is already, naturally, zero from
+era 34 onward, on every network — 30 full eras before Core's `>= 64` guard
+would ever matter. `BlockSubsidy` needs no special case for this: plain
+integer right-shift already produces `0` at era 34; Core's guard is simply
+never the actual reason era-34-and-later blocks pay zero. Concretely, by
+height (network-specific, since `HalvingInterval` differs, but always era
+34):
+
+- **main/test/signet** (`HalvingInterval = 500000`): height 16,999,999
+  (era 33) pays 1 satoshi; height 17,000,000 (era 34) is the first height
+  to pay 0, and every later height stays 0.
+- **regtest** (`HalvingInterval = 150`): height 5,099 (era 33) pays 1
+  satoshi; height 5,100 (era 34) is the first height to pay 0.
+
+`ScheduledSubsidyThroughHeight` reflects this too: the running total stops
+growing at each network's era-34 height, and stays identical all the way
+out to `height = math.MaxInt64` — proven for both mainnet and regtest by
+`TestScheduledSubsidyThroughHeight_PostExhaustion` and
+`TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow`.
+`MaxHalvings` itself is kept (rather than renamed) because it still
+accurately names Core's own guard constant; its doc comment on
+`SubsidySchedule` states the shift-guard-vs-effective-exhaustion
+distinction explicitly so a future reader can't re-conflate them.
+`TestBlockSubsidy_CoreShiftGuardBoundary` separately documents that the
+guard itself is safe (no wrapped/resurrected subsidy at or beyond era 64),
+without implying it's the monetary exhaustion point.
 
 ### Immutable, per-block `block_accounting` — not a cumulative counter
 

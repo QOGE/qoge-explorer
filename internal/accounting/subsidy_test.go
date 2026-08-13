@@ -126,30 +126,82 @@ func TestBlockSubsidy_HalvingEraBoundaries(t *testing.T) {
 	}
 }
 
-// TestBlockSubsidy_Exhaustion proves the subsidy reaches exactly zero once
-// MaxHalvings halvings have elapsed (Core's `if (halvings >= 64) return
-// 0;`), and stays zero for every height beyond that — including heights far
-// beyond any real chain length, proving there's no later resurgence from a
-// wrapped shift.
-func TestBlockSubsidy_Exhaustion(t *testing.T) {
+// TestBlockSubsidy_EffectiveExhaustion_Mainnet proves the subsidy's ACTUAL
+// (not Core-shift-guard) zero point: with InitialSubsidySatoshis =
+// 10,000,000,000, 10,000,000,000 >> 33 = 1 satoshi and 10,000,000,000 >> 34
+// = 0 — so era 33 (heights 16,500,000-16,999,999) is the last era with a
+// nonzero subsidy, and era 34 (starting at height 17,000,000) is the first
+// with a zero subsidy, entirely independent of Core's `halvings >= 64`
+// shift-safety guard (era 34 is nowhere near era 64). A prior version of
+// this test conflated the two — see TestBlockSubsidy_CoreShiftGuardBoundary
+// for the guard itself.
+func TestBlockSubsidy_EffectiveExhaustion_Mainnet(t *testing.T) {
 	sch := MainnetSchedule
-	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval // first height with 0 subsidy
-
-	lastNonZeroHeight := exhaustionHeight - 1
-	got, err := sch.BlockSubsidy(lastNonZeroHeight)
-	if err != nil {
-		t.Fatalf("BlockSubsidy(%d): unexpected error: %v", lastNonZeroHeight, err)
+	cases := []struct {
+		name   string
+		height int64
+		want   int64
+	}{
+		{"era 33 last height: 1 satoshi", 16_999_999, 1},
+		{"era 34 first height: 0", 17_000_000, 0},
+		{"era 34 second height: still 0", 17_000_001, 0},
 	}
-	want := sch.InitialSubsidySatoshis >> uint(sch.MaxHalvings-1)
-	if got != want {
-		t.Fatalf("BlockSubsidy(%d) (last height before exhaustion) = %d, want %d", lastNonZeroHeight, got, want)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := sch.BlockSubsidy(c.height)
+			if err != nil {
+				t.Fatalf("BlockSubsidy(%d): unexpected error: %v", c.height, err)
+			}
+			if got != c.want {
+				t.Fatalf("BlockSubsidy(%d) = %d, want %d", c.height, got, c.want)
+			}
+		})
 	}
+}
 
+// TestBlockSubsidy_EffectiveExhaustion_Regtest is the regtest analogue of
+// TestBlockSubsidy_EffectiveExhaustion_Mainnet: regtest's 150-block halving
+// interval means the SAME era 33/34 boundary (subsidy depends only on era,
+// not on HalvingInterval) falls at different heights — era 33 starts at
+// 33*150=4,950, so its last height is 5,099 and era 34 starts at 5,100.
+func TestBlockSubsidy_EffectiveExhaustion_Regtest(t *testing.T) {
+	sch := RegtestSchedule
+	cases := []struct {
+		name   string
+		height int64
+		want   int64
+	}{
+		{"era 33 last height: 1 satoshi", 5_099, 1},
+		{"era 34 first height: 0", 5_100, 0},
+		{"era 34 second height: still 0", 5_101, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := sch.BlockSubsidy(c.height)
+			if err != nil {
+				t.Fatalf("BlockSubsidy(%d): unexpected error: %v", c.height, err)
+			}
+			if got != c.want {
+				t.Fatalf("BlockSubsidy(%d) = %d, want %d", c.height, got, c.want)
+			}
+		})
+	}
+}
+
+// TestBlockSubsidy_CoreShiftGuardBoundary proves Core's `if (halvings >= 64)
+// return 0;` shift-safety guard itself behaves safely — NOT that it is the
+// monetary exhaustion point (that's era 34, already zero 30 eras earlier;
+// see TestBlockSubsidy_EffectiveExhaustion_Mainnet). This test's only
+// purpose is to document that era >= 64 takes Core's explicit guard path
+// and that no wrapped/resurrected nonzero subsidy ever occurs there or
+// beyond, for heights far past any real chain length.
+func TestBlockSubsidy_CoreShiftGuardBoundary(t *testing.T) {
+	sch := MainnetSchedule
 	heights := []int64{
-		exhaustionHeight,
-		exhaustionHeight + 1,
-		exhaustionHeight + sch.HalvingInterval,
-		exhaustionHeight * 1000,
+		63 * sch.HalvingInterval, // era 63 start: guard not yet triggered (63 < 64), but already 0 from effective exhaustion
+		64 * sch.HalvingInterval, // era 64 start: guard triggers (halvings >= 64)
+		64*sch.HalvingInterval + 1,
+		1000 * sch.HalvingInterval, // far beyond any real chain length
 	}
 	for _, h := range heights {
 		got, err := sch.BlockSubsidy(h)
@@ -157,7 +209,7 @@ func TestBlockSubsidy_Exhaustion(t *testing.T) {
 			t.Fatalf("BlockSubsidy(%d): unexpected error: %v", h, err)
 		}
 		if got != 0 {
-			t.Fatalf("BlockSubsidy(%d) = %d, want 0 (post-exhaustion)", h, got)
+			t.Fatalf("BlockSubsidy(%d) = %d, want 0 (no resurgence at/past Core's shift guard)", h, got)
 		}
 	}
 }
@@ -338,58 +390,83 @@ func TestScheduledSubsidyThroughHeight_CurrentChainScale(t *testing.T) {
 }
 
 // TestScheduledSubsidyThroughHeight_PostExhaustion proves the sum stops
-// growing once every era's subsidy has reached zero: the total at the
-// exhaustion height must equal the total at any later height.
+// growing once every era's subsidy has reached zero. This is grounded in
+// EFFECTIVE exhaustion (era 34 — see TestBlockSubsidy_EffectiveExhaustion_Mainnet),
+// not Core's era-64 shift guard: the running total at the last-nonzero
+// height, the first-zero height, and any later height must all be equal,
+// for both mainnet and regtest (whose era-34 boundary falls at a different
+// height because HalvingInterval differs, but the SAME era).
 func TestScheduledSubsidyThroughHeight_PostExhaustion(t *testing.T) {
-	sch := MainnetSchedule
-	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval
+	cases := []struct {
+		name              string
+		sch               SubsidySchedule
+		lastNonZeroHeight int64
+		firstZeroHeight   int64
+	}{
+		{"mainnet", MainnetSchedule, 16_999_999, 17_000_000},
+		{"regtest", RegtestSchedule, 5_099, 5_100},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			totalJustBefore, err := c.sch.ScheduledSubsidyThroughHeight(c.lastNonZeroHeight)
+			if err != nil {
+				t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", c.lastNonZeroHeight, err)
+			}
+			totalAtExhaustion, err := c.sch.ScheduledSubsidyThroughHeight(c.firstZeroHeight)
+			if err != nil {
+				t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", c.firstZeroHeight, err)
+			}
+			if totalAtExhaustion != totalJustBefore {
+				t.Fatalf("scheduled subsidy total grew at the first zero-subsidy height (%d): before=%d at=%d, want equal",
+					c.firstZeroHeight, totalJustBefore, totalAtExhaustion)
+			}
 
-	totalAtExhaustion, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	totalJustBefore, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight - 1)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if totalAtExhaustion != totalJustBefore {
-		t.Fatalf("scheduled subsidy total grew at the exhaustion height (%d): before=%d at=%d, want equal (subsidy is 0 there)",
-			exhaustionHeight, totalJustBefore, totalAtExhaustion)
-	}
-
-	laterHeights := []int64{exhaustionHeight + 1, exhaustionHeight + sch.HalvingInterval, exhaustionHeight * 10}
-	for _, h := range laterHeights {
-		got, err := sch.ScheduledSubsidyThroughHeight(h)
-		if err != nil {
-			t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", h, err)
-		}
-		if got != totalAtExhaustion {
-			t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d (total must not grow post-exhaustion)", h, got, totalAtExhaustion)
-		}
+			laterHeights := []int64{c.firstZeroHeight + 1, c.firstZeroHeight + c.sch.HalvingInterval, c.firstZeroHeight * 10}
+			for _, h := range laterHeights {
+				got, err := c.sch.ScheduledSubsidyThroughHeight(h)
+				if err != nil {
+					t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", h, err)
+				}
+				if got != totalAtExhaustion {
+					t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d (total must not grow post-exhaustion)", h, got, totalAtExhaustion)
+				}
+			}
+		})
 	}
 }
 
 // TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow proves
 // ScheduledSubsidyThroughHeight(math.MaxInt64) returns exactly the same
-// value as the first fully post-exhaustion height, with no error and no
-// silent wraparound — the era arithmetic deliberately never computes
-// height+1 (which would overflow at MaxInt64) for exactly this reason. See
-// SubsidySchedule.ScheduledSubsidyThroughHeight's doc comment.
+// value as the EFFECTIVE first fully post-exhaustion height (era 34, not
+// Core's era-64 shift guard — see TestBlockSubsidy_EffectiveExhaustion_Mainnet),
+// with no error and no silent wraparound — the era arithmetic deliberately
+// never computes height+1 (which would overflow at MaxInt64) for exactly
+// this reason. See SubsidySchedule.ScheduledSubsidyThroughHeight's doc
+// comment. Checked for both mainnet and regtest.
 func TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow(t *testing.T) {
-	sch := MainnetSchedule
-	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval
-
-	want, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight)
-	if err != nil {
-		t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", exhaustionHeight, err)
+	cases := []struct {
+		name            string
+		sch             SubsidySchedule
+		firstZeroHeight int64
+	}{
+		{"mainnet", MainnetSchedule, 17_000_000},
+		{"regtest", RegtestSchedule, 5_100},
 	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			want, err := c.sch.ScheduledSubsidyThroughHeight(c.firstZeroHeight)
+			if err != nil {
+				t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", c.firstZeroHeight, err)
+			}
 
-	got, err := sch.ScheduledSubsidyThroughHeight(math.MaxInt64)
-	if err != nil {
-		t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64): unexpected error: %v", err)
-	}
-	if got != want {
-		t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64) = %d, want %d (same as first fully post-exhaustion height)", got, want)
+			got, err := c.sch.ScheduledSubsidyThroughHeight(math.MaxInt64)
+			if err != nil {
+				t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64): unexpected error: %v", err)
+			}
+			if got != want {
+				t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64) = %d, want %d (same as first effectively-post-exhaustion height)", got, want)
+			}
+		})
 	}
 }
 
