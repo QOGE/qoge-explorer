@@ -11,12 +11,12 @@ import (
 
 // TestMigration_0002RoundTrip exercises schema v1 -> v2 -> v1 -> v2 (spec
 // item 36): migratedPool already applies every migration (0001, 0002,
-// and — since Phase 2G.1 — 0003) to a fresh disposable schema; this test
-// additionally rolls 0003 and 0002 both back (0003 must come off first,
-// being the newer migration, before 0002 can) and re-applies them,
-// confirming mempool_state and every mempool_* table exist after the
-// final up and are gone after the rollback, and that 0001's tables/rows
-// are never touched by any of it.
+// 0003 since Phase 2G.1, and 0004 since Phase 2H.1) to a fresh disposable
+// schema; this test additionally rolls 0004, 0003, and 0002 all back
+// (newest first: 0004 must come off before 0003, which must come off
+// before 0002) and re-applies them, confirming mempool_state and every
+// mempool_* table exist after the final up and are gone after the
+// rollback, and that 0001's tables/rows are never touched by any of it.
 func TestMigration_0002RoundTrip(t *testing.T) {
 	pool := migratedPool(t)
 	ctx := context.Background()
@@ -46,32 +46,34 @@ func TestMigration_0002RoundTrip(t *testing.T) {
 		t.Fatalf("load migrations: %v", err)
 	}
 
-	// v3 -> v1: roll back 0003 (deployment_state, newest first) then 0002
-	// (the mempool migration).
-	rolledBack, err := store.Down(ctx, pool, migrations, 2)
+	// v4 -> v1: roll back 0004 (block_accounting), 0003 (deployment_state),
+	// then 0002 (the mempool migration), newest first.
+	rolledBack, err := store.Down(ctx, pool, migrations, 3)
 	if err != nil {
-		t.Fatalf("Down(2): %v", err)
+		t.Fatalf("Down(3): %v", err)
 	}
-	if len(rolledBack) != 2 || rolledBack[0] != 3 || rolledBack[1] != 2 {
-		t.Fatalf("Down(2) rolled back %v, want [3 2]", rolledBack)
+	if len(rolledBack) != 3 || rolledBack[0] != 4 || rolledBack[1] != 3 || rolledBack[2] != 2 {
+		t.Fatalf("Down(3) rolled back %v, want [4 3 2]", rolledBack)
 	}
 	requireTableAbsent(t, ctx, pool, "mempool_state")
 	requireTableAbsent(t, ctx, pool, "mempool_transactions")
 	requireTableAbsent(t, ctx, pool, "mempool_dependencies")
 	requireTableAbsent(t, ctx, pool, "deployment_state")
+	requireTableAbsent(t, ctx, pool, "block_accounting")
 	requireTableExists(t, ctx, pool, "blocks")            // 0001 unaffected
 	requireTableExists(t, ctx, pool, "chain_deployments") // 0001 unaffected
 
-	// v1 -> v3 again: re-apply both.
+	// v1 -> v4 again: re-apply all three.
 	applied, err := store.Up(ctx, pool, migrations)
 	if err != nil {
 		t.Fatalf("Up (re-apply): %v", err)
 	}
-	if len(applied) != 2 || applied[0] != 2 || applied[1] != 3 {
-		t.Fatalf("Up (re-apply) applied %v, want [2 3]", applied)
+	if len(applied) != 3 || applied[0] != 2 || applied[1] != 3 || applied[2] != 4 {
+		t.Fatalf("Up (re-apply) applied %v, want [2 3 4]", applied)
 	}
 	requireTableExists(t, ctx, pool, "mempool_state")
 	requireTableExists(t, ctx, pool, "deployment_state")
+	requireTableExists(t, ctx, pool, "block_accounting")
 
 	// The bootstrap mempool_state('main') row must be back in its
 	// UNINITIALIZED state after re-creation, exactly as migration 0002's

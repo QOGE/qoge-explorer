@@ -833,38 +833,75 @@ that decision without owning the policy loop itself.
 Four distinct concepts, computed independently so a bug in one can't
 contaminate another:
 
-- **Block subsidy** — a pure function of height, confirmed directly from
-  Qogecoin Core source (`src/validation.cpp`, `GetBlockSubsidy`):
-  `subsidy(height) = 100 QOGE >> (height / 500000)` (`nSubsidyHalvingInterval
-  = 500000` per `src/chainparams.cpp`), zero once the shift exceeds 63
-  halvings. Cross-checked empirically against the live chain: height
-  1,000,000 (2 halvings) → 25 QOGE; height 2,000,000 (4 halvings) → 6.25
-  QOGE — both match the formula exactly.
+- **Block subsidy** — a pure function of height AND network, confirmed
+  directly from Qogecoin Core source (`src/validation.cpp`,
+  `GetBlockSubsidy`): `subsidy(height) = 100 QOGE >> (height /
+  halvingInterval)`. Core additionally forces the result to zero without
+  performing the shift once `halvings >= 64` ("Force block reward to zero
+  when right shift is undefined" — a C++ shift-safety guard, since
+  right-shifting a 64-bit value by 64+ bits is undefined behavior). That
+  guard is NOT where QOGE's subsidy actually reaches zero: with a 100 QOGE
+  (10,000,000,000 satoshi) initial subsidy, plain integer right-shift
+  already yields 0 from era 34 onward (`10,000,000,000 >> 33 = 1` satoshi,
+  `>> 34 = 0`) — 30 full eras before Core's guard would ever matter. An
+  earlier version of this document conflated the two, describing era 64 as
+  the exhaustion point; see §26 "Network-aware subsidy schedule" for the
+  correction and `internal/accounting.TestBlockSubsidy_EffectiveExhaustion_Mainnet`
+  / `TestBlockSubsidy_CoreShiftGuardBoundary` for the tests that keep the
+  two concepts distinct. `halvingInterval` is **not** a single global constant — `src/chainparams.cpp`
+  sets `nSubsidyHalvingInterval = 500000` for `CMainParams`, `CTestNetParams`,
+  and `CSigNetParams`, but `150` for `CRegTestParams`. An earlier version of
+  this codebase hardcoded 500,000 as if it applied everywhere, which would
+  have silently mis-recorded regtest accounting (see §26 "Network-aware
+  subsidy schedule" for the fix and why the bug didn't fail loudly).
+  Cross-checked empirically against the live mainnet chain: height 1,000,000
+  (2 halvings) → 25 QOGE; height 2,000,000 (4 halvings) → 6.25 QOGE — both
+  match the formula exactly.
 - **Transaction fees** — per block, `SUM(non-coinbase input values) -
   SUM(non-coinbase output values)`, computed from indexed data once all
   referenced inputs are resolved.
-- **Total issued supply** — `SUM(subsidy(h) for h in 0..tip)`. Monotonic,
-  height-derived, never touches indexed coinbase-output data at all.
+- **Scheduled subsidy total** (formerly, incorrectly, called "issued
+  supply") — `SUM(subsidy(h) for h in 0..tip)`. Monotonic, height-derived,
+  never touches indexed coinbase-output data at all — but see the
+  correction below: this is the maximum a fully-claiming chain COULD have
+  issued, not necessarily what it actually did.
 - **Currently unspent ("circulating") supply** *(future, optional)* —
   `SELECT SUM(o.value_satoshis) FROM transaction_outputs o JOIN utxo_state u
   USING (txid, vout_index) WHERE NOT u.spent AND o.script_type !=
   'nulldata'` (spend state lives in `utxo_state`, not on
-  `transaction_outputs` itself — see §3b). This is `total_issued_supply`
-  minus everything provably burned (`nulldata`/OP_RETURN outputs, which are
-  consensus-unspendable) minus nothing else — spent-and-respent value doesn't
-  disappear, it just moves.
+  `transaction_outputs` itself — see §3b). Not simply "scheduled subsidy
+  total minus burned outputs" — see the correction below for why.
 
-**Recommendation:** compute issued supply from the **height-based subsidy
-formula**, not from `coinbase outputs − fees` derived from indexed data. The
-formula is a pure function of height — it's correct even for blocks not yet
-indexed, requires trusting no indexed data at all, and can't be corrupted by
-an indexing bug. Deriving it from indexed coinbase totals minus a separately
-indexed fee figure requires *both* numbers to be correct, which is exactly
-the kind of double bookkeeping that let eIquidus's bug through unnoticed.
-The two numbers should still be cross-checked against each other
-periodically as an integrity check (`cumulative coinbase output value` should
-always equal `total issued supply + cumulative fees`) — a mismatch means an
-indexing bug, and is exactly the kind of alarm eIquidus had no way to raise.
+**Recommendation:** compute the scheduled subsidy total from the
+**height-based subsidy formula**, not from `coinbase outputs − fees` derived
+from indexed data. The formula is a pure function of height and network —
+it's correct even for blocks not yet indexed, requires trusting no indexed
+data at all, and can't be corrupted by an indexing bug. Deriving it from
+indexed coinbase totals minus a separately indexed fee figure requires
+*both* numbers to be correct, which is exactly the kind of double
+bookkeeping that let eIquidus's bug through unnoticed.
+
+**Correction (Phase 2H.1 — see §26):** the two numbers are NOT expected to
+satisfy a strict equality, even for perfectly correct data. Confirmed
+directly against Qogecoin Core `stable` source (`src/validation.cpp`
+`ConnectBlock`): Core rejects a block only if `coinbase_output_total >
+subsidy + fees` ("bad-cb-amount") — a miner may validly claim LESS than
+the maximum available reward, and real chains do. `cumulative coinbase
+output value == scheduled subsidy total + cumulative fees` is therefore not
+a sound integrity check; the correct per-block invariant is
+`coinbase_output + unclaimed_reward == subsidy + fees` (`unclaimed_reward >=
+0`), which is what §26's `block_accounting` table and `internal/accounting.
+SubsidySchedule.ComputeBlockFacts` actually enforce.
+
+**Terminology correction (Phase 2H.1 internal review):** because a positive
+`unclaimed_reward` is valid, ordinary chain state, `SUM(subsidy(h))` across
+blocks systematically OVERSTATES actual chain issuance whenever any block
+underclaims. This codebase therefore never calls that pure, schedule-only
+sum "issued supply," "actual issued supply," or "circulating supply" — see
+`internal/accounting.SubsidySchedule.ScheduledSubsidyThroughHeight`'s doc
+comment and §26 "Scheduled subsidy is not issued supply." The exact public
+metrics that account for underclaimed reward/fees remain deferred to Phase
+2H.2.
 
 ## 7. Script classification model
 
@@ -4213,3 +4250,423 @@ ways — test-only, no production code was implicated:
   `TestDeploymentDetailPage_AllStatusesRenderSafely` (web) each verify
   the boundary object is reported/serialized/rendered exactly as Core
   sent it, with no special-cased transition branch in production code.
+
+## 26. Block monetary accounting foundation (Phase 2H.1)
+
+Phase 2H.1 adds the write/foundation layer for a future
+`GET /api/v1/supply`, `/supply` page, and rich-list/address-distribution
+work. It adds NO public API or HTML — those are deferred to Phase 2H.2
+(public read surface) and Phase 2H.3 (rich list). This section documents
+the monetary model, correcting and superseding the "Recommendation"
+paragraph at the end of §6, which is still correct about the subsidy
+formula and the general four-concepts framing, but predates the
+correction below about what invariant Core actually enforces.
+
+**Internal review correction (still Phase 2H.1, pre-merge):** an internal
+review of the first version of this work found two blocking issues, both
+fixed in place rather than deferred: the subsidy schedule was hardcoded to
+mainnet's 500,000-block halving interval, silently wrong for `regtest`
+(150 blocks); and the pure `SUM(subsidy(h))` quantity was called "issued
+supply," which overstates real issuance whenever any block underclaims.
+Both are described in full below ("Network-aware subsidy schedule" and the
+"Scheduled subsidy total" bullet's terminology note); the underlying
+architecture this review examined — immutable per-block accounting, no
+additive global counter, atomic `ApplyBlock` integration, reorg audit
+trail, explicit PostgreSQL backfill — was found sound and is unchanged.
+
+**Second internal review correction (still Phase 2H.1, pre-merge):** a
+follow-up review found one further test/documentation grounding issue, not
+a code defect — production `BlockSubsidy` already computed correct values.
+This document and one test described `MaxHalvings = 64` (Core's C++
+shift-safety guard) as if it were the point QOGE's subsidy actually
+exhausts. It isn't: with a 10,000,000,000-satoshi initial subsidy, plain
+integer right-shift already reaches 0 at era 34, 30 eras before the guard
+would matter. See "Network-aware subsidy schedule" below for the corrected
+explanation and exact per-network heights.
+
+### Monetary terms
+
+Six distinct concepts, kept structurally separate (`internal/accounting`)
+so a bug in one can never silently contaminate another:
+
+- **Block subsidy** — the height- AND network-derived new-issuance
+  entitlement, a pure function of `(height, SubsidySchedule)`
+  (`SubsidySchedule.BlockSubsidy` — see "Network-aware subsidy schedule"
+  below). Verified directly against Qogecoin Core `stable` (not merely
+  trusted from this document): `src/validation.cpp`'s `GetBlockSubsidy`
+  computes `CAmount nSubsidy = 100 * COIN; nSubsidy >>= halvings;` with
+  `if (halvings >= 64) return 0;` (Core's own comment: "Force block reward
+  to zero when right shift is undefined" — a C++ shift-safety guard, not a
+  monetary-exhaustion statement); `src/consensus/amount.h` defines `COIN
+  = 100000000`. The halving interval itself is NOT one global constant —
+  `src/chainparams.cpp` sets `nSubsidyHalvingInterval = 500000` for
+  `CMainParams`/`CTestNetParams`/`CSigNetParams`, but `150` for
+  `CRegTestParams`. This confirms the formula already stated in §6 —
+  `subsidy(height) = 100 QOGE >> (height / halvingInterval)` — with the
+  exact Core source locations that formula is drawn from. See
+  "Network-aware subsidy schedule" below for why this reaches zero at era
+  34 in practice, 30 eras before Core's `>= 64` guard would ever trigger.
+- **Transaction fees** — the exact sum of a block's non-coinbase
+  transaction fees, using the SAME `inputSum - outputSum` figure already
+  persisted to `transactions.fee_satoshis` by `applyTransaction` (§16
+  "Fee computation") — never a second, independently derived figure that
+  could disagree with it.
+- **Maximum available block reward** — `subsidy + fees`. Not a stored
+  column; a value `SubsidySchedule.ComputeBlockFacts` derives on the fly.
+- **Actual coinbase output total** — the exact sum of every output of a
+  block's transaction index 0. OP_RETURN, unspendable, unknown, P2QPK,
+  and the genesis coinbase are all included — this is "what the coinbase
+  transaction's outputs actually paid," not "spendable miner reward."
+- **Unclaimed reward** — `subsidy + fees - actual coinbase output total`.
+  See "Coinbase correction" below for why a positive value here is
+  ordinary, valid chain state, not corruption.
+- **Scheduled subsidy total** — `SUM(subsidy(h), h=0..tip)`, computed via
+  `SubsidySchedule.ScheduledSubsidyThroughHeight` in O(number of halving
+  eras) (at most 64 iterations — one multiply-add per era), never
+  O(height), and safe even at `height = math.MaxInt64` (the era arithmetic
+  never adds 1 to `height` itself, which is what would overflow there —
+  see the function's doc comment). Genesis (height 0) is included: this is
+  what the consensus schedule ENTITLES a height to, which is a different
+  metric from currently-spendable UTXO value — Core's own `ConnectBlock`
+  never inserts the genesis coinbase into the coins view at all (§16 "Core
+  UTXO semantics"), but that UTXO-set bookkeeping choice doesn't change
+  what height 0 was consensus-entitled to issue. `coinbase output total`
+  is never treated as this quantity (fees are transferred existing coins,
+  not new issuance), and `maximum reward` is never treated as actual
+  miner payout.
+
+  **This function is deliberately NOT named, or described as, "issued
+  supply."** An internal review caught an earlier version of this
+  document and code calling it exactly that. Because a positive
+  `unclaimed_reward` is valid chain state (see "Coinbase correction"
+  below), a chain where any block underclaims has
+  `SUM(subsidy(h)) > SUM(actual coinbase output value created)` — the
+  scheduled total is a ceiling, not a ledger of what actually happened.
+  Concretely: for one block, `coinbase_output - fees = subsidy -
+  unclaimed_reward`; when `unclaimed_reward > 0`, the value actually
+  created by that block's coinbase is strictly less than its scheduled
+  subsidy. Summing `subsidy(h)` across many blocks therefore does not, in
+  general, equal actual chain issuance. Phase 2H.2's public read layer
+  must define its own precise metric(s) — accounting for underclaimed
+  reward, unclaimed fees, genesis's special UTXO-set handling, and
+  provably unspendable outputs — rather than presenting this pure,
+  schedule-only sum as if it already were "issued supply" or "circulating
+  supply."
+
+### Coinbase correction: overclaim is the only rejected direction
+
+Core's `ConnectBlock` (`src/validation.cpp`) computes `CAmount
+blockReward = nFees + GetBlockSubsidy(...)` and rejects a block only if
+`block.vtx[0]->GetValueOut() > blockReward` (`"bad-cb-amount"`).
+Confirmed directly from source, not assumed: this means
+
+```
+coinbase_output_total == subsidy + fees
+```
+
+is **NOT** a consensus invariant — a miner may validly claim LESS than
+the maximum available reward. This corrects the older `docs/
+ARCHITECTURE.md` §6 wording, which described periodically cross-checking
+"`cumulative coinbase output value` should always equal `total issued
+supply + cumulative fees`" as an integrity check whose failure signals an
+indexing bug; that equality is not actually guaranteed even for perfectly
+correct data, since real miners can and do underclaim.
+`SubsidySchedule.ComputeBlockFacts` reflects the corrected rule exactly:
+it rejects only `coinbase_output_total > subsidy + fees`
+(`ErrCoinbaseOverclaim`) and reports any lesser value as a positive, valid
+`UnclaimedRewardSatoshis` — never clamped, never treated as an error.
+
+### `internal/accounting`: pure, checked-arithmetic functions
+
+`internal/accounting` is DISPLAY/ACCOUNTING logic layered on top of an
+already-Core-validated chain — it never decides whether Core should have
+accepted a block, and Core remains the sole consensus authority.
+`SubsidySchedule.BlockSubsidy`/`SubsidySchedule.ScheduledSubsidyThroughHeight`/
+`SubsidySchedule.ComputeBlockFacts` are pure functions: no floats anywhere
+(`chain.Amount`/plain `int64` satoshis throughout), negative heights AND
+negative monetary inputs rejected (`ErrNegativeHeight`/`ErrNegativeAmount`
+— the latter guards `ComputeBlockFacts`'s own fee/coinbase-output
+arguments, even though `internal/store` never actually supplies a negative
+one today), and every accumulation checked against `int64` overflow rather
+than silently wrapping (mirroring `internal/store`'s existing `addChecked`
+policy from §16 "Fee computation").
+
+### Network-aware subsidy schedule
+
+`BlockSubsidy`/`ScheduledSubsidyThroughHeight`/`ComputeBlockFacts` are
+methods on `accounting.SubsidySchedule` — `{InitialSubsidySatoshis,
+HalvingInterval, MaxHalvings}` — not free functions closed over a single
+global mainnet constant. This exists because of an internal-review finding
+against Phase 2H.1's first version: it hardcoded `SubsidyHalvingInterval =
+500000`, which is correct for `main`/`test`/`signet` but wrong for
+`regtest` (`CRegTestParams.nSubsidyHalvingInterval = 150`, confirmed
+directly from `src/chainparams.cpp`). Because underclaiming a block's
+reward is ordinary, valid chain state, that bug did NOT fail loudly: a
+real 50 QOGE regtest coinbase at height 150 would have been silently
+recorded as `subsidy = 100 QOGE, unclaimed_reward = 50 QOGE` — a
+plausible-looking but false accounting fact, not a rejected block.
+
+`accounting.ScheduleForNetwork(network)` maps the exact Core
+`getblockchaininfo` `"chain"` string this codebase already requires
+elsewhere (`QOGE_NETWORK` / `indexer.ValidateStartup`, §18) —
+`"main"`/`"test"`/`"signet"`/`"regtest"` — to the correct
+`SubsidySchedule`, rejecting (`ErrUnknownNetwork`) anything else outright
+rather than defaulting to mainnet. `network` is never inferred (e.g. from
+an address HRP — §18).
+
+`internal/store.Store` carries its own `accountingSchedule` field, bound
+once at construction:
+
+- `store.New(pool)` is a documented, explicitly mainnet-scoped convenience
+  constructor — used by the large majority of this codebase's test suites
+  (query, api, web, indexer, decode, mempool, deployments), which predate
+  Phase 2H.1 and never exercise a non-mainnet halving boundary, so a
+  hardcoded mainnet default is harmless and well-documented for them.
+- `store.NewForNetwork(pool, network)` is the constructor production code
+  paths MUST use: `cmd/qoge-explorer`'s `runIndex` and
+  `runBackfillAccounting` both call it with `cfg.Network`, so a `regtest`
+  index (or backfill) can never silently receive mainnet accounting. This
+  is why `backfill-accounting` now requires `QOGE_NETWORK` too (previously
+  it needed only `QOGE_DATABASE_URL`) — the schedule backfill reconstructs
+  accounting from is exactly as network-specific as the schedule live
+  indexing uses, and both must agree.
+
+**`MaxHalvings = 64` is Core's shift-safety guard, not where the subsidy
+actually reaches zero.** A second internal review caught this document (and
+a test) describing 64 halvings as "the exhaustion point." Core's `>= 64`
+check exists purely because right-shifting a 64-bit `CAmount` by 64 or more
+bit positions is undefined behavior in C++; it is not a claim about when
+QOGE's subsidy runs out monetarily. `SubsidySchedule.InitialSubsidySatoshis`
+is `10,000,000,000` (100 QOGE): `10,000,000,000 >> 33 = 1` satoshi, and
+`10,000,000,000 >> 34 = 0`. So the subsidy is already, naturally, zero from
+era 34 onward, on every network — 30 full eras before Core's `>= 64` guard
+would ever matter. `BlockSubsidy` needs no special case for this: plain
+integer right-shift already produces `0` at era 34; Core's guard is simply
+never the actual reason era-34-and-later blocks pay zero. Concretely, by
+height (network-specific, since `HalvingInterval` differs, but always era
+34):
+
+- **main/test/signet** (`HalvingInterval = 500000`): height 16,999,999
+  (era 33) pays 1 satoshi; height 17,000,000 (era 34) is the first height
+  to pay 0, and every later height stays 0.
+- **regtest** (`HalvingInterval = 150`): height 5,099 (era 33) pays 1
+  satoshi; height 5,100 (era 34) is the first height to pay 0.
+
+`ScheduledSubsidyThroughHeight` reflects this too: the running total stops
+growing at each network's era-34 height, and stays identical all the way
+out to `height = math.MaxInt64` — proven for both mainnet and regtest by
+`TestScheduledSubsidyThroughHeight_PostExhaustion` and
+`TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow`.
+`MaxHalvings` itself is kept (rather than renamed) because it still
+accurately names Core's own guard constant; its doc comment on
+`SubsidySchedule` states the shift-guard-vs-effective-exhaustion
+distinction explicitly so a future reader can't re-conflate them.
+`TestBlockSubsidy_CoreShiftGuardBoundary` separately documents that the
+guard itself is safe (no wrapped/resurrected subsidy at or beyond era 64),
+without implying it's the monetary exhaustion point.
+
+### Immutable, per-block `block_accounting` — not a cumulative counter
+
+`migrations/0004_block_accounting.up.sql` adds one table, keyed by
+`block_hash TEXT PRIMARY KEY REFERENCES blocks (hash)`, storing exactly
+one block's own subsidy/fee/coinbase-output/unclaimed-reward facts. This
+follows the SAME "immutable body vs. canonical derived state" split
+already used for `transaction_outputs` vs. `utxo_state` (§3b): a block's
+monetary facts are immutable properties of that block, exactly like its
+merkle root — they never change when a reorg later demotes the block off
+the canonical chain. `block_accounting` carries no `canonical` column of
+its own; `blocks.canonical` is already the single source of truth for
+which chain a block belongs to, and duplicating it here would let two
+canonical flags drift apart. `RollbackTo` (§18 "Reorg execution") marks
+`blocks.canonical = false` and never deletes the block row, so it never
+touches `block_accounting` either — an orphaned block's accounting row
+remains queryable as audit history, exactly like its transactions and
+outputs.
+
+Deliberately absent: any cumulative `total_issued`/`total_fees`/
+`total_coinbase`/`total_unclaimed` counter. An additive global monetary
+counter is exactly the eIquidus-style design this project already avoids
+elsewhere (§2) — it would require every `ApplyBlock` to correctly
+increment a running total (a single missed/duplicated increment corrupts
+it forever with no way to detect the drift), would need a parent-
+accounting dependency that breaks this codebase's frozen "arbitrary
+synthetic bootstrap height" test policy (§16, §18 "Fresh production sync
+always starts at genesis"), and would couple branch-independent per-block
+records to reorg-sensitive replay order. The scheduled subsidy total
+doesn't need a running counter at all — it's a pure O(halving-eras)
+function of height and network (`ScheduledSubsidyThroughHeight`); a future
+cumulative fee/coinbase/unclaimed analytic, if ever needed, is deferred to
+Phase 2H.2 to be designed after benchmarking the real PostgreSQL chain,
+not decided speculatively here.
+
+`ApplyBlock` computes and idempotently persists this row inside the SAME
+transaction as everything else it writes (§16 "Atomicity"), using the
+SAME `insertOrVerifyIdempotent` idempotent-conflict machinery every other
+immutable identity in this package uses: a replay of the exact same block
+reapplies identical facts as a safe no-op, and contradictory facts for an
+already-persisted `block_hash` is `ErrImmutableConflict`, never silently
+overwritten. It is written after the transaction loop has produced the
+exact fee total and the coinbase output total, but strictly before the
+`sync_state` checkpoint update, which remains the final logical write.
+
+### Backfill: an explicit, separate command — not an invisible migration
+
+Migration 0004 is schema-only; it does not attempt to backfill millions
+of pre-existing rows inside a schema migration. A database indexed before
+migration 0004 existed has zero `block_accounting` rows for its existing
+blocks. `qoge-explorer backfill-accounting` (`cmd/qoge-explorer/main.go`)
+reconstructs them from already-indexed PostgreSQL data alone — it never
+calls Core RPC. For each stored block (canonical AND orphaned — this is
+immutable historical metadata independent of current canonical status),
+it derives fees and the coinbase output total strictly through that
+block's OWN occurrence (`block_transactions`), not the global
+`transactions` table, since the same txid can have more than one
+historical block occurrence across a reorg an indexer already resolved
+before the backfill ever ran.
+
+`BackfillAccounting` (`internal/store/backfill.go`) is idempotent and
+safely restartable: each block's row goes through the identical
+insert-or-verify path `ApplyBlock` itself uses, so an already-correct row
+is cheaply re-verified (not blindly skipped, and not re-derived from a
+fragile numeric progress counter — `block_hash`-keyed immutability is
+already a complete resume mechanism), a missing row is freshly inserted,
+and a contradictory existing row fails loudly rather than being silently
+overwritten. It takes a PostgreSQL session-level, **schema-scoped**
+advisory lock for its whole duration, rejecting a second concurrent
+`backfill-accounting` run against the SAME explorer schema outright — but
+this does NOT, and cannot, serialize against a concurrently running
+`index` process (which serializes its own `ApplyBlock`/`RollbackTo` calls
+via a different mechanism, the `sync_state` row lock in §16 "Canonical tip
+continuity" — holding THAT lock for an entire backfill's duration would
+block live indexing for as long as the backfill takes). Stopping `index`
+before running `backfill-accounting` is therefore an operational
+requirement, documented in the command's own usage text, not a
+mechanically enforced one.
+
+**Advisory lock isolation is per explorer schema, not per database.** An
+adversarial monetary-accounting review (Grok Build) approved this phase's
+accounting correctness but found a reproducible test-isolation defect: the
+advisory lock originally used one fixed key
+(`pg_try_advisory_lock(728341001)`) for every `BackfillAccounting` call.
+PostgreSQL advisory locks are global to a database, not scoped to a
+schema — but this project's own PostgreSQL-backed package tests
+deliberately isolate themselves using separate schemas within the SAME
+`QOGE_TEST_DATABASE_URL` database (`internal/store/dbtest_test.go`'s
+`newTestSchema`). Two completely unrelated tests, each backfilling its own
+disjoint schema, could therefore spuriously contend for the identical
+database-wide key: the losing one got a legitimate-looking
+`ErrBackfillAlreadyRunning` despite operating on unrelated explorer state,
+making `go test -count=1 ./...` occasionally fail under normal parallel
+package execution (reliably passing only with `-p 1`). This was fail-
+closed and never a false-accounting path, but an unreliable ordinary test
+suite is still a real defect.
+
+The fix (`schemaScopedLockKey`, `internal/store/backfill.go`) derives the
+lock's second key from the schema the `Store`'s connection actually
+resolves unqualified names against: `pg_try_advisory_lock(namespace,
+hashtext(current_schema()))`, where `namespace` is the same fixed constant
+as before and `hashtext()` is deterministic — the same schema name always
+produces the same key, across processes, connections, and `Store`
+instances, with no process-local randomness involved. Two
+`BackfillAccounting` runs against the SAME schema still correctly exclude
+each other (`TestBackfillAccounting_ConcurrentRunRejected`); two runs
+against DIFFERENT schemas in the same database no longer contend at all
+(`TestBackfillAccounting_DifferentSchemaNotBlocked`), matching the fact
+that they read and write entirely disjoint tables. If `current_schema()`
+cannot be resolved (`NULL`/empty), `BackfillAccounting` fails closed with
+`store.ErrSchemaIdentityUnavailable` rather than falling back to the old
+database-global key or any other default.
+
+`backfill-accounting` requires `QOGE_NETWORK`, exactly like `index` — it
+constructs its `Store` via `store.NewForNetwork(pool, cfg.Network)`, never
+`store.New`'s mainnet-default convenience, so it reconstructs accounting
+using the SAME subsidy schedule the original live indexing run used (see
+"Network-aware subsidy schedule" above).
+
+**Backfill network identity verification.** Unlike `index`, `backfill-
+accounting` has no Core RPC connection, so it cannot cross-check
+`QOGE_NETWORK` against a live `getblockchaininfo` the way
+`indexer.ValidateStartup` does (§18). A second internal review found that
+this made a wrong-`QOGE_NETWORK` misconfiguration dangerous rather than
+merely inert: because underclaiming a block's reward is ordinary, valid
+chain state, a real smoke test showed a **regtest** database combined with
+`QOGE_NETWORK=main` did not fail — it silently wrote a plausible-looking
+but false `block_accounting` row (actual Core subsidy 50 QOGE, wrongly-
+backfilled subsidy 100 QOGE, a fabricated 50 QOGE "unclaimed reward").
+
+`backfill-accounting` remains, and must remain, Core-independent — the fix
+does not add an RPC dependency. Instead it verifies the database's OWN
+already-indexed chain identity: `chain.ExpectedGenesisHash(network)`
+(`internal/chain/genesis.go`) is a pure lookup of QOGE Core stable's
+`assert(consensus.hashGenesisBlock == uint256S("0x..."))` genesis hash for
+`main`/`test`/`regtest`, verified directly against
+`src/chainparams.cpp`. signet is deliberately unsupported —
+`CSigNetParams` in QOGE Core stable asserts no genesis hash at all (its own
+source comment: "No assert on hashGenesisBlock: signet is not functional
+in this release"), so this package refuses to invent one rather than let a
+signet database pass or fail a check against a fabricated value
+(`chain.ErrGenesisUnsupportedForNetwork`).
+
+`store.VerifyNetworkIdentity(ctx, pool, network)`
+(`internal/store/network_identity.go`) reads the canonical block at height
+0 (`SELECT hash FROM blocks WHERE height = 0 AND canonical` — the
+`blocks_height_canonical_uidx` unique index guarantees at most one row) and
+compares it against the expected hash. `cmd/qoge-explorer`'s
+`runBackfillAccounting` calls this BEFORE constructing the network-bound
+`Store` and before `BackfillAccounting` ever runs, so a mismatch is
+detected before the first `block_accounting` `INSERT`:
+
+- **Match** — preflight passes silently; backfill proceeds exactly as
+  before.
+- **Mismatch** (`store.ErrGenesisMismatch`) — the database's observed
+  genesis hash differs from what `QOGE_NETWORK` expects (e.g. a regtest
+  database with `QOGE_NETWORK=main`). Exits nonzero with zero
+  `block_accounting` rows written. The error message includes the
+  configured network, the expected genesis hash, and the observed genesis
+  hash — none of which are secrets.
+- **Missing** (`store.ErrGenesisMissing`) — no canonical block exists at
+  height 0 at all. A normal already-indexed production database always has
+  genesis (production historical sync always starts at height 0 — §18
+  "Fresh production sync always starts at genesis"); a missing genesis
+  therefore FAILS CLOSED rather than trusting `QOGE_NETWORK` alone.
+
+This check is intentionally NOT built into `Store.ApplyBlock` or `Store`
+construction generally: this codebase's frozen test policy lets an
+uninitialized `Store` bootstrap `ApplyBlock` at an arbitrary synthetic
+height (§16, §18), which numerous existing test suites depend on and which
+this correction must not weaken. The genesis/network-identity preflight
+belongs to the OPERATIONAL `backfill-accounting` command (and to
+`store.VerifyNetworkIdentity` as an explicit, opt-in helper other callers
+may choose to use), never to ordinary `Store` construction or `ApplyBlock`
+itself.
+
+**Source-data completeness, not just presence.** `BackfillBlockAccounting`
+does not trust a bare `COALESCE(SUM(...), 0)` over already-indexed data,
+because migration 0001 (frozen) permits `transactions.fee_satoshis` to be
+`NULL` for a non-coinbase transaction, and SQL's `SUM()` silently ignores
+`NULL` rows — which would turn a genuinely-unknown historical fee into an
+understated (but plausible-looking) fee total and a correspondingly
+inflated, WRONG `unclaimed_reward_satoshis`. It instead counts
+non-coinbase occurrences (`count(*)`) against how many actually have a
+non-`NULL` fee (`count(t.fee_satoshis)`, standard SQL `COUNT(column)`
+semantics) and refuses to proceed on a mismatch. Symmetrically, a coinbase
+transaction with zero `transaction_outputs` rows is indistinguishable, from
+a bare summed total alone, from a miner who legitimately claimed nothing —
+so `BackfillBlockAccounting` requires at least one output row before
+summing. Both cases return `ErrIncompleteAccountingSource` and produce NO
+`block_accounting` row, rather than silently writing a plausible but wrong
+one.
+
+### No `circulating_supply` label yet
+
+Phase 2H.1 introduces no stored or public metric named
+`circulating_supply`, in code or in this document. Genesis is
+intentionally absent from Core's own coins view, provably unspendable
+outputs are absent from `utxo_state`, bare multisig is intentionally
+excluded from address-balance ownership (§7/§13.A), and an unresolved/
+unknown script may have no `output_addresses` row at all — `SUM(utxo_state
+values)` and `SUM(addresses.balance)` are therefore both real, precise,
+independently useful metrics, but neither is safely labelable
+"circulating supply" without a UI layer carefully choosing its own
+terminology, which is explicitly deferred (Phase 2H.2/2H.3), not decided
+here.

@@ -56,6 +56,8 @@ func main() {
 		os.Exit(runMigrate(cfg, log, os.Args[2:]))
 	case "index":
 		os.Exit(runIndex(cfg, log))
+	case "backfill-accounting":
+		os.Exit(runBackfillAccounting(cfg, log))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -92,6 +94,44 @@ Usage:
                                      never halts confirmed indexing. No
                                      API/UI. Run this as a separate process
                                      from serve.
+  qoge-explorer backfill-accounting Reconstruct block_accounting rows
+                                     (Phase 2H.1) for every block already in
+                                     the database — canonical and orphaned
+                                     alike — from already-indexed PostgreSQL
+                                     data only; never calls Core RPC. Only
+                                     needed on a database that was indexed
+                                     before migration 0004 existed; a
+                                     database indexed entirely on or after
+                                     0004 already has every row (ApplyBlock
+                                     writes it live). Idempotent and safely
+                                     restartable — rerun after an
+                                     interruption to continue. REQUIRES the
+                                     index process to be stopped first: this
+                                     command takes a PostgreSQL
+                                     advisory lock against a second
+                                     CONCURRENT backfill-accounting run, but
+                                     that lock does not, and cannot,
+                                     serialize against a live indexer
+                                     writing new blocks at the same time —
+                                     see docs/ARCHITECTURE.md §26. Also
+                                     REQUIRES QOGE_NETWORK, matching exactly
+                                     whatever network the database was
+                                     actually indexed against: the subsidy
+                                     schedule reconstructed accounting uses
+                                     is network-specific (e.g. regtest's
+                                     150-block halving interval versus every
+                                     other network's 500000). This command
+                                     has no Core RPC connection, so instead
+                                     of trusting QOGE_NETWORK blindly it
+                                     verifies the database's own canonical
+                                     genesis block (height 0) against QOGE
+                                     Core stable's known genesis hash for
+                                     that network BEFORE writing anything;
+                                     a mismatched or missing genesis exits
+                                     nonzero with zero accounting rows
+                                     written. signet is rejected as
+                                     unsupported (QOGE Core stable has no
+                                     stable asserted signet genesis).
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -100,10 +140,14 @@ Configuration is read from environment variables:
   QOGE_RPC_PASSWORD         required for check-rpc, index
   QOGE_RPC_TLS              default false     (check-rpc, index)
   QOGE_RPC_TIMEOUT_SECONDS  default 30        (check-rpc, index)
-  QOGE_DATABASE_URL         required for migrate/index/serve, e.g. postgres://user:pass@host:5432/dbname
+  QOGE_DATABASE_URL         required for migrate/index/serve/backfill-accounting,
+                             e.g. postgres://user:pass@host:5432/dbname
   QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
-  QOGE_NETWORK              required for index; must exactly match Core's
-                             getblockchaininfo "chain" (e.g. main/test/regtest)
+  QOGE_NETWORK              required for index and backfill-accounting;
+                             must exactly match Core's getblockchaininfo
+                             "chain" (main/test/signet/regtest) — selects
+                             the subsidy schedule block_accounting uses
+                             (docs/ARCHITECTURE.md §26); never inferred
   QOGE_INDEX_POLL_SECONDS   default 10 (index; live-loop wait once caught up)
   QOGE_HTTP_ADDR            default 127.0.0.1:8532 (serve)
   QOGE_LOG_LEVEL            default info
@@ -335,6 +379,98 @@ func runMigrate(cfg config.Config, log interface {
 	}
 }
 
+// runBackfillAccounting reconstructs block_accounting (Phase 2H.1) for
+// every already-indexed block from PostgreSQL data alone — see
+// store.Store.BackfillAccounting's doc comment for the full idempotency/
+// concurrency contract. It does not connect to Core RPC and does not
+// require any RPC configuration, but it DOES require QOGE_NETWORK: the
+// subsidy schedule backfill reconstructs from height is network-specific
+// (see accounting.ScheduleForNetwork / docs/ARCHITECTURE.md §26), and must
+// be the same network the database was actually indexed against — never a
+// silent mainnet default.
+//
+// Unlike `index` (which cross-checks QOGE_NETWORK against Core's live
+// getblockchaininfo via indexer.ValidateStartup), this command has no Core
+// RPC connection available to double-check QOGE_NETWORK directly. Instead,
+// before constructing a network-bound Store or writing anything, it runs
+// store.VerifyNetworkIdentity: the database's own already-indexed canonical
+// genesis block (height 0) is compared against QOGE Core stable's asserted
+// genesis hash for QOGE_NETWORK. A mismatch (or a missing genesis) exits
+// nonzero before the first block_accounting row is ever written — see
+// docs/ARCHITECTURE.md §26 "Backfill network identity verification".
+func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+	if cfg.Network == "" {
+		log.Error("config error", "error", "QOGE_NETWORK is not set")
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	if err := store.VerifyNetworkIdentity(ctx, pool, cfg.Network); err != nil {
+		log.Error("network identity preflight failed", "error", err)
+		return 1
+	}
+	log.Info("network identity preflight passed", "network", cfg.Network)
+
+	st, err := store.NewForNetwork(pool, cfg.Network)
+	if err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
+
+	before, err := store.CheckAccountingCompleteness(ctx, pool)
+	if err != nil {
+		log.Error("pre-backfill completeness check failed", "error", err)
+		return 1
+	}
+	log.Info("starting accounting backfill",
+		"blocks", before.BlockCount, "existing_accounting_rows", before.AccountingCount, "missing", before.MissingCount)
+
+	start := time.Now()
+	result, err := st.BackfillAccounting(ctx)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Error("accounting backfill failed", "error", err, "elapsed", elapsed.String())
+		return 1
+	}
+
+	after, err := store.CheckAccountingCompleteness(ctx, pool)
+	if err != nil {
+		log.Error("post-backfill completeness check failed", "error", err)
+		return 1
+	}
+
+	fmt.Println("qoge-explorer backfill-accounting")
+	fmt.Println("----------------------------------")
+	fmt.Printf("blocks considered:   %d\n", result.TotalBlocks)
+	fmt.Printf("rows inserted:       %d\n", result.Inserted)
+	fmt.Printf("rows verified:       %d\n", result.Verified)
+	fmt.Printf("blocks (final):      %d\n", after.BlockCount)
+	fmt.Printf("accounting (final):  %d\n", after.AccountingCount)
+	fmt.Printf("missing (final):     %d\n", after.MissingCount)
+	fmt.Printf("elapsed:             %s\n", elapsed)
+
+	if after.MissingCount != 0 {
+		log.Error("accounting backfill completed but coverage is still incomplete", "missing", after.MissingCount)
+		return 1
+	}
+
+	log.Info("accounting backfill complete", "elapsed", elapsed.String())
+	return 0
+}
+
 // runIndex validates the Core/database/network environment, then runs
 // historical sync + the live reorg-aware polling loop
 // (docs/ARCHITECTURE.md §18) until SIGINT/SIGTERM. It never starts
@@ -390,8 +526,17 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 	}
 	defer pool.Close()
 
+	// Phase 2H.1 correction: the Store used for live indexing must be
+	// bound to the SAME network cfg.Network/ValidateStartup already
+	// confirmed against Core, never to store.New's mainnet-default
+	// convenience — otherwise a regtest index would silently compute
+	// mainnet subsidies (see docs/ARCHITECTURE.md §26).
 	resolver := decode.NewCoreAddressResolver(client)
-	st := store.New(pool)
+	st, err := store.NewForNetwork(pool, cfg.Network)
+	if err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
 	pollInterval := time.Duration(cfg.IndexPollSeconds) * time.Second
 	idx := indexer.New(client, st, resolver, pollInterval, log)
 

@@ -10,8 +10,9 @@ import (
 )
 
 // TestMigrationRoundTrip_PreservesExistingData is spec item 7: schema
-// v2 -> v3 -> v2 -> v3, with REAL pre-existing confirmed-chain, address,
-// and mempool state seeded before the migration exercise. All
+// v4 -> v2 -> v4 (0003 and 0004 both roll back and reapply together — see
+// the in-function comment for why), with REAL pre-existing confirmed-chain,
+// address, and mempool state seeded before the migration exercise. All
 // pre-existing data must survive unchanged; DROP SCHEMA public and any
 // destruction of unrelated tables are never used (newTestSchema's
 // isolated, uniquely-named schema — see dbtest_test.go).
@@ -20,16 +21,29 @@ func TestMigrationRoundTrip_PreservesExistingData(t *testing.T) {
 	pool := newTestSchema(t)
 	migrations := migrationsFS(t)
 
-	// Start at v2 only (every migration except 0003), seed real data,
-	// THEN exercise 0003 up/down/up — proving 0003 itself round-trips
-	// cleanly around genuinely pre-existing v2 data, not just an empty
-	// schema.
-	v2Migrations := migrations[:len(migrations)-1]
-	if migrations[len(migrations)-1].Version != 3 {
-		t.Fatalf("fixture assumption violated: last migration version = %d, want 3", migrations[len(migrations)-1].Version)
-	}
-	if _, err := store.Up(ctx, pool, v2Migrations); err != nil {
-		t.Fatalf("Up to v2: %v", err)
+	// Every migration is applied up front — including 0004
+	// (block_accounting), added by Phase 2H.1 — because
+	// internal/store.ApplyBlock (used below to seed real confirmed-chain
+	// fixtures) unconditionally writes a block_accounting row for every
+	// block it applies; 0004 must exist for that to succeed at all.
+	//
+	// store.Down/Up always operate by strict descending/ascending VERSION
+	// NUMBER against whatever is actually applied in the database, not by
+	// which single migration a test cares about — once 0004 sits on top
+	// of 0003, Down has no way to roll back 0003 alone while leaving 0004
+	// in place (Down(1) would target 0004, the higher version number,
+	// every time). This test's round trip below therefore cycles 0003 AND
+	// 0004 together (both come off, then both go back on); what it
+	// actually asserts — deployment_state's own presence/bootstrap state,
+	// and zero mutation of confirmed/mempool data — is unaffected by 0004
+	// also cycling alongside it. block_accounting itself is deliberately
+	// excluded from the "must remain byte-identical" table lists below
+	// for exactly this reason: its own table is dropped and recreated
+	// empty as a mechanical side effect of this test toggling 0004, which
+	// is not what this test exists to verify (that belongs to
+	// internal/store's own migration round-trip coverage).
+	if _, err := store.Up(ctx, pool, migrations); err != nil {
+		t.Fatalf("Up (all migrations): %v", err)
 	}
 
 	cstore := store.New(pool)
@@ -63,35 +77,33 @@ func TestMigrationRoundTrip_PreservesExistingData(t *testing.T) {
 		t.Fatal("fixture bug: expected at least one address row before the migration exercise")
 	}
 
-	// v2 -> v3
-	if _, err := store.Up(ctx, pool, migrations); err != nil {
-		t.Fatalf("Up to v3: %v", err)
-	}
-	if !tableExistsIn(t, ctx, pool, "deployment_state") {
-		t.Fatal("deployment_state table missing after migrating up to v3")
-	}
-	requireTablesUnchanged(t, ctx, pool, confirmedTables, confirmedBefore)
-	requireTablesUnchanged(t, ctx, pool, mempoolTables, mempoolBefore)
-
-	// v3 -> v2
-	if _, err := store.Down(ctx, pool, migrations, 1); err != nil {
+	// v4 -> v2: roll back 0004 (block_accounting) then 0003
+	// (deployment_state), newest version first — see the comment above for
+	// why both must come off together.
+	if _, err := store.Down(ctx, pool, migrations, 2); err != nil {
 		t.Fatalf("Down to v2: %v", err)
 	}
 	if tableExistsIn(t, ctx, pool, "deployment_state") {
 		t.Fatal("deployment_state table still present after rolling back to v2")
 	}
+	if tableExistsIn(t, ctx, pool, "block_accounting") {
+		t.Fatal("block_accounting table still present after rolling back to v2")
+	}
 	if !tableExistsIn(t, ctx, pool, "chain_deployments") {
-		t.Fatal("chain_deployments table (owned by migration 0001) must survive rolling back migration 0003")
+		t.Fatal("chain_deployments table (owned by migration 0001) must survive rolling back migrations 0003/0004")
 	}
 	requireTablesUnchanged(t, ctx, pool, confirmedTables, confirmedBefore)
 	requireTablesUnchanged(t, ctx, pool, mempoolTables, mempoolBefore)
 
-	// v2 -> v3 again
+	// v2 -> v4 again: reapply both 0003 and 0004.
 	if _, err := store.Up(ctx, pool, migrations); err != nil {
-		t.Fatalf("second Up to v3: %v", err)
+		t.Fatalf("second Up to v4: %v", err)
 	}
 	if !tableExistsIn(t, ctx, pool, "deployment_state") {
 		t.Fatal("deployment_state table missing after reapplying migration 0003")
+	}
+	if !tableExistsIn(t, ctx, pool, "block_accounting") {
+		t.Fatal("block_accounting table missing after reapplying migration 0004")
 	}
 	requireTablesUnchanged(t, ctx, pool, confirmedTables, confirmedBefore)
 	requireTablesUnchanged(t, ctx, pool, mempoolTables, mempoolBefore)
