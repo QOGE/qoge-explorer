@@ -120,9 +120,18 @@ Usage:
                                      schedule reconstructed accounting uses
                                      is network-specific (e.g. regtest's
                                      150-block halving interval versus every
-                                     other network's 500000), and this
-                                     command has no Core RPC connection
-                                     available to detect a mismatch itself.
+                                     other network's 500000). This command
+                                     has no Core RPC connection, so instead
+                                     of trusting QOGE_NETWORK blindly it
+                                     verifies the database's own canonical
+                                     genesis block (height 0) against QOGE
+                                     Core stable's known genesis hash for
+                                     that network BEFORE writing anything;
+                                     a mismatched or missing genesis exits
+                                     nonzero with zero accounting rows
+                                     written. signet is rejected as
+                                     unsupported (QOGE Core stable has no
+                                     stable asserted signet genesis).
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -378,11 +387,17 @@ func runMigrate(cfg config.Config, log interface {
 // subsidy schedule backfill reconstructs from height is network-specific
 // (see accounting.ScheduleForNetwork / docs/ARCHITECTURE.md §26), and must
 // be the same network the database was actually indexed against — never a
-// silent mainnet default. This is a plain string comparison against
-// whatever the operator already used for `index`; backfill-accounting has
-// no Core RPC connection available to double check it against
-// getblockchaininfo, so an operator-supplied mismatch is not detectable
-// here.
+// silent mainnet default.
+//
+// Unlike `index` (which cross-checks QOGE_NETWORK against Core's live
+// getblockchaininfo via indexer.ValidateStartup), this command has no Core
+// RPC connection available to double-check QOGE_NETWORK directly. Instead,
+// before constructing a network-bound Store or writing anything, it runs
+// store.VerifyNetworkIdentity: the database's own already-indexed canonical
+// genesis block (height 0) is compared against QOGE Core stable's asserted
+// genesis hash for QOGE_NETWORK. A mismatch (or a missing genesis) exits
+// nonzero before the first block_accounting row is ever written — see
+// docs/ARCHITECTURE.md §26 "Backfill network identity verification".
 func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
 	if cfg.DatabaseURL == "" {
 		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
@@ -402,6 +417,12 @@ func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
 		return 1
 	}
 	defer pool.Close()
+
+	if err := store.VerifyNetworkIdentity(ctx, pool, cfg.Network); err != nil {
+		log.Error("network identity preflight failed", "error", err)
+		return 1
+	}
+	log.Info("network identity preflight passed", "network", cfg.Network)
 
 	st, err := store.NewForNetwork(pool, cfg.Network)
 	if err != nil {

@@ -4546,10 +4546,64 @@ in the command's own usage text, not a mechanically enforced one.
 constructs its `Store` via `store.NewForNetwork(pool, cfg.Network)`, never
 `store.New`'s mainnet-default convenience, so it reconstructs accounting
 using the SAME subsidy schedule the original live indexing run used (see
-"Network-aware subsidy schedule" above). It has no Core RPC connection
-available, so it cannot detect an operator supplying the wrong network
-itself — this is a plain, undetectable string match against whatever was
-used for `index`.
+"Network-aware subsidy schedule" above).
+
+**Backfill network identity verification.** Unlike `index`, `backfill-
+accounting` has no Core RPC connection, so it cannot cross-check
+`QOGE_NETWORK` against a live `getblockchaininfo` the way
+`indexer.ValidateStartup` does (§18). A second internal review found that
+this made a wrong-`QOGE_NETWORK` misconfiguration dangerous rather than
+merely inert: because underclaiming a block's reward is ordinary, valid
+chain state, a real smoke test showed a **regtest** database combined with
+`QOGE_NETWORK=main` did not fail — it silently wrote a plausible-looking
+but false `block_accounting` row (actual Core subsidy 50 QOGE, wrongly-
+backfilled subsidy 100 QOGE, a fabricated 50 QOGE "unclaimed reward").
+
+`backfill-accounting` remains, and must remain, Core-independent — the fix
+does not add an RPC dependency. Instead it verifies the database's OWN
+already-indexed chain identity: `chain.ExpectedGenesisHash(network)`
+(`internal/chain/genesis.go`) is a pure lookup of QOGE Core stable's
+`assert(consensus.hashGenesisBlock == uint256S("0x..."))` genesis hash for
+`main`/`test`/`regtest`, verified directly against
+`src/chainparams.cpp`. signet is deliberately unsupported —
+`CSigNetParams` in QOGE Core stable asserts no genesis hash at all (its own
+source comment: "No assert on hashGenesisBlock: signet is not functional
+in this release"), so this package refuses to invent one rather than let a
+signet database pass or fail a check against a fabricated value
+(`chain.ErrGenesisUnsupportedForNetwork`).
+
+`store.VerifyNetworkIdentity(ctx, pool, network)`
+(`internal/store/network_identity.go`) reads the canonical block at height
+0 (`SELECT hash FROM blocks WHERE height = 0 AND canonical` — the
+`blocks_height_canonical_uidx` unique index guarantees at most one row) and
+compares it against the expected hash. `cmd/qoge-explorer`'s
+`runBackfillAccounting` calls this BEFORE constructing the network-bound
+`Store` and before `BackfillAccounting` ever runs, so a mismatch is
+detected before the first `block_accounting` `INSERT`:
+
+- **Match** — preflight passes silently; backfill proceeds exactly as
+  before.
+- **Mismatch** (`store.ErrGenesisMismatch`) — the database's observed
+  genesis hash differs from what `QOGE_NETWORK` expects (e.g. a regtest
+  database with `QOGE_NETWORK=main`). Exits nonzero with zero
+  `block_accounting` rows written. The error message includes the
+  configured network, the expected genesis hash, and the observed genesis
+  hash — none of which are secrets.
+- **Missing** (`store.ErrGenesisMissing`) — no canonical block exists at
+  height 0 at all. A normal already-indexed production database always has
+  genesis (production historical sync always starts at height 0 — §18
+  "Fresh production sync always starts at genesis"); a missing genesis
+  therefore FAILS CLOSED rather than trusting `QOGE_NETWORK` alone.
+
+This check is intentionally NOT built into `Store.ApplyBlock` or `Store`
+construction generally: this codebase's frozen test policy lets an
+uninitialized `Store` bootstrap `ApplyBlock` at an arbitrary synthetic
+height (§16, §18), which numerous existing test suites depend on and which
+this correction must not weaken. The genesis/network-identity preflight
+belongs to the OPERATIONAL `backfill-accounting` command (and to
+`store.VerifyNetworkIdentity` as an explicit, opt-in helper other callers
+may choose to use), never to ordinary `Store` construction or `ApplyBlock`
+itself.
 
 **Source-data completeness, not just presence.** `BackfillBlockAccounting`
 does not trust a bare `COALESCE(SUM(...), 0)` over already-indexed data,

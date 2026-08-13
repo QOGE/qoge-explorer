@@ -34,3 +34,10 @@ QOGE_DATABASE_URL=... ./bin/qoge-explorer serve   # read-only JSON API + HTML UI
 `QOGE_NETWORK` must match the network the database was actually indexed
 against (`main`/`test`/`signet`/`regtest`) — it selects the correct
 consensus subsidy schedule and is never inferred or defaulted.
+`backfill-accounting` has no Core RPC connection to cross-check this
+itself, so before writing anything it verifies the database's own
+canonical genesis block (height 0) against QOGE Core's known genesis hash
+for the configured network; a mismatched or missing genesis exits nonzero
+with zero rows written (`docs/ARCHITECTURE.md` §26 "Backfill network
+identity verification"). signet is rejected as unsupported (QOGE Core
+stable has no stable asserted signet genesis).
