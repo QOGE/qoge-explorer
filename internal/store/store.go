@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/QOGE/qoge-explorer/internal/accounting"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -21,11 +22,48 @@ import (
 // and keeps every SQL/table-ordering concern internal.
 type Store struct {
 	pool *pgxpool.Pool
+
+	// accountingSchedule is the subsidy schedule (see
+	// accounting.SubsidySchedule) ApplyBlock and BackfillBlockAccounting
+	// use to compute block_accounting rows (Phase 2H.1) — see
+	// docs/ARCHITECTURE.md §26 "Network-aware subsidy schedule". It is
+	// never re-derived per call: a Store is bound to exactly one network
+	// for its whole lifetime, matching how QOGE_NETWORK is fixed for the
+	// lifetime of one `index`/`backfill-accounting` process.
+	accountingSchedule accounting.SubsidySchedule
 }
 
-// New wraps an already-connected pool (see Connect) in a Store.
+// New wraps an already-connected pool (see Connect) in a Store using QOGE
+// MAINNET's subsidy schedule for Phase 2H.1 block_accounting computation.
+//
+// This is a convenience constructor for callers that are not
+// network-sensitive — most of this codebase's test suites (query, api,
+// web, indexer, decode, mempool, deployments) construct a Store purely to
+// exercise confirmed-chain/mempool/deployment logic that predates Phase
+// 2H.1 and never touches a regtest-scale halving boundary, so mainnet's
+// schedule is a harmless, well-documented default for them. It must NEVER
+// be relied on by a production code path that has an actual network to
+// select on — cmd/qoge-explorer's `index` and `backfill-accounting`
+// commands both use NewForNetwork instead, threading cfg.Network through
+// explicitly, specifically so a regtest index can never silently receive
+// mainnet accounting (see docs/ARCHITECTURE.md §26).
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool}
+	return &Store{pool: pool, accountingSchedule: accounting.MainnetSchedule}
+}
+
+// NewForNetwork wraps an already-connected pool in a Store using the
+// subsidy schedule for network — the exact Core getblockchaininfo "chain"
+// string (e.g. cfg.Network: "main", "test", "signet", "regtest"), never
+// inferred. Returns an error (accounting.ErrUnknownNetwork) rather than
+// falling back to any default if network isn't recognized — this is the
+// constructor production code paths that index or backfill against a real
+// network must use.
+func NewForNetwork(pool *pgxpool.Pool, network string) (*Store, error) {
+	schedule, err := accounting.ScheduleForNetwork(network)
+	if err != nil {
+		return nil, fmt.Errorf("store: new store for network %q: %w", network, err)
+	}
+	return &Store{pool: pool, accountingSchedule: schedule}, nil
 }
 
 // Sentinel errors ApplyBlock/RollbackTo return, wrapped with contextual

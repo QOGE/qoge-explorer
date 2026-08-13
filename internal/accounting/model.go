@@ -12,6 +12,16 @@ var (
 	// ErrNegativeHeight means a height argument was negative.
 	ErrNegativeHeight = errors.New("accounting: height must be non-negative")
 
+	// ErrNegativeAmount means a fee or coinbase-output-total argument
+	// passed to ComputeBlockFacts was negative. Every real caller derives
+	// these from summed satoshi values (never a signed difference), so
+	// this should never trigger from production data — it exists so a
+	// caller bug produces a loud, typed error here instead of silently
+	// propagating a nonsensical negative monetary fact into
+	// block_accounting (whose own CHECK constraints would then be the
+	// only remaining guard).
+	ErrNegativeAmount = errors.New("accounting: monetary amount must be non-negative")
+
 	// ErrAmountOverflow means a checked satoshi accumulation would exceed
 	// int64's range. Real QOGE quantities are far below this, but silent
 	// wraparound is kept structurally impossible rather than merely
@@ -31,10 +41,11 @@ var (
 )
 
 // BlockFacts is one block's own immutable monetary facts — see
-// docs/ARCHITECTURE.md §6 for the full definitions this type mirrors:
+// docs/ARCHITECTURE.md §6/§26 for the full definitions this type mirrors:
 //
-//   - SubsidySatoshis: the height-derived new issuance entitlement (this
-//     block's BlockSubsidy).
+//   - SubsidySatoshis: the height-and-network-derived new issuance
+//     entitlement (this block's SubsidySchedule.BlockSubsidy) — the
+//     SCHEDULED subsidy, not necessarily what the coinbase actually paid.
 //   - FeeSatoshis: the exact sum of this block's non-coinbase transaction
 //     fees.
 //   - CoinbaseOutputSatoshis: the exact sum of every output of this
@@ -45,7 +56,11 @@ var (
 //     CoinbaseOutputSatoshis. A positive value is valid, ordinary chain
 //     state — a miner may claim less than the maximum available reward —
 //     never evidence of corruption on its own. See ErrCoinbaseOverclaim
-//     for the one direction that IS rejected.
+//     for the one direction that IS rejected. A positive value here also
+//     means SubsidySatoshis overstates what this block's coinbase actually
+//     created — see SubsidySchedule.ScheduledSubsidyThroughHeight's doc
+//     comment for why a sum of SubsidySatoshis across blocks is not
+//     "issued supply."
 //
 // BlockFacts deliberately carries no "canonical" flag — blocks.canonical
 // (internal/store) is already the single source of truth for which chain a
@@ -60,25 +75,36 @@ type BlockFacts struct {
 	UnclaimedRewardSatoshis int64
 }
 
-// ComputeBlockFacts derives BlockFacts for one block from its height and
-// two already-computed sums — feeSatoshis (this block's total non-coinbase
-// transaction fees) and coinbaseOutputSatoshis (the sum of transaction
-// index 0's outputs) — both of which the caller (internal/store) must
-// derive from the SAME already-decoded/indexed data it is persisting, not
-// from a second independent computation that could disagree with it (see
-// docs/ARCHITECTURE.md §16 "Fee computation": transactions.fee_satoshis is
-// the one fee algorithm this codebase has).
+// ComputeBlockFacts derives BlockFacts for one block under sch (this
+// block's network's subsidy schedule — see ScheduleForNetwork) from its
+// height and two already-computed sums — feeSatoshis (this block's total
+// non-coinbase transaction fees) and coinbaseOutputSatoshis (the sum of
+// transaction index 0's outputs) — both of which the caller
+// (internal/store) must derive from the SAME already-decoded/indexed data
+// it is persisting, not from a second independent computation that could
+// disagree with it (see docs/ARCHITECTURE.md §16 "Fee computation":
+// transactions.fee_satoshis is the one fee algorithm this codebase has).
 //
+// Returns ErrNegativeAmount if feeSatoshis or coinbaseOutputSatoshis is
+// negative — both must already be non-negative satoshi sums by
+// construction, so this is a caller-bug guard, not an expected outcome.
 // Returns ErrCoinbaseOverclaim if coinbaseOutputSatoshis exceeds subsidy +
-// fees — the only rejection this function performs; any lesser value
-// (including zero) is accepted and reported as a positive
+// fees — the only rejection this function performs based on chain content;
+// any lesser value (including zero) is accepted and reported as a positive
 // UnclaimedRewardSatoshis, per Core's actual reward-limit rule (see
 // ErrCoinbaseOverclaim's doc comment). Returns ErrAmountOverflow if
 // subsidy + fees would overflow int64, and ErrNegativeHeight if height is
-// negative (propagated from BlockSubsidy) — both are pure input-shape
+// negative (propagated from sch.BlockSubsidy) — all are pure input-shape
 // failures, never a signal to clamp.
-func ComputeBlockFacts(blockHash string, height, feeSatoshis, coinbaseOutputSatoshis int64) (BlockFacts, error) {
-	subsidy, err := BlockSubsidy(height)
+func (sch SubsidySchedule) ComputeBlockFacts(blockHash string, height, feeSatoshis, coinbaseOutputSatoshis int64) (BlockFacts, error) {
+	if feeSatoshis < 0 {
+		return BlockFacts{}, fmt.Errorf("%w: block %s fee %d", ErrNegativeAmount, blockHash, feeSatoshis)
+	}
+	if coinbaseOutputSatoshis < 0 {
+		return BlockFacts{}, fmt.Errorf("%w: block %s coinbase output total %d", ErrNegativeAmount, blockHash, coinbaseOutputSatoshis)
+	}
+
+	subsidy, err := sch.BlockSubsidy(height)
 	if err != nil {
 		return BlockFacts{}, err
 	}
@@ -94,10 +120,8 @@ func ComputeBlockFacts(blockHash string, height, feeSatoshis, coinbaseOutputSato
 	}
 
 	// Safe without a checked subtraction: coinbaseOutputSatoshis <=
-	// maxReward was just proven above, and both are non-negative by
-	// construction (callers derive them from summed satoshi values, never
-	// from a signed difference) — the result can never exceed maxReward or
-	// go negative.
+	// maxReward was just proven above, and both are non-negative by the
+	// guard above — the result can never exceed maxReward or go negative.
 	unclaimed := maxReward - coinbaseOutputSatoshis
 
 	return BlockFacts{

@@ -173,7 +173,7 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	// present and at index 0 by validateBlockShape) is available for the
 	// coinbase output total — but strictly BEFORE the checkpoint update
 	// below, inside this SAME transaction. See applyBlockAccounting.
-	if err := applyBlockAccounting(ctx, tx, block, blockFeeTotal); err != nil {
+	if err := s.applyBlockAccounting(ctx, tx, block, blockFeeTotal); err != nil {
 		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
 	}
 

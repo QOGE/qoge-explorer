@@ -27,5 +27,10 @@ QOGE_RPC_PASSWORD=...
 ```
 QOGE_RPC_USER=... QOGE_RPC_PASSWORD=... ./bin/qoge-explorer check-rpc
 QOGE_RPC_USER=... QOGE_RPC_PASSWORD=... QOGE_NETWORK=main QOGE_DATABASE_URL=... ./bin/qoge-explorer index
+QOGE_NETWORK=main QOGE_DATABASE_URL=... ./bin/qoge-explorer backfill-accounting  # one-time, only for a database indexed before block_accounting existed
 QOGE_DATABASE_URL=... ./bin/qoge-explorer serve   # read-only JSON API + HTML UI; no RPC credentials needed
 ```
+
+`QOGE_NETWORK` must match the network the database was actually indexed
+against (`main`/`test`/`signet`/`regtest`) — it selects the correct
+consensus subsidy schedule and is never inferred or defaulted.

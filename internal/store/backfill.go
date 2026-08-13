@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/QOGE/qoge-explorer/internal/accounting"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -23,6 +22,27 @@ const backfillAccountingAdvisoryLockKey int64 = 728341001
 // passes rather than let them race each other's reads of `blocks`/
 // `transactions`/`transaction_outputs` against each other.
 var ErrBackfillAlreadyRunning = errors.New("store: another backfill-accounting run holds the advisory lock")
+
+// ErrIncompleteAccountingSource means the already-indexed PostgreSQL data
+// BackfillBlockAccounting needs for one block is present but incomplete in
+// a way that would otherwise silently understate that block's true fees or
+// coinbase output total:
+//
+//   - migrations/0001_initial.up.sql permits transactions.fee_satoshis to
+//     be NULL for a non-coinbase transaction; SQL SUM() silently ignores
+//     NULL rows, which would turn a genuinely-unknown fee into an
+//     under-counted (but plausible-looking) fee total and a correspondingly
+//     inflated, WRONG unclaimed_reward_satoshis.
+//   - a coinbase transaction with zero transaction_outputs rows is
+//     indistinguishable, from a bare COALESCE(SUM(...), 0), from a miner
+//     who legitimately claimed nothing — but the former means this
+//     backfill's own source data is incomplete, not that the chain
+//     recorded a zero-value coinbase.
+//
+// BackfillBlockAccounting refuses to guess in either case: it returns this
+// error and writes no block_accounting row, rather than silently treating
+// missing data as zero.
+var ErrIncompleteAccountingSource = errors.New("store: backfill accounting: incomplete source data")
 
 // BackfillAccountingResult summarizes one BackfillAccounting run.
 type BackfillAccountingResult struct {
@@ -169,24 +189,45 @@ func (s *Store) BackfillBlockAccounting(ctx context.Context, blockHash string) (
 		return false, fmt.Errorf("store: backfill accounting: block %s tx_index 0 (%s) is not coinbase", blockHash, coinbaseTxid)
 	}
 
+	// count(*) alongside the SUM lets us tell "a coinbase whose outputs
+	// legitimately sum to zero" apart from "no transaction_outputs rows
+	// exist for this coinbase at all" (incomplete source data) — a bare
+	// COALESCE(SUM(...), 0) cannot distinguish the two. See
+	// ErrIncompleteAccountingSource.
+	var coinbaseOutputRowCount int64
 	var coinbaseOutputTotal int64
 	if err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(value_satoshis), 0) FROM transaction_outputs WHERE txid = $1
-	`, coinbaseTxid).Scan(&coinbaseOutputTotal); err != nil {
+		SELECT count(*), COALESCE(SUM(value_satoshis), 0) FROM transaction_outputs WHERE txid = $1
+	`, coinbaseTxid).Scan(&coinbaseOutputRowCount, &coinbaseOutputTotal); err != nil {
 		return false, fmt.Errorf("store: backfill accounting: sum coinbase outputs for block %s: %w", blockHash, err)
 	}
+	if coinbaseOutputRowCount == 0 {
+		return false, fmt.Errorf("%w: block %s coinbase %s has zero transaction_outputs rows",
+			ErrIncompleteAccountingSource, blockHash, coinbaseTxid)
+	}
 
+	// count(*) is every non-coinbase occurrence in this block;
+	// count(t.fee_satoshis) is standard SQL COUNT(column) semantics — it
+	// counts only the NON-NULL values. A mismatch means at least one
+	// non-coinbase transaction in this block has fee_satoshis = NULL
+	// (permitted by the frozen 0001 schema), which SUM() would otherwise
+	// have silently treated as zero. See ErrIncompleteAccountingSource.
+	var nonCoinbaseCount, nonCoinbaseWithFeeCount int64
 	var feeTotal int64
 	if err := s.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(t.fee_satoshis), 0)
+		SELECT count(*), count(t.fee_satoshis), COALESCE(SUM(t.fee_satoshis), 0)
 		FROM block_transactions bt
 		JOIN transactions t ON t.txid = bt.txid
 		WHERE bt.block_hash = $1 AND NOT t.is_coinbase
-	`, blockHash).Scan(&feeTotal); err != nil {
+	`, blockHash).Scan(&nonCoinbaseCount, &nonCoinbaseWithFeeCount, &feeTotal); err != nil {
 		return false, fmt.Errorf("store: backfill accounting: sum fees for block %s: %w", blockHash, err)
 	}
+	if nonCoinbaseWithFeeCount != nonCoinbaseCount {
+		return false, fmt.Errorf("%w: block %s has %d of %d non-coinbase occurrence(s) with NULL fee_satoshis",
+			ErrIncompleteAccountingSource, blockHash, nonCoinbaseCount-nonCoinbaseWithFeeCount, nonCoinbaseCount)
+	}
 
-	facts, err := accounting.ComputeBlockFacts(blockHash, height, feeTotal, coinbaseOutputTotal)
+	facts, err := s.accountingSchedule.ComputeBlockFacts(blockHash, height, feeTotal, coinbaseOutputTotal)
 	if err != nil {
 		return false, fmt.Errorf("store: backfill accounting: %w", err)
 	}

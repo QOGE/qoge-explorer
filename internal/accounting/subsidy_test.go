@@ -6,11 +6,66 @@ import (
 	"testing"
 )
 
+// ─── ScheduleForNetwork ─────────────────────────────────────────────────
+
+// TestScheduleForNetwork_KnownNetworks proves every QOGE Core network name
+// this codebase already uses elsewhere (QOGE_NETWORK / Core's
+// getblockchaininfo "chain") maps to the correct halving interval,
+// independently verified against Qogecoin Core stable's
+// src/chainparams.cpp: CMainParams/CTestNetParams/CSigNetParams all use
+// nSubsidyHalvingInterval = 500000, CRegTestParams uses 150 — all four
+// share the same 100 QOGE initial subsidy (GetBlockSubsidy takes
+// consensusParams as a parameter, not a per-network subsidy formula).
+func TestScheduleForNetwork_KnownNetworks(t *testing.T) {
+	cases := []struct {
+		network         string
+		wantInterval    int64
+		wantInitial     int64
+		wantMaxHalvings int64
+	}{
+		{"main", 500_000, initialSubsidySatoshis, 64},
+		{"test", 500_000, initialSubsidySatoshis, 64},
+		{"signet", 500_000, initialSubsidySatoshis, 64},
+		{"regtest", 150, initialSubsidySatoshis, 64},
+	}
+	for _, c := range cases {
+		t.Run(c.network, func(t *testing.T) {
+			sch, err := ScheduleForNetwork(c.network)
+			if err != nil {
+				t.Fatalf("ScheduleForNetwork(%q): unexpected error: %v", c.network, err)
+			}
+			if sch.HalvingInterval != c.wantInterval {
+				t.Fatalf("ScheduleForNetwork(%q).HalvingInterval = %d, want %d", c.network, sch.HalvingInterval, c.wantInterval)
+			}
+			if sch.InitialSubsidySatoshis != c.wantInitial {
+				t.Fatalf("ScheduleForNetwork(%q).InitialSubsidySatoshis = %d, want %d", c.network, sch.InitialSubsidySatoshis, c.wantInitial)
+			}
+			if sch.MaxHalvings != c.wantMaxHalvings {
+				t.Fatalf("ScheduleForNetwork(%q).MaxHalvings = %d, want %d", c.network, sch.MaxHalvings, c.wantMaxHalvings)
+			}
+		})
+	}
+}
+
+// TestScheduleForNetwork_UnknownRejected proves an unrecognized network
+// string is rejected outright rather than silently defaulting to
+// MainnetSchedule — the exact bug this correction exists to prevent (a
+// regtest index accidentally getting mainnet accounting).
+func TestScheduleForNetwork_UnknownRejected(t *testing.T) {
+	networks := []string{"", "mainnet", "MAIN", "testnet3", "unknown"}
+	for _, n := range networks {
+		_, err := ScheduleForNetwork(n)
+		if !errors.Is(err, ErrUnknownNetwork) {
+			t.Fatalf("ScheduleForNetwork(%q): got err=%v, want ErrUnknownNetwork", n, err)
+		}
+	}
+}
+
 // ─── BlockSubsidy boundaries ────────────────────────────────────────────
 
 // TestBlockSubsidy_ExactHeights verifies the exact satoshi subsidy at every
-// height the spec calls out, computed independently from the halving-era
-// formula rather than copy-pasted from the implementation.
+// mainnet height the spec calls out, computed independently from the
+// halving-era formula rather than copy-pasted from the implementation.
 func TestBlockSubsidy_ExactHeights(t *testing.T) {
 	const qoge int64 = 100_000_000
 
@@ -31,7 +86,7 @@ func TestBlockSubsidy_ExactHeights(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := BlockSubsidy(c.height)
+			got, err := MainnetSchedule.BlockSubsidy(c.height)
 			if err != nil {
 				t.Fatalf("BlockSubsidy(%d): unexpected error: %v", c.height, err)
 			}
@@ -44,14 +99,16 @@ func TestBlockSubsidy_ExactHeights(t *testing.T) {
 
 // TestBlockSubsidy_HalvingEraBoundaries independently derives era start
 // heights for every era from 0 through a few past exhaustion, and checks
-// the subsidy value at the first and last height of each era.
+// the subsidy value at the first and last height of each era, on mainnet's
+// schedule.
 func TestBlockSubsidy_HalvingEraBoundaries(t *testing.T) {
+	sch := MainnetSchedule
 	for era := int64(0); era <= 5; era++ {
-		eraStart := era * SubsidyHalvingInterval
-		eraLast := eraStart + SubsidyHalvingInterval - 1
-		want := InitialSubsidySatoshis >> uint(era)
+		eraStart := era * sch.HalvingInterval
+		eraLast := eraStart + sch.HalvingInterval - 1
+		want := sch.InitialSubsidySatoshis >> uint(era)
 
-		gotStart, err := BlockSubsidy(eraStart)
+		gotStart, err := sch.BlockSubsidy(eraStart)
 		if err != nil {
 			t.Fatalf("era %d start height %d: unexpected error: %v", era, eraStart, err)
 		}
@@ -59,7 +116,7 @@ func TestBlockSubsidy_HalvingEraBoundaries(t *testing.T) {
 			t.Fatalf("era %d start height %d: BlockSubsidy = %d, want %d", era, eraStart, gotStart, want)
 		}
 
-		gotLast, err := BlockSubsidy(eraLast)
+		gotLast, err := sch.BlockSubsidy(eraLast)
 		if err != nil {
 			t.Fatalf("era %d last height %d: unexpected error: %v", era, eraLast, err)
 		}
@@ -70,19 +127,20 @@ func TestBlockSubsidy_HalvingEraBoundaries(t *testing.T) {
 }
 
 // TestBlockSubsidy_Exhaustion proves the subsidy reaches exactly zero once
-// 64 halvings have elapsed (Core's `if (halvings >= 64) return 0;`), and
-// stays zero for every height beyond that — including heights far beyond
-// any real chain length, proving there's no later resurgence from a wrapped
-// shift.
+// MaxHalvings halvings have elapsed (Core's `if (halvings >= 64) return
+// 0;`), and stays zero for every height beyond that — including heights far
+// beyond any real chain length, proving there's no later resurgence from a
+// wrapped shift.
 func TestBlockSubsidy_Exhaustion(t *testing.T) {
-	exhaustionHeight := MaxHalvings * SubsidyHalvingInterval // first height with 0 subsidy
+	sch := MainnetSchedule
+	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval // first height with 0 subsidy
 
 	lastNonZeroHeight := exhaustionHeight - 1
-	got, err := BlockSubsidy(lastNonZeroHeight)
+	got, err := sch.BlockSubsidy(lastNonZeroHeight)
 	if err != nil {
 		t.Fatalf("BlockSubsidy(%d): unexpected error: %v", lastNonZeroHeight, err)
 	}
-	want := InitialSubsidySatoshis >> uint(MaxHalvings-1)
+	want := sch.InitialSubsidySatoshis >> uint(sch.MaxHalvings-1)
 	if got != want {
 		t.Fatalf("BlockSubsidy(%d) (last height before exhaustion) = %d, want %d", lastNonZeroHeight, got, want)
 	}
@@ -90,11 +148,11 @@ func TestBlockSubsidy_Exhaustion(t *testing.T) {
 	heights := []int64{
 		exhaustionHeight,
 		exhaustionHeight + 1,
-		exhaustionHeight + SubsidyHalvingInterval,
+		exhaustionHeight + sch.HalvingInterval,
 		exhaustionHeight * 1000,
 	}
 	for _, h := range heights {
-		got, err := BlockSubsidy(h)
+		got, err := sch.BlockSubsidy(h)
 		if err != nil {
 			t.Fatalf("BlockSubsidy(%d): unexpected error: %v", h, err)
 		}
@@ -107,160 +165,240 @@ func TestBlockSubsidy_Exhaustion(t *testing.T) {
 func TestBlockSubsidy_NegativeHeightRejected(t *testing.T) {
 	heights := []int64{-1, -500_000, -1 << 62}
 	for _, h := range heights {
-		_, err := BlockSubsidy(h)
+		_, err := MainnetSchedule.BlockSubsidy(h)
 		if !errors.Is(err, ErrNegativeHeight) {
 			t.Fatalf("BlockSubsidy(%d): got err=%v, want ErrNegativeHeight", h, err)
 		}
 	}
 }
 
-// ─── IssuedSupplyThroughHeight ──────────────────────────────────────────
+// TestBlockSubsidy_RegtestBoundary proves regtest's 150-block halving
+// interval (CRegTestParams.nSubsidyHalvingInterval, distinct from every
+// other network's 500000) is honored exactly — this is the boundary the
+// internal review flagged as silently wrong when the schedule was
+// hardcoded to mainnet's interval.
+func TestBlockSubsidy_RegtestBoundary(t *testing.T) {
+	const qoge int64 = 100_000_000
+	cases := []struct {
+		height int64
+		want   int64
+	}{
+		{149, 100 * qoge},
+		{150, 50 * qoge},
+		{299, 50 * qoge},
+		{300, 25 * qoge},
+	}
+	for _, c := range cases {
+		got, err := RegtestSchedule.BlockSubsidy(c.height)
+		if err != nil {
+			t.Fatalf("RegtestSchedule.BlockSubsidy(%d): unexpected error: %v", c.height, err)
+		}
+		if got != c.want {
+			t.Fatalf("RegtestSchedule.BlockSubsidy(%d) = %d, want %d", c.height, got, c.want)
+		}
+	}
+}
 
-// slowIssuedSupply is a deliberately naive O(height) reference
+// TestBlockSubsidy_TestnetMatchesMainnetBoundary proves testnet's schedule
+// (also nSubsidyHalvingInterval = 500000) halves at exactly the same
+// boundary as mainnet, distinct from regtest.
+func TestBlockSubsidy_TestnetMatchesMainnetBoundary(t *testing.T) {
+	const qoge int64 = 100_000_000
+	cases := []struct {
+		height int64
+		want   int64
+	}{
+		{499_999, 100 * qoge},
+		{500_000, 50 * qoge},
+	}
+	for _, c := range cases {
+		got, err := TestnetSchedule.BlockSubsidy(c.height)
+		if err != nil {
+			t.Fatalf("TestnetSchedule.BlockSubsidy(%d): unexpected error: %v", c.height, err)
+		}
+		if got != c.want {
+			t.Fatalf("TestnetSchedule.BlockSubsidy(%d) = %d, want %d", c.height, got, c.want)
+		}
+	}
+}
+
+// ─── ScheduledSubsidyThroughHeight ──────────────────────────────────────
+
+// slowScheduledSubsidy is a deliberately naive O(height) reference
 // implementation, used ONLY in this test file to cross-check
-// IssuedSupplyThroughHeight's O(halving eras) production implementation
+// ScheduledSubsidyThroughHeight's O(halving eras) production implementation
 // over small/sampled ranges. Never used in production code.
-func slowIssuedSupply(t *testing.T, height int64) int64 {
+func slowScheduledSubsidy(t *testing.T, sch SubsidySchedule, height int64) int64 {
 	t.Helper()
 	var total int64
 	for h := int64(0); h <= height; h++ {
-		s, err := BlockSubsidy(h)
+		s, err := sch.BlockSubsidy(h)
 		if err != nil {
-			t.Fatalf("slowIssuedSupply: BlockSubsidy(%d): %v", h, err)
+			t.Fatalf("slowScheduledSubsidy: BlockSubsidy(%d): %v", h, err)
 		}
 		total += s // small ranges only — this reference loop does not itself need overflow checking
 	}
 	return total
 }
 
-func TestIssuedSupplyThroughHeight_CrossCheckSmallRanges(t *testing.T) {
+func TestScheduledSubsidyThroughHeight_CrossCheckSmallRanges(t *testing.T) {
+	sch := MainnetSchedule
 	heights := []int64{0, 1, 2, 100, 499_999, 500_000, 500_001, 999_999, 1_000_000, 1_500_000}
 	for _, h := range heights {
-		want := slowIssuedSupply(t, h)
-		got, err := IssuedSupplyThroughHeight(h)
+		want := slowScheduledSubsidy(t, sch, h)
+		got, err := sch.ScheduledSubsidyThroughHeight(h)
 		if err != nil {
-			t.Fatalf("IssuedSupplyThroughHeight(%d): unexpected error: %v", h, err)
+			t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", h, err)
 		}
 		if got != want {
-			t.Fatalf("IssuedSupplyThroughHeight(%d) = %d, want %d (slow reference)", h, got, want)
+			t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d (slow reference)", h, got, want)
 		}
 	}
 }
 
-func TestIssuedSupplyThroughHeight_Height0IsGenesisSubsidy(t *testing.T) {
-	got, err := IssuedSupplyThroughHeight(0)
+func TestScheduledSubsidyThroughHeight_Height0IsGenesisSubsidy(t *testing.T) {
+	got, err := MainnetSchedule.ScheduledSubsidyThroughHeight(0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got != InitialSubsidySatoshis {
-		t.Fatalf("IssuedSupplyThroughHeight(0) = %d, want %d (genesis subsidy alone)", got, InitialSubsidySatoshis)
+	if got != MainnetSchedule.InitialSubsidySatoshis {
+		t.Fatalf("ScheduledSubsidyThroughHeight(0) = %d, want %d (genesis subsidy alone)", got, MainnetSchedule.InitialSubsidySatoshis)
 	}
 }
 
-func TestIssuedSupplyThroughHeight_LastBeforeFirstHalving(t *testing.T) {
-	height := SubsidyHalvingInterval - 1
-	got, err := IssuedSupplyThroughHeight(height)
+func TestScheduledSubsidyThroughHeight_LastBeforeFirstHalving(t *testing.T) {
+	sch := MainnetSchedule
+	height := sch.HalvingInterval - 1
+	got, err := sch.ScheduledSubsidyThroughHeight(height)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := SubsidyHalvingInterval * InitialSubsidySatoshis // every one of these blocks paid the full era-0 subsidy
+	want := sch.HalvingInterval * sch.InitialSubsidySatoshis // every one of these blocks paid the full era-0 subsidy
 	if got != want {
-		t.Fatalf("IssuedSupplyThroughHeight(%d) = %d, want %d", height, got, want)
+		t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d", height, got, want)
 	}
 }
 
-func TestIssuedSupplyThroughHeight_FirstHalvingBoundary(t *testing.T) {
-	height := SubsidyHalvingInterval // first block of era 1
-	got, err := IssuedSupplyThroughHeight(height)
+func TestScheduledSubsidyThroughHeight_FirstHalvingBoundary(t *testing.T) {
+	sch := MainnetSchedule
+	height := sch.HalvingInterval // first block of era 1
+	got, err := sch.ScheduledSubsidyThroughHeight(height)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	era0Total := SubsidyHalvingInterval * InitialSubsidySatoshis
-	era1FirstBlock := InitialSubsidySatoshis >> 1
+	era0Total := sch.HalvingInterval * sch.InitialSubsidySatoshis
+	era1FirstBlock := sch.InitialSubsidySatoshis >> 1
 	want := era0Total + era1FirstBlock
 	if got != want {
-		t.Fatalf("IssuedSupplyThroughHeight(%d) = %d, want %d", height, got, want)
+		t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d", height, got, want)
 	}
 }
 
-func TestIssuedSupplyThroughHeight_SeveralHalvingBoundaries(t *testing.T) {
+func TestScheduledSubsidyThroughHeight_SeveralHalvingBoundaries(t *testing.T) {
+	sch := MainnetSchedule
 	for era := int64(1); era <= 4; era++ {
-		height := era * SubsidyHalvingInterval
-		got, err := IssuedSupplyThroughHeight(height)
+		height := era * sch.HalvingInterval
+		got, err := sch.ScheduledSubsidyThroughHeight(height)
 		if err != nil {
 			t.Fatalf("era %d: unexpected error: %v", era, err)
 		}
 		var want int64
 		for e := int64(0); e < era; e++ {
-			want += SubsidyHalvingInterval * (InitialSubsidySatoshis >> uint(e))
+			want += sch.HalvingInterval * (sch.InitialSubsidySatoshis >> uint(e))
 		}
-		want += InitialSubsidySatoshis >> uint(era) // the first block of this era
+		want += sch.InitialSubsidySatoshis >> uint(era) // the first block of this era
 		if got != want {
-			t.Fatalf("era %d boundary height %d: IssuedSupplyThroughHeight = %d, want %d", era, height, got, want)
+			t.Fatalf("era %d boundary height %d: ScheduledSubsidyThroughHeight = %d, want %d", era, height, got, want)
 		}
 	}
 }
 
-// TestIssuedSupplyThroughHeight_CurrentChainScale checks a height in the
-// low millions — representative of QOGE's actual current chain length —
-// against the independently-derived era-sum formula.
-func TestIssuedSupplyThroughHeight_CurrentChainScale(t *testing.T) {
-	height := int64(3_250_000) // spans eras 0..6 plus a partial era 6... actually era = height/interval = 6 (partial)
-	got, err := IssuedSupplyThroughHeight(height)
+// TestScheduledSubsidyThroughHeight_CurrentChainScale checks a height in
+// the low millions — representative of QOGE's actual current mainnet chain
+// length — against the independently-derived era-sum formula.
+func TestScheduledSubsidyThroughHeight_CurrentChainScale(t *testing.T) {
+	sch := MainnetSchedule
+	height := int64(3_250_000) // spans eras 0..6 plus a partial era 6
+	got, err := sch.ScheduledSubsidyThroughHeight(height)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
 	var want int64
-	fullEras := height / SubsidyHalvingInterval
+	fullEras := height / sch.HalvingInterval
 	for e := int64(0); e < fullEras; e++ {
-		want += SubsidyHalvingInterval * (InitialSubsidySatoshis >> uint(e))
+		want += sch.HalvingInterval * (sch.InitialSubsidySatoshis >> uint(e))
 	}
-	partialBlocks := height - fullEras*SubsidyHalvingInterval + 1
-	want += partialBlocks * (InitialSubsidySatoshis >> uint(fullEras))
+	partialBlocks := height - fullEras*sch.HalvingInterval + 1
+	want += partialBlocks * (sch.InitialSubsidySatoshis >> uint(fullEras))
 
 	if got != want {
-		t.Fatalf("IssuedSupplyThroughHeight(%d) = %d, want %d", height, got, want)
+		t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d", height, got, want)
 	}
 }
 
-// TestIssuedSupplyThroughHeight_PostExhaustion proves the sum stops growing
-// once every era's subsidy has reached zero: the total at the exhaustion
-// height must equal the total at any later height.
-func TestIssuedSupplyThroughHeight_PostExhaustion(t *testing.T) {
-	exhaustionHeight := MaxHalvings * SubsidyHalvingInterval
+// TestScheduledSubsidyThroughHeight_PostExhaustion proves the sum stops
+// growing once every era's subsidy has reached zero: the total at the
+// exhaustion height must equal the total at any later height.
+func TestScheduledSubsidyThroughHeight_PostExhaustion(t *testing.T) {
+	sch := MainnetSchedule
+	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval
 
-	totalAtExhaustion, err := IssuedSupplyThroughHeight(exhaustionHeight)
+	totalAtExhaustion, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	totalJustBefore, err := IssuedSupplyThroughHeight(exhaustionHeight - 1)
+	totalJustBefore, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight - 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if totalAtExhaustion != totalJustBefore {
-		t.Fatalf("issued supply grew at the exhaustion height (%d): before=%d at=%d, want equal (subsidy is 0 there)",
+		t.Fatalf("scheduled subsidy total grew at the exhaustion height (%d): before=%d at=%d, want equal (subsidy is 0 there)",
 			exhaustionHeight, totalJustBefore, totalAtExhaustion)
 	}
 
-	laterHeights := []int64{exhaustionHeight + 1, exhaustionHeight + SubsidyHalvingInterval, exhaustionHeight * 10}
+	laterHeights := []int64{exhaustionHeight + 1, exhaustionHeight + sch.HalvingInterval, exhaustionHeight * 10}
 	for _, h := range laterHeights {
-		got, err := IssuedSupplyThroughHeight(h)
+		got, err := sch.ScheduledSubsidyThroughHeight(h)
 		if err != nil {
-			t.Fatalf("IssuedSupplyThroughHeight(%d): unexpected error: %v", h, err)
+			t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", h, err)
 		}
 		if got != totalAtExhaustion {
-			t.Fatalf("IssuedSupplyThroughHeight(%d) = %d, want %d (supply must not grow post-exhaustion)", h, got, totalAtExhaustion)
+			t.Fatalf("ScheduledSubsidyThroughHeight(%d) = %d, want %d (total must not grow post-exhaustion)", h, got, totalAtExhaustion)
 		}
 	}
 }
 
-func TestIssuedSupplyThroughHeight_NegativeHeightRejected(t *testing.T) {
+// TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow proves
+// ScheduledSubsidyThroughHeight(math.MaxInt64) returns exactly the same
+// value as the first fully post-exhaustion height, with no error and no
+// silent wraparound — the era arithmetic deliberately never computes
+// height+1 (which would overflow at MaxInt64) for exactly this reason. See
+// SubsidySchedule.ScheduledSubsidyThroughHeight's doc comment.
+func TestScheduledSubsidyThroughHeight_MaxInt64NoOverflow(t *testing.T) {
+	sch := MainnetSchedule
+	exhaustionHeight := sch.MaxHalvings * sch.HalvingInterval
+
+	want, err := sch.ScheduledSubsidyThroughHeight(exhaustionHeight)
+	if err != nil {
+		t.Fatalf("ScheduledSubsidyThroughHeight(%d): unexpected error: %v", exhaustionHeight, err)
+	}
+
+	got, err := sch.ScheduledSubsidyThroughHeight(math.MaxInt64)
+	if err != nil {
+		t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64): unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("ScheduledSubsidyThroughHeight(MaxInt64) = %d, want %d (same as first fully post-exhaustion height)", got, want)
+	}
+}
+
+func TestScheduledSubsidyThroughHeight_NegativeHeightRejected(t *testing.T) {
 	heights := []int64{-1, -500_000}
 	for _, h := range heights {
-		_, err := IssuedSupplyThroughHeight(h)
+		_, err := MainnetSchedule.ScheduledSubsidyThroughHeight(h)
 		if !errors.Is(err, ErrNegativeHeight) {
-			t.Fatalf("IssuedSupplyThroughHeight(%d): got err=%v, want ErrNegativeHeight", h, err)
+			t.Fatalf("ScheduledSubsidyThroughHeight(%d): got err=%v, want ErrNegativeHeight", h, err)
 		}
 	}
 }
@@ -268,20 +406,20 @@ func TestIssuedSupplyThroughHeight_NegativeHeightRejected(t *testing.T) {
 // ─── ComputeBlockFacts ───────────────────────────────────────────────────
 
 func TestComputeBlockFacts_ExactClaim(t *testing.T) {
-	facts, err := ComputeBlockFacts("deadbeef", 0, 1000, InitialSubsidySatoshis+1000)
+	facts, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 1000, MainnetSchedule.InitialSubsidySatoshis+1000)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if facts.UnclaimedRewardSatoshis != 0 {
 		t.Fatalf("UnclaimedRewardSatoshis = %d, want 0", facts.UnclaimedRewardSatoshis)
 	}
-	if facts.SubsidySatoshis != InitialSubsidySatoshis {
-		t.Fatalf("SubsidySatoshis = %d, want %d", facts.SubsidySatoshis, InitialSubsidySatoshis)
+	if facts.SubsidySatoshis != MainnetSchedule.InitialSubsidySatoshis {
+		t.Fatalf("SubsidySatoshis = %d, want %d", facts.SubsidySatoshis, MainnetSchedule.InitialSubsidySatoshis)
 	}
 }
 
 func TestComputeBlockFacts_Underclaim(t *testing.T) {
-	facts, err := ComputeBlockFacts("deadbeef", 0, 1000, InitialSubsidySatoshis)
+	facts, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 1000, MainnetSchedule.InitialSubsidySatoshis)
 	if err != nil {
 		t.Fatalf("underclaiming the reward must be accepted, not rejected: %v", err)
 	}
@@ -293,26 +431,76 @@ func TestComputeBlockFacts_Underclaim(t *testing.T) {
 func TestComputeBlockFacts_ZeroCoinbaseOutputIsValid(t *testing.T) {
 	// An extreme underclaim (a miner who claims nothing at all) is still a
 	// valid — if unusual — chain state under Core's actual rule.
-	facts, err := ComputeBlockFacts("deadbeef", 0, 0, 0)
+	facts, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if facts.UnclaimedRewardSatoshis != InitialSubsidySatoshis {
-		t.Fatalf("UnclaimedRewardSatoshis = %d, want %d", facts.UnclaimedRewardSatoshis, InitialSubsidySatoshis)
+	if facts.UnclaimedRewardSatoshis != MainnetSchedule.InitialSubsidySatoshis {
+		t.Fatalf("UnclaimedRewardSatoshis = %d, want %d", facts.UnclaimedRewardSatoshis, MainnetSchedule.InitialSubsidySatoshis)
+	}
+}
+
+// TestComputeBlockFacts_ScheduledSubsidyIsNotActualIssuance proves the
+// terminology distinction the internal review required: for an
+// underclaimed block, SubsidySatoshis still follows the schedule exactly
+// (it does not shrink to "what was actually paid"), while
+// UnclaimedRewardSatoshis is the separate fact recording that less value
+// was actually created. A reader must never treat SubsidySatoshis alone,
+// or a sum of it across blocks, as "actual issued supply" — see
+// SubsidySchedule.ScheduledSubsidyThroughHeight's doc comment.
+func TestComputeBlockFacts_ScheduledSubsidyIsNotActualIssuance(t *testing.T) {
+	const actualCoinbasePayout = 1000 // a miner claiming almost nothing
+	facts, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 0, actualCoinbasePayout)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if facts.SubsidySatoshis != MainnetSchedule.InitialSubsidySatoshis {
+		t.Fatalf("SubsidySatoshis = %d, want the full scheduled subsidy %d regardless of actual claim",
+			facts.SubsidySatoshis, MainnetSchedule.InitialSubsidySatoshis)
+	}
+	if facts.CoinbaseOutputSatoshis != actualCoinbasePayout {
+		t.Fatalf("CoinbaseOutputSatoshis = %d, want %d (actual value created)", facts.CoinbaseOutputSatoshis, actualCoinbasePayout)
+	}
+	wantUnclaimed := MainnetSchedule.InitialSubsidySatoshis - actualCoinbasePayout
+	if facts.UnclaimedRewardSatoshis != wantUnclaimed {
+		t.Fatalf("UnclaimedRewardSatoshis = %d, want %d", facts.UnclaimedRewardSatoshis, wantUnclaimed)
+	}
+	if facts.SubsidySatoshis == facts.CoinbaseOutputSatoshis {
+		t.Fatalf("scheduled subsidy and actual coinbase payout coincidentally equal in this fixture — test does not exercise the distinction")
 	}
 }
 
 func TestComputeBlockFacts_OverclaimRejected(t *testing.T) {
-	_, err := ComputeBlockFacts("deadbeef", 0, 1000, InitialSubsidySatoshis+1001)
+	_, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 1000, MainnetSchedule.InitialSubsidySatoshis+1001)
 	if !errors.Is(err, ErrCoinbaseOverclaim) {
 		t.Fatalf("got err=%v, want ErrCoinbaseOverclaim", err)
 	}
 }
 
 func TestComputeBlockFacts_NegativeHeightRejected(t *testing.T) {
-	_, err := ComputeBlockFacts("deadbeef", -1, 0, 0)
+	_, err := MainnetSchedule.ComputeBlockFacts("deadbeef", -1, 0, 0)
 	if !errors.Is(err, ErrNegativeHeight) {
 		t.Fatalf("got err=%v, want ErrNegativeHeight", err)
+	}
+}
+
+// TestComputeBlockFacts_NegativeFeeRejected and
+// TestComputeBlockFacts_NegativeCoinbaseOutputRejected prove
+// ComputeBlockFacts enforces non-negativity of its own monetary inputs
+// rather than trusting the caller — internal/store never actually supplies
+// a negative value today, but this keeps that invariant structurally
+// guaranteed inside the package that owns it.
+func TestComputeBlockFacts_NegativeFeeRejected(t *testing.T) {
+	_, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, -1, 0)
+	if !errors.Is(err, ErrNegativeAmount) {
+		t.Fatalf("got err=%v, want ErrNegativeAmount", err)
+	}
+}
+
+func TestComputeBlockFacts_NegativeCoinbaseOutputRejected(t *testing.T) {
+	_, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, 0, -1)
+	if !errors.Is(err, ErrNegativeAmount) {
+		t.Fatalf("got err=%v, want ErrNegativeAmount", err)
 	}
 }
 
@@ -322,7 +510,7 @@ func TestComputeBlockFacts_NegativeHeightRejected(t *testing.T) {
 // subsidy is InitialSubsidySatoshis (10,000,000,000), so a fee value just
 // under math.MaxInt64 pushes the sum past int64's range.
 func TestComputeBlockFacts_SubsidyPlusFeesOverflowRejected(t *testing.T) {
-	_, err := ComputeBlockFacts("deadbeef", 0, math.MaxInt64-1, 0)
+	_, err := MainnetSchedule.ComputeBlockFacts("deadbeef", 0, math.MaxInt64-1, 0)
 	if !errors.Is(err, ErrAmountOverflow) {
 		t.Fatalf("got err=%v, want ErrAmountOverflow", err)
 	}

@@ -113,7 +113,16 @@ Usage:
                                      that lock does not, and cannot,
                                      serialize against a live indexer
                                      writing new blocks at the same time —
-                                     see docs/ARCHITECTURE.md §26.
+                                     see docs/ARCHITECTURE.md §26. Also
+                                     REQUIRES QOGE_NETWORK, matching exactly
+                                     whatever network the database was
+                                     actually indexed against: the subsidy
+                                     schedule reconstructed accounting uses
+                                     is network-specific (e.g. regtest's
+                                     150-block halving interval versus every
+                                     other network's 500000), and this
+                                     command has no Core RPC connection
+                                     available to detect a mismatch itself.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -125,8 +134,11 @@ Configuration is read from environment variables:
   QOGE_DATABASE_URL         required for migrate/index/serve/backfill-accounting,
                              e.g. postgres://user:pass@host:5432/dbname
   QOGE_MIGRATIONS_DIR       default ./migrations (migrate)
-  QOGE_NETWORK              required for index; must exactly match Core's
-                             getblockchaininfo "chain" (e.g. main/test/regtest)
+  QOGE_NETWORK              required for index and backfill-accounting;
+                             must exactly match Core's getblockchaininfo
+                             "chain" (main/test/signet/regtest) — selects
+                             the subsidy schedule block_accounting uses
+                             (docs/ARCHITECTURE.md §26); never inferred
   QOGE_INDEX_POLL_SECONDS   default 10 (index; live-loop wait once caught up)
   QOGE_HTTP_ADDR            default 127.0.0.1:8532 (serve)
   QOGE_LOG_LEVEL            default info
@@ -362,10 +374,22 @@ func runMigrate(cfg config.Config, log interface {
 // every already-indexed block from PostgreSQL data alone — see
 // store.Store.BackfillAccounting's doc comment for the full idempotency/
 // concurrency contract. It does not connect to Core RPC and does not
-// require any RPC configuration.
+// require any RPC configuration, but it DOES require QOGE_NETWORK: the
+// subsidy schedule backfill reconstructs from height is network-specific
+// (see accounting.ScheduleForNetwork / docs/ARCHITECTURE.md §26), and must
+// be the same network the database was actually indexed against — never a
+// silent mainnet default. This is a plain string comparison against
+// whatever the operator already used for `index`; backfill-accounting has
+// no Core RPC connection available to double check it against
+// getblockchaininfo, so an operator-supplied mismatch is not detectable
+// here.
 func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
 	if cfg.DatabaseURL == "" {
 		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+	if cfg.Network == "" {
+		log.Error("config error", "error", "QOGE_NETWORK is not set")
 		return 1
 	}
 
@@ -379,7 +403,11 @@ func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
 	}
 	defer pool.Close()
 
-	st := store.New(pool)
+	st, err := store.NewForNetwork(pool, cfg.Network)
+	if err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
 
 	before, err := store.CheckAccountingCompleteness(ctx, pool)
 	if err != nil {
@@ -477,8 +505,17 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 	}
 	defer pool.Close()
 
+	// Phase 2H.1 correction: the Store used for live indexing must be
+	// bound to the SAME network cfg.Network/ValidateStartup already
+	// confirmed against Core, never to store.New's mainnet-default
+	// convenience — otherwise a regtest index would silently compute
+	// mainnet subsidies (see docs/ARCHITECTURE.md §26).
 	resolver := decode.NewCoreAddressResolver(client)
-	st := store.New(pool)
+	st, err := store.NewForNetwork(pool, cfg.Network)
+	if err != nil {
+		log.Error("config error", "error", err)
+		return 1
+	}
 	pollInterval := time.Duration(cfg.IndexPollSeconds) * time.Second
 	idx := indexer.New(client, st, resolver, pollInterval, log)
 

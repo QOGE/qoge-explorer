@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/QOGE/qoge-explorer/internal/accounting"
 	"github.com/QOGE/qoge-explorer/internal/chain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -29,13 +28,13 @@ import (
 // a data-shape bug, not chain-state corruption to silently tolerate.
 // Underclaiming (a positive unclaimed reward) is ordinary, valid state and
 // is never rejected.
-func applyBlockAccounting(ctx context.Context, tx pgx.Tx, block chain.Block, blockFeeTotal int64) error {
+func (s *Store) applyBlockAccounting(ctx context.Context, tx pgx.Tx, block chain.Block, blockFeeTotal int64) error {
 	coinbaseOutputTotal, ok := sumOutputValues(block.Transactions[0].Outputs)
 	if !ok {
 		return fmt.Errorf("%w: block %s coinbase output total", ErrAmountOverflow, block.Hash)
 	}
 
-	facts, err := accounting.ComputeBlockFacts(block.Hash, block.Height, blockFeeTotal, coinbaseOutputTotal)
+	facts, err := s.accountingSchedule.ComputeBlockFacts(block.Hash, block.Height, blockFeeTotal, coinbaseOutputTotal)
 	if err != nil {
 		return fmt.Errorf("block accounting: %w", err)
 	}

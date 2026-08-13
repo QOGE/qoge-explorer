@@ -11,10 +11,11 @@ import (
 )
 
 // era0Subsidy is the block subsidy for every height these tests use (all
-// well below the first halving at 500,000) — accounting.InitialSubsidySatoshis,
+// well below the first halving at 500,000), on the mainnet schedule
+// newTestStore's Store uses (New defaults to accounting.MainnetSchedule) —
 // referenced by name rather than a magic number so the intent (era-0
 // subsidy) stays obvious at every call site.
-const era0Subsidy = accounting.InitialSubsidySatoshis
+var era0Subsidy = accounting.MainnetSchedule.InitialSubsidySatoshis
 
 // ─── A: per-block basic accounting (spec section 43) ────────────────────
 

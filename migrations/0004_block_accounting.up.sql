@@ -1,6 +1,6 @@
 -- Phase 2H.1: immutable block monetary accounting foundation.
 --
--- Design invariants (see docs/ARCHITECTURE.md §6/§21 for full rationale):
+-- Design invariants (see docs/ARCHITECTURE.md §6/§26 for full rationale):
 --
 --   1. Per-block, not cumulative. A block's monetary facts — the subsidy
 --      its height entitled it to, the fees its transactions paid, what its
@@ -28,8 +28,11 @@
 --      ConnectBlock only rejects coinbase_output_total > subsidy + fees
 --      (src/validation.cpp: `if (block.vtx[0]->GetValueOut() > blockReward)
 --      ... "bad-cb-amount"`) — underclaiming is valid chain state. Because
---      internal/accounting.ComputeBlockFacts already rejects the overclaim
---      direction in Go before this table is ever written to, the identity
+--      internal/accounting.SubsidySchedule.ComputeBlockFacts already
+--      rejects the overclaim direction in Go before this table is ever
+--      written to (using the network-specific schedule the writing Store
+--      was constructed with — see docs/ARCHITECTURE.md §26 "Network-aware
+--      subsidy schedule"), the identity
 --      below only needs to hold, not additionally bound
 --      unclaimed_reward_satoshis by anything other than >= 0.
 CREATE TABLE block_accounting (

@@ -1,94 +1,178 @@
 // Package accounting computes per-block monetary facts — block subsidy,
-// issued supply — as pure, checked-arithmetic functions of height. This is
-// DISPLAY/ACCOUNTING logic layered on top of an already-Core-validated
-// chain: it never decides whether Core should have accepted a block, and it
-// is never consulted by internal/store's consensus-adjacent shape checks.
-// Core remains the sole authority on chain validity. See
-// docs/ARCHITECTURE.md §6 for the full monetary-terms rationale.
+// scheduled subsidy totals — as pure, checked-arithmetic functions of
+// height and network. This is DISPLAY/ACCOUNTING logic layered on top of an
+// already-Core-validated chain: it never decides whether Core should have
+// accepted a block, and it is never consulted by internal/store's
+// consensus-adjacent shape checks. Core remains the sole authority on chain
+// validity. See docs/ARCHITECTURE.md §6/§26 for the full monetary-terms
+// rationale.
 package accounting
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
 
-// InitialSubsidySatoshis and SubsidyHalvingInterval are QOGE mainnet's
-// actual consensus constants, verified directly against Qogecoin Core
-// stable (not merely trusted from prior documentation — see
-// docs/ARCHITECTURE.md §6):
+// ErrUnknownNetwork means ScheduleForNetwork was asked for a network string
+// that doesn't match any QOGE Core network this package knows the subsidy
+// schedule for. Callers must never fall back to a default schedule on this
+// error — see docs/ARCHITECTURE.md §26 "Network-aware subsidy schedule".
+var ErrUnknownNetwork = errors.New("accounting: unknown network")
+
+// SubsidySchedule holds the consensus subsidy parameters for one QOGE
+// network. Every QOGE network shares the same 100 QOGE initial subsidy and
+// 64-halving exhaustion point; only HalvingInterval differs between them.
+// This was verified directly against Qogecoin Core stable's
+// src/chainparams.cpp (not merely assumed from mainnet — a prior version of
+// this package hardcoded mainnet's interval as if it were universal, which
+// was wrong for regtest):
 //
-//   - src/validation.cpp, GetBlockSubsidy: `CAmount nSubsidy = 100 * COIN;
-//     nSubsidy >>= halvings;` with `if (halvings >= 64) return 0;`.
-//   - src/consensus/amount.h: `COIN = 100000000` (100,000,000 satoshis/QOGE).
-//   - src/chainparams.cpp, CMainParams: `nSubsidyHalvingInterval = 500000`.
-const (
-	InitialSubsidySatoshis int64 = 100 * 100_000_000 // 100 QOGE = 100 * COIN
-	SubsidyHalvingInterval int64 = 500_000           // mainnet nSubsidyHalvingInterval
+//   - CMainParams:    nSubsidyHalvingInterval = 500000  (strNetworkID "main")
+//   - CTestNetParams: nSubsidyHalvingInterval = 500000  (strNetworkID "test")
+//   - CSigNetParams:  nSubsidyHalvingInterval = 500000  (strNetworkID "signet")
+//   - CRegTestParams: nSubsidyHalvingInterval = 150     (strNetworkID "regtest")
+//
+// The initial subsidy and halving formula themselves come from
+// src/validation.cpp's GetBlockSubsidy, which takes consensusParams (and
+// therefore the halving interval) as a parameter but otherwise applies
+// identically across networks: `CAmount nSubsidy = 100 * COIN; nSubsidy >>=
+// halvings;` with `if (halvings >= 64) return 0;`. src/consensus/amount.h:
+// COIN = 100000000 (100,000,000 satoshis/QOGE).
+type SubsidySchedule struct {
+	InitialSubsidySatoshis int64
+	HalvingInterval        int64
 
 	// MaxHalvings mirrors Core's `if (halvings >= 64) return 0;` — a right
 	// shift by 64 or more of a 64-bit value is undefined in Core's C++, so
 	// Core forces the result to zero explicitly rather than ever
-	// performing that shift. This function mirrors that exact boundary,
-	// not a Go-idiomatic "shift until zero" derivation.
-	MaxHalvings int64 = 64
+	// performing that shift. This is the same 64 for every network: it is
+	// a property of the C++ shift-width guard, not of HalvingInterval.
+	MaxHalvings int64
+}
+
+const (
+	initialSubsidySatoshis int64 = 100 * 100_000_000 // 100 QOGE = 100 * COIN, identical on every network
+	maxHalvings            int64 = 64
 )
 
-// BlockSubsidy returns the consensus block subsidy for height, in integer
-// satoshis, computed by the exact formula verified against Core's
-// GetBlockSubsidy: 100 QOGE right-shifted once per 500,000-block halving
-// era, forced to zero once 64 halvings have elapsed. height must be
-// non-negative; a negative height is rejected rather than silently treated
-// as height 0 (which would misreport a caller's bug as valid consensus
-// data).
-func BlockSubsidy(height int64) (int64, error) {
+// MainnetSchedule, TestnetSchedule, SignetSchedule, and RegtestSchedule are
+// QOGE Core's four network subsidy schedules, keyed by ScheduleForNetwork.
+// MainnetSchedule is also exposed directly as a documented, explicitly
+// mainnet-scoped convenience for callers that are known not to be
+// network-sensitive (see internal/store.New's doc comment) — it must never
+// be reached implicitly by a production code path that has an actual
+// network to select on.
+var (
+	MainnetSchedule = SubsidySchedule{InitialSubsidySatoshis: initialSubsidySatoshis, HalvingInterval: 500_000, MaxHalvings: maxHalvings}
+	TestnetSchedule = SubsidySchedule{InitialSubsidySatoshis: initialSubsidySatoshis, HalvingInterval: 500_000, MaxHalvings: maxHalvings}
+	SignetSchedule  = SubsidySchedule{InitialSubsidySatoshis: initialSubsidySatoshis, HalvingInterval: 500_000, MaxHalvings: maxHalvings}
+	RegtestSchedule = SubsidySchedule{InitialSubsidySatoshis: initialSubsidySatoshis, HalvingInterval: 150, MaxHalvings: maxHalvings}
+)
+
+// ScheduleForNetwork returns the SubsidySchedule for network, matching
+// exactly the Core getblockchaininfo "chain" string this codebase already
+// requires elsewhere (QOGE_NETWORK / indexer.ValidateStartup) — "main",
+// "test", "signet", or "regtest". network is never inferred (e.g. from an
+// address HRP — see docs/ARCHITECTURE.md §18); an unrecognized string is
+// rejected as ErrUnknownNetwork rather than silently defaulting to
+// MainnetSchedule.
+func ScheduleForNetwork(network string) (SubsidySchedule, error) {
+	switch network {
+	case "main":
+		return MainnetSchedule, nil
+	case "test":
+		return TestnetSchedule, nil
+	case "signet":
+		return SignetSchedule, nil
+	case "regtest":
+		return RegtestSchedule, nil
+	default:
+		return SubsidySchedule{}, fmt.Errorf("%w: %q", ErrUnknownNetwork, network)
+	}
+}
+
+// BlockSubsidy returns the consensus block subsidy for height under sch, in
+// integer satoshis, computed by the exact formula verified against Core's
+// GetBlockSubsidy: the initial subsidy right-shifted once per
+// sch.HalvingInterval-block halving era, forced to zero once
+// sch.MaxHalvings halvings have elapsed. height must be non-negative; a
+// negative height is rejected rather than silently treated as height 0
+// (which would misreport a caller's bug as valid consensus data).
+func (sch SubsidySchedule) BlockSubsidy(height int64) (int64, error) {
 	if height < 0 {
 		return 0, fmt.Errorf("%w: block subsidy height %d", ErrNegativeHeight, height)
 	}
-	halvings := height / SubsidyHalvingInterval
-	if halvings >= MaxHalvings {
+	halvings := height / sch.HalvingInterval
+	if halvings >= sch.MaxHalvings {
 		return 0, nil
 	}
-	return InitialSubsidySatoshis >> uint(halvings), nil
+	return sch.InitialSubsidySatoshis >> uint(halvings), nil
 }
 
-// IssuedSupplyThroughHeight returns the total consensus issue — the sum of
-// BlockSubsidy(h) for every h from 0 through height inclusive — in integer
-// satoshis. It runs in O(number of halving eras) (at most MaxHalvings = 64
-// iterations), never O(height): each era contributes
-// (blocks in that era) * (that era's subsidy) as a single multiply, rather
-// than iterating every individual height. This is what keeps a future
-// GET /api/v1/supply cheap regardless of chain length.
+// ScheduledSubsidyThroughHeight returns the sum of sch.BlockSubsidy(h) for
+// every h from 0 through height inclusive, in integer satoshis. It runs in
+// O(number of halving eras) (at most sch.MaxHalvings iterations), never
+// O(height): each era contributes (blocks in that era) * (that era's
+// subsidy) as a single multiply, rather than iterating every individual
+// height.
+//
+// This is the SCHEDULED subsidy total, i.e. the maximum a fully-claiming
+// chain could ever have issued through height under this consensus
+// schedule — it is deliberately NOT called "issued supply." Because a
+// miner's coinbase output total is only required to be <= subsidy + fees
+// (see accounting.ErrCoinbaseOverclaim / block_accounting's
+// unclaimed_reward_satoshis), a positive unclaimed reward on any block
+// means less value was actually created by that block's coinbase than its
+// scheduled entitlement — so SUM(BlockSubsidy) can systematically overstate
+// actual chain issuance. See docs/ARCHITECTURE.md §26 "Scheduled subsidy is
+// not issued supply." Phase 2H.2 will define the exact public metrics that
+// account for underclaimed reward/fees; this function intentionally stops
+// at the pure, schedule-only quantity.
 //
 // height must be non-negative. Genesis (height 0) is included in the sum:
-// the project's supply definition is issued supply — what the consensus
-// schedule entitles a height to — which is unaffected by Core's UTXO-set
-// bookkeeping choice to never insert the genesis coinbase as a spendable
-// coin (see docs/ARCHITECTURE.md §6/§16). Issued supply is therefore NOT
-// the same metric as currently-spendable UTXO value.
-func IssuedSupplyThroughHeight(height int64) (int64, error) {
+// its scheduled entitlement is unaffected by Core's UTXO-set bookkeeping
+// choice to never insert the genesis coinbase as a spendable coin (see
+// docs/ARCHITECTURE.md §6/§16).
+//
+// height may be any non-negative int64, including math.MaxInt64: the
+// per-era arithmetic below is written to avoid ever adding 1 to height
+// itself (which would overflow at MaxInt64) — comparisons are phrased
+// against the era's own bounds instead, which stay small (at most
+// sch.MaxHalvings * sch.HalvingInterval) regardless of how large height is.
+func (sch SubsidySchedule) ScheduledSubsidyThroughHeight(height int64) (int64, error) {
 	if height < 0 {
-		return 0, fmt.Errorf("%w: issued supply height %d", ErrNegativeHeight, height)
+		return 0, fmt.Errorf("%w: scheduled subsidy height %d", ErrNegativeHeight, height)
 	}
 
 	var total int64
-	for era := int64(0); era < MaxHalvings; era++ {
-		eraStart := era * SubsidyHalvingInterval
+	for era := int64(0); era < sch.MaxHalvings; era++ {
+		eraStart := era * sch.HalvingInterval
 		if eraStart > height {
 			break
 		}
-		eraEndExclusive := eraStart + SubsidyHalvingInterval
+		eraEndExclusive := eraStart + sch.HalvingInterval
 
-		blocksInEra := SubsidyHalvingInterval
-		if height+1 < eraEndExclusive {
-			blocksInEra = height + 1 - eraStart
+		// Full era unless height falls strictly inside it. Phrased as
+		// "height < eraEndExclusive-1" (equivalent to the more obvious
+		// "height+1 < eraEndExclusive" but without ever computing height+1,
+		// which overflows when height == math.MaxInt64). eraEndExclusive-1
+		// is always small (bounded by sch.MaxHalvings * sch.HalvingInterval),
+		// so this comparison and the blocksInEra subtraction below never
+		// overflow even for a huge height.
+		blocksInEra := sch.HalvingInterval
+		if height < eraEndExclusive-1 {
+			blocksInEra = height - eraStart + 1
 		}
 
-		subsidy := InitialSubsidySatoshis >> uint(era)
+		subsidy := sch.InitialSubsidySatoshis >> uint(era)
 
 		contribution, ok := checkedMul(subsidy, blocksInEra)
 		if !ok {
-			return 0, fmt.Errorf("%w: issued supply era %d contribution overflow", ErrAmountOverflow, era)
+			return 0, fmt.Errorf("%w: scheduled subsidy era %d contribution overflow", ErrAmountOverflow, era)
 		}
 		sum, ok := checkedAdd(total, contribution)
 		if !ok {
-			return 0, fmt.Errorf("%w: issued supply running total overflow at era %d", ErrAmountOverflow, era)
+			return 0, fmt.Errorf("%w: scheduled subsidy running total overflow at era %d", ErrAmountOverflow, era)
 		}
 		total = sum
 	}
