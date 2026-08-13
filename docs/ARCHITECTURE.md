@@ -4531,16 +4531,51 @@ is cheaply re-verified (not blindly skipped, and not re-derived from a
 fragile numeric progress counter — `block_hash`-keyed immutability is
 already a complete resume mechanism), a missing row is freshly inserted,
 and a contradictory existing row fails loudly rather than being silently
-overwritten. It takes a PostgreSQL session-level advisory lock for its
-whole duration, rejecting a second concurrent `backfill-accounting` run
-outright — but this does NOT, and cannot, serialize against a
-concurrently running `index` process (which serializes its own
-`ApplyBlock`/`RollbackTo` calls via a different mechanism, the
-`sync_state` row lock in §16 "Canonical tip continuity" — holding THAT
-lock for an entire backfill's duration would block live indexing for as
-long as the backfill takes). Stopping `index` before running
-`backfill-accounting` is therefore an operational requirement, documented
-in the command's own usage text, not a mechanically enforced one.
+overwritten. It takes a PostgreSQL session-level, **schema-scoped**
+advisory lock for its whole duration, rejecting a second concurrent
+`backfill-accounting` run against the SAME explorer schema outright — but
+this does NOT, and cannot, serialize against a concurrently running
+`index` process (which serializes its own `ApplyBlock`/`RollbackTo` calls
+via a different mechanism, the `sync_state` row lock in §16 "Canonical tip
+continuity" — holding THAT lock for an entire backfill's duration would
+block live indexing for as long as the backfill takes). Stopping `index`
+before running `backfill-accounting` is therefore an operational
+requirement, documented in the command's own usage text, not a
+mechanically enforced one.
+
+**Advisory lock isolation is per explorer schema, not per database.** An
+adversarial monetary-accounting review (Grok Build) approved this phase's
+accounting correctness but found a reproducible test-isolation defect: the
+advisory lock originally used one fixed key
+(`pg_try_advisory_lock(728341001)`) for every `BackfillAccounting` call.
+PostgreSQL advisory locks are global to a database, not scoped to a
+schema — but this project's own PostgreSQL-backed package tests
+deliberately isolate themselves using separate schemas within the SAME
+`QOGE_TEST_DATABASE_URL` database (`internal/store/dbtest_test.go`'s
+`newTestSchema`). Two completely unrelated tests, each backfilling its own
+disjoint schema, could therefore spuriously contend for the identical
+database-wide key: the losing one got a legitimate-looking
+`ErrBackfillAlreadyRunning` despite operating on unrelated explorer state,
+making `go test -count=1 ./...` occasionally fail under normal parallel
+package execution (reliably passing only with `-p 1`). This was fail-
+closed and never a false-accounting path, but an unreliable ordinary test
+suite is still a real defect.
+
+The fix (`schemaScopedLockKey`, `internal/store/backfill.go`) derives the
+lock's second key from the schema the `Store`'s connection actually
+resolves unqualified names against: `pg_try_advisory_lock(namespace,
+hashtext(current_schema()))`, where `namespace` is the same fixed constant
+as before and `hashtext()` is deterministic — the same schema name always
+produces the same key, across processes, connections, and `Store`
+instances, with no process-local randomness involved. Two
+`BackfillAccounting` runs against the SAME schema still correctly exclude
+each other (`TestBackfillAccounting_ConcurrentRunRejected`); two runs
+against DIFFERENT schemas in the same database no longer contend at all
+(`TestBackfillAccounting_DifferentSchemaNotBlocked`), matching the fact
+that they read and write entirely disjoint tables. If `current_schema()`
+cannot be resolved (`NULL`/empty), `BackfillAccounting` fails closed with
+`store.ErrSchemaIdentityUnavailable` rather than falling back to the old
+database-global key or any other default.
 
 `backfill-accounting` requires `QOGE_NETWORK`, exactly like `index` — it
 constructs its `Store` via `store.NewForNetwork(pool, cfg.Network)`, never

@@ -8,20 +8,69 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// backfillAccountingAdvisoryLockKey is an arbitrary, fixed PostgreSQL
-// advisory-lock key reserved for BackfillAccounting. Advisory locks are a
-// global (per-database) namespace of plain integers with no built-in
-// collision protection against other unrelated uses — this package uses
-// exactly one key, exclusively for this purpose, so a fixed constant is
-// sufficient.
-const backfillAccountingAdvisoryLockKey int64 = 728341001
+// backfillAccountingAdvisoryLockNamespace is the fixed first key of the
+// two-key PostgreSQL advisory lock BackfillAccounting takes
+// (pg_try_advisory_lock(namespace, schema_key)). Advisory locks are a
+// global (per-database, not per-schema) namespace of plain integers, so the
+// namespace alone is NOT sufficient to identify which backfill run this
+// is — see schemaScopedLockKey, which combines this namespace with a key
+// derived from the explorer schema actually being backfilled.
+const backfillAccountingAdvisoryLockNamespace int32 = 728341001
 
 // ErrBackfillAlreadyRunning means another BackfillAccounting call already
-// holds the advisory lock — either a concurrent process or a concurrent
-// goroutine in this one. BackfillAccounting refuses to run two overlapping
-// passes rather than let them race each other's reads of `blocks`/
-// `transactions`/`transaction_outputs` against each other.
-var ErrBackfillAlreadyRunning = errors.New("store: another backfill-accounting run holds the advisory lock")
+// holds the advisory lock for the SAME explorer schema — either a
+// concurrent process or a concurrent goroutine in this one. BackfillAccounting
+// refuses to run two overlapping passes over the same schema rather than
+// let them race each other's reads of `blocks`/`transactions`/
+// `transaction_outputs` against each other. A concurrent backfill running
+// against a DIFFERENT explorer schema in the same database does not hold
+// this lock and is unaffected (see schemaScopedLockKey).
+var ErrBackfillAlreadyRunning = errors.New("store: another backfill-accounting run holds the advisory lock for this explorer schema")
+
+// ErrSchemaIdentityUnavailable means BackfillAccounting could not determine
+// which PostgreSQL schema this Store's connection is actually operating
+// against (current_schema() returned NULL/empty). The advisory lock's
+// safety depends entirely on being scoped to the right schema, so
+// BackfillAccounting fails closed here rather than falling back to a
+// schema-independent global key or any other default.
+var ErrSchemaIdentityUnavailable = errors.New("store: backfill accounting: could not determine current PostgreSQL schema")
+
+// schemaScopedLockKey reads the schema `conn`'s session actually resolves
+// unqualified names against (current_schema(), i.e. the first existing
+// schema on search_path) and derives a deterministic PostgreSQL advisory
+// lock key pair from it: a fixed namespace
+// (backfillAccountingAdvisoryLockNamespace) plus hashtext(schema name).
+//
+// This makes the lock schema-scoped rather than database-global: two
+// BackfillAccounting runs against the SAME schema always compute the same
+// key pair and correctly exclude each other, while two runs against
+// DIFFERENT schemas in the same database (this project's PostgreSQL
+// package tests each use their own throwaway schema, per
+// dbtest_test.go's newTestSchema) compute different key pairs and do not
+// contend — matching the fact that they read and write entirely disjoint
+// tables. hashtext() is deterministic for a given input across processes,
+// connections, and Store instances, so no process-local randomness is
+// involved.
+//
+// Returns ErrSchemaIdentityUnavailable if current_schema() is NULL/empty,
+// rather than silently falling back to an arbitrary or schema-independent
+// key.
+func schemaScopedLockKey(ctx context.Context, conn interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}) (namespace, schemaKey int32, schemaName string, err error) {
+	var name *string
+	if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&name); err != nil {
+		return 0, 0, "", fmt.Errorf("store: backfill accounting: read current_schema: %w", err)
+	}
+	if name == nil || *name == "" {
+		return 0, 0, "", ErrSchemaIdentityUnavailable
+	}
+	var key int32
+	if err := conn.QueryRow(ctx, `SELECT hashtext($1)`, *name).Scan(&key); err != nil {
+		return 0, 0, "", fmt.Errorf("store: backfill accounting: hash schema name: %w", err)
+	}
+	return backfillAccountingAdvisoryLockNamespace, key, *name, nil
+}
 
 // ErrIncompleteAccountingSource means the already-indexed PostgreSQL data
 // BackfillBlockAccounting needs for one block is present but incomplete in
@@ -59,15 +108,21 @@ type BackfillAccountingResult struct {
 //
 // # Concurrency policy
 //
-// BackfillAccounting takes a session-level PostgreSQL advisory lock
-// (pg_try_advisory_lock) for its entire duration, which prevents two
-// overlapping BackfillAccounting runs (in this process or any other one
-// sharing the database) from racing each other — returning
-// ErrBackfillAlreadyRunning immediately if the lock is already held,
-// rather than silently computing across a moving result set. The lock is
-// released automatically if the holding connection is lost (crash,
-// network partition), so a killed backfill process can never leave a
-// stale lock behind.
+// BackfillAccounting takes a session-level, schema-scoped PostgreSQL
+// advisory lock (pg_try_advisory_lock(namespace, schema_key), see
+// schemaScopedLockKey) for its entire duration, which prevents two
+// overlapping BackfillAccounting runs against the SAME explorer schema (in
+// this process or any other one sharing the database) from racing each
+// other — returning ErrBackfillAlreadyRunning immediately if the lock is
+// already held, rather than silently computing across a moving result
+// set. Because the lock key is derived from the schema, two
+// BackfillAccounting runs against DIFFERENT explorer schemas in the same
+// database (as this project's PostgreSQL-backed package tests deliberately
+// use, one throwaway schema per test) do not contend with each other at
+// all — they read and write entirely disjoint tables, so there is nothing
+// to serialize. The lock is released automatically if the holding
+// connection is lost (crash, network partition), so a killed backfill
+// process can never leave a stale lock behind.
 //
 // This does NOT, and cannot, serialize against a concurrently RUNNING
 // `qoge-explorer index` process: the live indexer's ApplyBlock
@@ -100,8 +155,13 @@ func (s *Store) BackfillAccounting(ctx context.Context) (BackfillAccountingResul
 	}
 	defer conn.Release()
 
+	namespace, schemaKey, _, err := schemaScopedLockKey(ctx, conn)
+	if err != nil {
+		return BackfillAccountingResult{}, fmt.Errorf("store: backfill accounting: %w", err)
+	}
+
 	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, backfillAccountingAdvisoryLockKey).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespace, schemaKey).Scan(&locked); err != nil {
 		return BackfillAccountingResult{}, fmt.Errorf("store: backfill accounting: acquire advisory lock: %w", err)
 	}
 	if !locked {
@@ -110,8 +170,9 @@ func (s *Store) BackfillAccounting(ctx context.Context) (BackfillAccountingResul
 	defer func() {
 		// Best-effort: if this fails, the lock is still released when conn
 		// itself is closed/returned — pg_try_advisory_lock is session-
-		// scoped, not held open-endedly by a leaked reference.
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, backfillAccountingAdvisoryLockKey)
+		// scoped, not held open-endedly by a leaked reference. Same
+		// (namespace, schemaKey) pair used to acquire it.
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, namespace, schemaKey)
 	}()
 
 	rows, err := s.pool.Query(ctx, `SELECT hash FROM blocks ORDER BY height, hash`)

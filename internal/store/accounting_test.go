@@ -592,8 +592,16 @@ func TestCheckAccountingCompleteness_ReportsMissingThenComplete(t *testing.T) {
 	}
 }
 
-// ─── O: the advisory lock rejects a concurrent backfill run ─────────────
+// ─── O: the advisory lock rejects a concurrent backfill run against the
+//        SAME explorer schema, but NOT one against a different schema ────
 
+// TestBackfillAccounting_ConcurrentRunRejected simulates a second
+// BackfillAccounting run already in progress against the SAME explorer
+// schema newTestStore's Store operates on, by acquiring the identical
+// schema-scoped advisory lock key pair (schemaScopedLockKey) on a separate
+// connection from the SAME pool first. This is deterministic (no timing
+// sleeps): the lock is held before BackfillAccounting is ever called, so
+// there is no race to win.
 func TestBackfillAccounting_ConcurrentRunRejected(t *testing.T) {
 	ctx := context.Background()
 	s, pool := newTestStore(t)
@@ -604,19 +612,91 @@ func TestBackfillAccounting_ConcurrentRunRejected(t *testing.T) {
 	}
 	defer conn.Release()
 
+	namespace, schemaKey, _, err := schemaScopedLockKey(ctx, conn)
+	if err != nil {
+		t.Fatalf("schemaScopedLockKey: %v", err)
+	}
+
 	var locked bool
-	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, backfillAccountingAdvisoryLockKey).Scan(&locked); err != nil {
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespace, schemaKey).Scan(&locked); err != nil {
 		t.Fatalf("acquire advisory lock: %v", err)
 	}
 	if !locked {
 		t.Fatal("fixture bug: could not acquire the advisory lock to simulate a concurrent run")
 	}
 	defer func() {
-		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, backfillAccountingAdvisoryLockKey)
+		_, _ = conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, namespace, schemaKey)
 	}()
 
 	_, err = s.BackfillAccounting(ctx)
 	if !errors.Is(err, ErrBackfillAlreadyRunning) {
 		t.Fatalf("error = %v, want ErrBackfillAlreadyRunning", err)
+	}
+}
+
+// TestBackfillAccounting_DifferentSchemaNotBlocked reproduces the isolation
+// bug an adversarial review found: two entirely independent explorer
+// schemas in the SAME PostgreSQL database, each with a genuinely
+// in-progress backfill lock held, must NOT contend with each other — the
+// advisory lock is scoped per-schema (schemaScopedLockKey), not
+// database-global. Deterministic (no timing sleeps): schema A's lock is
+// held on a separate connection to schema A's own pool before schema B's
+// BackfillAccounting is ever called, so if the lock were still
+// database-global this test would fail every time, not flakily.
+func TestBackfillAccounting_DifferentSchemaNotBlocked(t *testing.T) {
+	ctx := context.Background()
+	sA, poolA := newTestStore(t)
+	sB, poolB := newTestStore(t)
+
+	seed := func(s *Store, label string) {
+		g := testBlock(hash64(label+"genesis"), 0, "", coinbaseTx(hash64(label+"cb"), out(0, era0Subsidy, "q"+label)))
+		mustApply(t, ctx, s, g)
+	}
+	seed(sA, "schemaA")
+	seed(sB, "schemaB")
+
+	connA, err := poolA.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire schema A lock connection: %v", err)
+	}
+	defer connA.Release()
+
+	namespaceA, schemaKeyA, schemaNameA, err := schemaScopedLockKey(ctx, connA)
+	if err != nil {
+		t.Fatalf("schemaScopedLockKey(A): %v", err)
+	}
+
+	var lockedA bool
+	if err := connA.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespaceA, schemaKeyA).Scan(&lockedA); err != nil {
+		t.Fatalf("acquire schema A advisory lock: %v", err)
+	}
+	if !lockedA {
+		t.Fatal("fixture bug: could not acquire schema A's advisory lock")
+	}
+	defer func() {
+		_, _ = connA.Exec(context.Background(), `SELECT pg_advisory_unlock($1, $2)`, namespaceA, schemaKeyA)
+	}()
+
+	// Confirm the two test schemas really are distinct (the whole test is
+	// meaningless otherwise), then prove schema B's backfill is unaffected
+	// by schema A's held lock.
+	connB, err := poolB.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire schema B connection: %v", err)
+	}
+	_, schemaKeyB, schemaNameB, err := schemaScopedLockKey(ctx, connB)
+	connB.Release()
+	if err != nil {
+		t.Fatalf("schemaScopedLockKey(B): %v", err)
+	}
+	if schemaNameA == schemaNameB {
+		t.Fatalf("fixture bug: schema A and schema B are the same schema (%s)", schemaNameA)
+	}
+	if schemaKeyA == schemaKeyB {
+		t.Fatalf("fixture bug: schema A and schema B hashed to the same lock key (%d)", schemaKeyA)
+	}
+
+	if _, err := sB.BackfillAccounting(ctx); err != nil {
+		t.Fatalf("BackfillAccounting on independent schema B failed while schema A's lock was held: %v", err)
 	}
 }
