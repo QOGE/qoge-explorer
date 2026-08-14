@@ -173,7 +173,16 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 	// present and at index 0 by validateBlockShape) is available for the
 	// coinbase output total — but strictly BEFORE the checkpoint update
 	// below, inside this SAME transaction. See applyBlockAccounting.
-	if err := s.applyBlockAccounting(ctx, tx, block, blockFeeTotal); err != nil {
+	facts, err := s.applyBlockAccounting(ctx, tx, block, blockFeeTotal)
+	if err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+	}
+
+	// Phase 2H.2a: block_supply_rollup is written immediately after
+	// block_accounting, reusing the exact facts just computed above — still
+	// strictly BEFORE the checkpoint update below, inside this SAME
+	// transaction. See applySupplyRollup.
+	if err := s.applySupplyRollup(ctx, tx, block, checkpoint, facts); err != nil {
 		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
 	}
 

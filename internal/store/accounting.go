@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/QOGE/qoge-explorer/internal/accounting"
 	"github.com/QOGE/qoge-explorer/internal/chain"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -28,15 +29,19 @@ import (
 // a data-shape bug, not chain-state corruption to silently tolerate.
 // Underclaiming (a positive unclaimed reward) is ordinary, valid state and
 // is never rejected.
-func (s *Store) applyBlockAccounting(ctx context.Context, tx pgx.Tx, block chain.Block, blockFeeTotal int64) error {
+// Returns the exact accounting.BlockFacts this call computed and persisted
+// — Phase 2H.2a's applySupplyRollup (supply_rollup.go) consumes this SAME
+// value to extend the cumulative rollup, rather than re-deriving it a
+// second time (task item 14: no second fee/subsidy algorithm).
+func (s *Store) applyBlockAccounting(ctx context.Context, tx pgx.Tx, block chain.Block, blockFeeTotal int64) (accounting.BlockFacts, error) {
 	coinbaseOutputTotal, ok := sumOutputValues(block.Transactions[0].Outputs)
 	if !ok {
-		return fmt.Errorf("%w: block %s coinbase output total", ErrAmountOverflow, block.Hash)
+		return accounting.BlockFacts{}, fmt.Errorf("%w: block %s coinbase output total", ErrAmountOverflow, block.Hash)
 	}
 
 	facts, err := s.accountingSchedule.ComputeBlockFacts(block.Hash, block.Height, blockFeeTotal, coinbaseOutputTotal)
 	if err != nil {
-		return fmt.Errorf("block accounting: %w", err)
+		return accounting.BlockFacts{}, fmt.Errorf("block accounting: %w", err)
 	}
 
 	// Idempotent insert, same pattern as every other immutable identity in
@@ -47,11 +52,13 @@ func (s *Store) applyBlockAccounting(ctx context.Context, tx pgx.Tx, block chain
 	// docs/ARCHITECTURE.md §26 "Idempotent insert"). Shared with
 	// BackfillBlockAccounting (backfill.go) via the same SQL constants, so
 	// live indexing and backfill can never persist this row differently.
-	_, err = insertOrVerifyIdempotent(ctx, tx, "block_accounting "+facts.BlockHash,
+	if _, err := insertOrVerifyIdempotent(ctx, tx, "block_accounting "+facts.BlockHash,
 		blockAccountingInsertSQL, blockAccountingVerifySQL,
 		facts.BlockHash, facts.SubsidySatoshis, facts.FeeSatoshis, facts.CoinbaseOutputSatoshis, facts.UnclaimedRewardSatoshis,
-	)
-	return err
+	); err != nil {
+		return accounting.BlockFacts{}, err
+	}
+	return facts, nil
 }
 
 // blockAccountingInsertSQL / blockAccountingVerifySQL are the exact

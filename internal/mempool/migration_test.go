@@ -46,34 +46,49 @@ func TestMigration_0002RoundTrip(t *testing.T) {
 		t.Fatalf("load migrations: %v", err)
 	}
 
-	// v4 -> v1: roll back 0004 (block_accounting), 0003 (deployment_state),
-	// then 0002 (the mempool migration), newest first.
-	rolledBack, err := store.Down(ctx, pool, migrations, 3)
+	// vN -> v1: roll back every migration above (and including) 0002 — the
+	// mempool migration itself, plus whatever has been layered on top of
+	// it since (0003 deployment_state, 0004 block_accounting, 0005
+	// block_supply_rollup as of Phase 2H.2a) — newest first. Computed as
+	// len(migrations)-1 rather than a hardcoded step count so this test
+	// doesn't need editing again the next time a migration is added on top
+	// (task item 38's own round-trip coverage lives in internal/store;
+	// this test only cares that ITS OWN migration round-trips cleanly
+	// alongside whatever else is currently layered above it).
+	steps := len(migrations) - 1
+	rolledBack, err := store.Down(ctx, pool, migrations, steps)
 	if err != nil {
-		t.Fatalf("Down(3): %v", err)
+		t.Fatalf("Down(%d): %v", steps, err)
 	}
-	if len(rolledBack) != 3 || rolledBack[0] != 4 || rolledBack[1] != 3 || rolledBack[2] != 2 {
-		t.Fatalf("Down(3) rolled back %v, want [4 3 2]", rolledBack)
+	if len(rolledBack) != steps {
+		t.Fatalf("Down(%d) rolled back %v, want %d versions", steps, rolledBack, steps)
+	}
+	for i, v := range rolledBack {
+		if want := int64(len(migrations)) - int64(i); v != want {
+			t.Fatalf("Down(%d) rolled back %v, want strictly descending versions ending at 2 (got %d at position %d, want %d)", steps, rolledBack, v, i, want)
+		}
 	}
 	requireTableAbsent(t, ctx, pool, "mempool_state")
 	requireTableAbsent(t, ctx, pool, "mempool_transactions")
 	requireTableAbsent(t, ctx, pool, "mempool_dependencies")
 	requireTableAbsent(t, ctx, pool, "deployment_state")
 	requireTableAbsent(t, ctx, pool, "block_accounting")
+	requireTableAbsent(t, ctx, pool, "block_supply_rollup")
 	requireTableExists(t, ctx, pool, "blocks")            // 0001 unaffected
 	requireTableExists(t, ctx, pool, "chain_deployments") // 0001 unaffected
 
-	// v1 -> v4 again: re-apply all three.
+	// v1 -> vN again: re-apply everything just rolled back.
 	applied, err := store.Up(ctx, pool, migrations)
 	if err != nil {
 		t.Fatalf("Up (re-apply): %v", err)
 	}
-	if len(applied) != 3 || applied[0] != 2 || applied[1] != 3 || applied[2] != 4 {
-		t.Fatalf("Up (re-apply) applied %v, want [2 3 4]", applied)
+	if len(applied) != steps {
+		t.Fatalf("Up (re-apply) applied %v, want %d versions", applied, steps)
 	}
 	requireTableExists(t, ctx, pool, "mempool_state")
 	requireTableExists(t, ctx, pool, "deployment_state")
 	requireTableExists(t, ctx, pool, "block_accounting")
+	requireTableExists(t, ctx, pool, "block_supply_rollup")
 
 	// The bootstrap mempool_state('main') row must be back in its
 	// UNINITIALIZED state after re-creation, exactly as migration 0002's
