@@ -81,39 +81,49 @@ func TestMigrationRoundTrip_0004PreservesExistingData(t *testing.T) {
 	mempoolBefore := fingerprintTables(t, ctx, pool, mempoolTables)
 	deploymentBefore := fingerprintTables(t, ctx, pool, deploymentTablesForNonMutation)
 
-	// v4 -> v3: roll back ONLY 0004. Unlike 0003's round trip, nothing is
-	// layered on top of 0004, so Down(1) targets it directly.
-	rolledBack, err := store.Down(ctx, pool, migrations, 1)
+	// vN -> v3: roll back 0004 and everything layered on top of it since
+	// (0005 block_supply_rollup, Phase 2H.2a; any future migration), newest
+	// version first. Computed as len(migrations)-3 rather than a hardcoded
+	// step count so this test doesn't need editing again the next time a
+	// migration is added on top.
+	steps := len(migrations) - 3
+	rolledBack, err := store.Down(ctx, pool, migrations, steps)
 	if err != nil {
-		t.Fatalf("Down(1): %v", err)
+		t.Fatalf("Down(%d): %v", steps, err)
 	}
-	if len(rolledBack) != 1 || rolledBack[0] != 4 {
-		t.Fatalf("Down(1) rolled back %v, want [4]", rolledBack)
+	if len(rolledBack) != steps {
+		t.Fatalf("Down(%d) rolled back %v, want %d versions", steps, rolledBack, steps)
 	}
 	if tableExistsIn(t, ctx, pool, "block_accounting") {
-		t.Fatal("block_accounting table still present after rolling back 0004")
+		t.Fatal("block_accounting table still present after rolling back 0004+")
+	}
+	if tableExistsIn(t, ctx, pool, "block_supply_rollup") {
+		t.Fatal("block_supply_rollup table still present after rolling back 0004+")
 	}
 	if !tableExistsIn(t, ctx, pool, "deployment_state") {
-		t.Fatal("deployment_state table (owned by 0003) must survive rolling back 0004")
+		t.Fatal("deployment_state table (owned by 0003) must survive rolling back 0004+")
 	}
 	requireTablesUnchanged(t, ctx, pool, confirmedTables, confirmedBefore)
 	requireTablesUnchanged(t, ctx, pool, mempoolTables, mempoolBefore)
 	requireTablesUnchanged(t, ctx, pool, deploymentTablesForNonMutation, deploymentBefore)
 
-	// v3 -> v4 again: reapply 0004. The table comes back EMPTY — DROP
-	// TABLE really did remove the old rows, and recreating the table via
-	// 0004's up.sql does not (and structurally cannot) restore them. This
-	// is exactly why backfill-accounting exists (spec section 63) —
-	// demonstrated concretely below.
+	// v3 -> vN again: reapply everything just rolled back. block_accounting
+	// comes back EMPTY — DROP TABLE really did remove the old rows, and
+	// recreating the table via 0004's up.sql does not (and structurally
+	// cannot) restore them. This is exactly why backfill-accounting exists
+	// (spec section 63) — demonstrated concretely below.
 	applied, err := store.Up(ctx, pool, migrations)
 	if err != nil {
-		t.Fatalf("Up (reapply 0004): %v", err)
+		t.Fatalf("Up (reapply): %v", err)
 	}
-	if len(applied) != 1 || applied[0] != 4 {
-		t.Fatalf("Up (reapply) applied %v, want [4]", applied)
+	if len(applied) != steps {
+		t.Fatalf("Up (reapply) applied %v, want %d versions", applied, steps)
 	}
 	if !tableExistsIn(t, ctx, pool, "block_accounting") {
 		t.Fatal("block_accounting table missing after reapplying 0004")
+	}
+	if !tableExistsIn(t, ctx, pool, "block_supply_rollup") {
+		t.Fatal("block_supply_rollup table missing after reapplying 0005")
 	}
 	requireTablesUnchanged(t, ctx, pool, confirmedTables, confirmedBefore)
 	requireTablesUnchanged(t, ctx, pool, mempoolTables, mempoolBefore)

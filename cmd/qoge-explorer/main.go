@@ -58,6 +58,8 @@ func main() {
 		os.Exit(runIndex(cfg, log))
 	case "backfill-accounting":
 		os.Exit(runBackfillAccounting(cfg, log))
+	case "backfill-supply-rollup":
+		os.Exit(runBackfillSupplyRollup(cfg, log))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -132,6 +134,45 @@ Usage:
                                      written. signet is rejected as
                                      unsupported (QOGE Core stable has no
                                      stable asserted signet genesis).
+  qoge-explorer backfill-supply-rollup
+                                     Reconstruct block_supply_rollup rows
+                                     (Phase 2H.2a) for the current canonical
+                                     chain (genesis through sync_state's
+                                     tip) from already-indexed PostgreSQL
+                                     data only; never calls Core RPC. Only
+                                     needed on a database that was indexed
+                                     before migration 0005 existed; a
+                                     database indexed entirely on or after
+                                     0005 already has every row (ApplyBlock
+                                     writes it live). Requires
+                                     block_accounting to already be
+                                     complete for every canonical block —
+                                     run backfill-accounting first if not.
+                                     Idempotent and safely restartable.
+                                     REQUIRES the index process to be
+                                     stopped first: this command takes a
+                                     PostgreSQL advisory lock against a
+                                     second CONCURRENT
+                                     backfill-supply-rollup run (in a
+                                     DIFFERENT namespace than
+                                     backfill-accounting's own lock, so the
+                                     two commands never contend with each
+                                     other), but that lock does not, and
+                                     cannot, serialize against a live
+                                     indexer writing new blocks at the same
+                                     time. Also REQUIRES QOGE_NETWORK,
+                                     verified the same way
+                                     backfill-accounting verifies it
+                                     (store.VerifyNetworkIdentity against
+                                     the database's own canonical genesis)
+                                     before writing anything. Before
+                                     publishing any row, independently
+                                     cross-checks its own computed totals
+                                     against a direct full scan of
+                                     utxo_state and block_accounting; any
+                                     disagreement aborts the entire run
+                                     with zero rows written — see
+                                     docs/ARCHITECTURE.md §27.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -471,6 +512,68 @@ func runBackfillAccounting(cfg config.Config, log *slog.Logger) int {
 	return 0
 }
 
+// runBackfillSupplyRollup reconstructs block_supply_rollup (Phase 2H.2a)
+// for the current canonical chain from PostgreSQL data alone — see
+// store.BackfillSupplyRollup's doc comment for the full atomicity/
+// idempotency/cross-check contract. Mirrors runBackfillAccounting's
+// network-identity preflight EXACTLY (same store.VerifyNetworkIdentity
+// call, same fail-closed-before-any-write policy) even though
+// BackfillSupplyRollup itself never touches the subsidy schedule — the
+// preflight exists to catch the same QOGE_NETWORK misconfiguration
+// backfill-accounting protects against, applied consistently across every
+// write-capable command this codebase has.
+func runBackfillSupplyRollup(cfg config.Config, log *slog.Logger) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+	if cfg.Network == "" {
+		log.Error("config error", "error", "QOGE_NETWORK is not set")
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	if err := store.VerifyNetworkIdentity(ctx, pool, cfg.Network); err != nil {
+		log.Error("network identity preflight failed", "error", err)
+		return 1
+	}
+	log.Info("network identity preflight passed", "network", cfg.Network)
+
+	log.Info("starting supply rollup backfill")
+
+	start := time.Now()
+	result, err := store.BackfillSupplyRollup(ctx, pool)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Error("supply rollup backfill failed", "error", err, "elapsed", elapsed.String())
+		return 1
+	}
+
+	fmt.Println("qoge-explorer backfill-supply-rollup")
+	fmt.Println("-------------------------------------")
+	fmt.Printf("canonical blocks:    %d\n", result.CanonicalBlocks)
+	fmt.Printf("rows inserted:       %d\n", result.Inserted)
+	fmt.Printf("rows verified:       %d\n", result.Verified)
+	if result.CanonicalBlocks > 0 {
+		fmt.Printf("tip:                 %s (height %d)\n", result.TipHash, result.TipHeight)
+	} else {
+		fmt.Println("tip:                 none (sync_state uninitialized; nothing to backfill yet)")
+	}
+	fmt.Printf("elapsed:             %s\n", elapsed)
+
+	log.Info("supply rollup backfill complete", "elapsed", elapsed.String())
+	return 0
+}
+
 // runIndex validates the Core/database/network environment, then runs
 // historical sync + the live reorg-aware polling loop
 // (docs/ARCHITECTURE.md §18) until SIGINT/SIGTERM. It never starts
@@ -525,6 +628,17 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 		return 1
 	}
 	defer pool.Close()
+
+	// Phase 2H.2a: fail fast, before the first live block fetch, if this
+	// database already has an indexed canonical tip but no
+	// block_supply_rollup row for it — e.g. migration 0005 was applied but
+	// backfill-supply-rollup was never run. See
+	// store.VerifySupplyRollupCoverage's doc comment for exactly which
+	// states this does and doesn't flag.
+	if err := store.VerifySupplyRollupCoverage(ctx, pool); err != nil {
+		log.Error("supply rollup coverage preflight failed", "error", err)
+		return 1
+	}
 
 	// Phase 2H.1 correction: the Store used for live indexing must be
 	// bound to the SAME network cfg.Network/ValidateStartup already
