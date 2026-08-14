@@ -71,9 +71,8 @@ var ErrSupplyIntegrity = errors.New("query: supply integrity check failed")
 //
 // cumulative_excluded_output_satoshis, the sixth column
 // block_supply_rollup stores, is deliberately never exposed here — it
-// exists purely to support the UTXO identity check and
-// internal/store/internal/store's own UTXO cross-check (§27), not as a
-// public metric.
+// exists purely to support the UTXO identity check and internal/store's
+// own UTXO cross-check (§27), not as a public metric.
 type SupplyOverview struct {
 	IndexedHeight int64   `json:"indexed_height"`
 	IndexedHash   *string `json:"indexed_block_hash"`

@@ -43,6 +43,17 @@ func TestSupplyPage_GoldenPath(t *testing.T) {
 	bodyContains(t, rec, "Supply")
 	bodyContains(t, rec, "100.00000000")
 	bodyNotContains(t, rec, "No block has been indexed yet")
+
+	// spec item 5: exact metric labels and corrected terminology must
+	// survive on the rendered page, not just in the query/API layer.
+	bodyContains(t, rec, "Scheduled subsidy")
+	bodyContains(t, rec, "Coinbase outputs")
+	bodyContains(t, rec, "Transaction fees")
+	bodyContains(t, rec, "Unclaimed reward")
+	bodyContains(t, rec, "Current UTXO-set value")
+	bodyContains(t, rec, "encoded in canonical coinbase transaction outputs")
+	bodyContains(t, rec, "input-minus-output value paid as fees")
+	bodyContains(t, rec, "None of the values on this page is labelled circulating supply.")
 }
 
 // TestSupplyPage_RollupUnavailable is spec item 22: an initialized chain

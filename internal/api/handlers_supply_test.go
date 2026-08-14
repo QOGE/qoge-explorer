@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 )
@@ -81,6 +82,100 @@ func TestSupplyEndpoint_GoldenPath(t *testing.T) {
 	}
 	if body.UnclaimedRewardSatoshis != 0 {
 		t.Fatalf("unclaimed_reward_sats = %d, want 0", body.UnclaimedRewardSatoshis)
+	}
+}
+
+// TestSupplyEndpoint_ExactJSONContract is spec item 4: the golden-path JSON
+// response must contain EXACTLY the twelve documented keys — sats fields as
+// JSON integer numbers, qoge fields as JSON strings — and must never leak
+// cumulative_excluded_output_satoshis or any circulating/issued/minted
+// supply field, regardless of naming.
+func TestSupplyEndpoint_ExactJSONContract(t *testing.T) {
+	ctx := context.Background()
+	s, st, _ := newTestServerWithPool(t)
+
+	g := block("api-supply-contract-g", 0, "", coinbaseTx("api-supply-contract-g", 100_00000000, "qApiSupplyContractG"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+
+	rec := doRequest(t, s, "GET", "/api/v1/supply")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode response as map: %v (body=%s)", err, rec.Body.String())
+	}
+
+	wantSatsKeys := []string{
+		"indexed_height",
+		"scheduled_subsidy_sats",
+		"transaction_fees_sats",
+		"coinbase_outputs_sats",
+		"unclaimed_reward_sats",
+		"utxo_set_value_sats",
+	}
+	wantQOGEKeys := []string{
+		"scheduled_subsidy_qoge",
+		"transaction_fees_qoge",
+		"coinbase_outputs_qoge",
+		"unclaimed_reward_qoge",
+		"utxo_set_value_qoge",
+	}
+	wantOtherKeys := []string{"indexed_block_hash"}
+
+	wantKeys := map[string]bool{}
+	for _, k := range wantSatsKeys {
+		wantKeys[k] = true
+	}
+	for _, k := range wantQOGEKeys {
+		wantKeys[k] = true
+	}
+	for _, k := range wantOtherKeys {
+		wantKeys[k] = true
+	}
+
+	if len(raw) != len(wantKeys) {
+		t.Fatalf("got %d keys, want %d: got=%v", len(raw), len(wantKeys), raw)
+	}
+	for k := range raw {
+		if !wantKeys[k] {
+			t.Fatalf("unexpected key %q in response: %v", k, raw)
+		}
+	}
+	for k := range wantKeys {
+		if _, ok := raw[k]; !ok {
+			t.Fatalf("missing expected key %q in response: %v", k, raw)
+		}
+	}
+
+	forbidden := []string{
+		"cumulative_excluded_output_satoshis",
+		"excluded_output_sats",
+		"circulating_supply",
+		"circulating_supply_sats",
+		"issued_supply",
+		"minted_supply",
+	}
+	for _, k := range forbidden {
+		if _, ok := raw[k]; ok {
+			t.Fatalf("forbidden key %q present in response: %v", k, raw)
+		}
+	}
+
+	for _, k := range wantSatsKeys {
+		v := string(raw[k])
+		if len(v) == 0 || v[0] == '"' {
+			t.Fatalf("%s = %s, want a JSON integer number, not a string", k, v)
+		}
+	}
+	for _, k := range wantQOGEKeys {
+		v := string(raw[k])
+		if len(v) == 0 || v[0] != '"' {
+			t.Fatalf("%s = %s, want a JSON string, not a bare number", k, v)
+		}
 	}
 }
 
