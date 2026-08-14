@@ -4670,3 +4670,226 @@ independently useful metrics, but neither is safely labelable
 "circulating supply" without a UI layer carefully choosing its own
 terminology, which is explicitly deferred (Phase 2H.2/2H.3), not decided
 here.
+
+## 27. Supply and monetary accounting read surface (Phase 2H.2)
+
+Phase 2H.2 makes Phase 2H.1's immutable per-block monetary facts
+(`subsidy_satoshis`, `fee_satoshis`, `coinbase_output_satoshis`,
+`unclaimed_reward_satoshis`) READABLE, via `GET /api/v1/supply` and
+`GET /supply`. It is a strict read layer: no indexing change, no
+accounting-writer change, no new mutable monetary state, no migration
+0005, no rich list, no circulating-supply claim. `internal/query/supply.go`
+is the only new production query file; `internal/api/handlers_supply.go`
+and `internal/web/handlers_supply.go` are thin callers, exactly like every
+other Phase 2D.1/2E.1 handler (§19/§20) — neither issues SQL directly.
+
+### Five public metrics, none of them "circulating supply"
+
+`query.Store.SupplyOverview` exposes exactly five monetary quantities,
+each computed exclusively from the CANONICAL chain
+(`blocks.canonical = true`):
+
+- **Scheduled subsidy** (`scheduled_subsidy_sats`/`_qoge`) —
+  `SUM(block_accounting.subsidy_satoshis)`. The consensus subsidy
+  entitlement accumulated by the indexed canonical chain — a ceiling, not
+  necessarily actual issuance, since §26 already established that a miner
+  may validly underclaim.
+- **Transaction fees** (`transaction_fees_sats`/`_qoge`) —
+  `SUM(block_accounting.fee_satoshis)`. Existing value transferred from
+  non-coinbase transaction inputs — never described as newly issued coins.
+- **Coinbase outputs** (`coinbase_outputs_sats`/`_qoge`) —
+  `SUM(block_accounting.coinbase_output_satoshis)`. What canonical
+  coinbase transactions actually paid out — some mix of subsidy and
+  claimed fees, including genesis — and therefore not, by itself, a supply
+  figure.
+- **Unclaimed reward** (`unclaimed_reward_sats`/`_qoge`) —
+  `SUM(block_accounting.unclaimed_reward_satoshis)`. The residual
+  `subsidy + fees - coinbase_output`, which §26 already established cannot
+  generally be partitioned into unclaimed subsidy vs. unclaimed fees. Never
+  labeled "burn", "unissued subsidy", "destroyed coins", or "circulating
+  loss".
+- **Current UTXO-set value** (`utxo_set_value_sats`/`_qoge`) —
+  `COALESCE(SUM(o.value_satoshis), 0)` from `utxo_state` joined to
+  `transaction_outputs` for every currently-unspent row. This is the ONLY
+  metric of the five not sourced from `block_accounting` — it reads
+  current canonical UTXO membership directly, deliberately never via
+  `addresses.balance_satoshis` (§13.A's bare-multisig exclusion would
+  silently undercount) and never conditioned on an output having any
+  `output_addresses` row at all (an eligible unknown/non-addressed output
+  is still a real coin — `TestSupplyOverview_NonAddressUTXOIncluded`).
+
+None of these five fields, and no combination of them, is exposed or
+described as `circulating_supply`/`issued_supply`/`minted_supply`
+anywhere in the API, the HTML page, or this document. The API's JSON keys
+and the HTML page's own text both say explicitly that none of these
+values is circulating supply — see `internal/web/templates/supply.tmpl`.
+
+### Genesis and Core-unspendable outputs: two more reasons `coinbase_outputs != utxo_set_value`
+
+`CoinbaseOutputsSatoshis` and `UTXOSetValueSatoshis` are INTENTIONALLY
+different quantities, for two independent reasons already established at
+the `internal/store` layer (§16 "Core UTXO semantics", this section's own
+§26 predecessor):
+
+- The genesis coinbase output exists as a real `transaction_outputs` row,
+  counts toward both scheduled subsidy and coinbase outputs, but is never
+  inserted into `utxo_state` at all (`applyOutput`'s `isGenesis`
+  exclusion) — Core itself never treats it as spendable.
+- Any output `script.IsUnspendable` classifies as unspendable (OP_RETURN,
+  or a script exceeding `script.MaxScriptSize`) is likewise preserved in
+  `transaction_outputs` (and counted in whichever transaction's total —
+  coinbase or otherwise — it belongs to) but never inserted into
+  `utxo_state`.
+
+Both are proven directly, not just asserted: `TestSupplyOverview_GenesisExcludedFromUTXOSet`
+and `TestSupplyOverview_UnspendableOutputExcluded`. Neither exclusion is
+"corrected" or reconciled — a smaller UTXO-set value than a naive
+`coinbase_outputs - fees` calculation would suggest is expected, not a
+bug, and Phase 2H.2 deliberately does not invent a "burned supply" metric
+to account for the gap (that would require a complete burn taxonomy,
+explicitly out of scope here).
+
+### Canonical-only, with a completeness check — never an understated total
+
+`SupplyOverview`'s core aggregate reads
+
+```sql
+SELECT
+    count(*)                          AS canonical_blocks,
+    count(ba.block_hash)              AS accounted_blocks,
+    COALESCE(sum(ba.subsidy_satoshis), 0), ...
+FROM blocks b
+LEFT JOIN block_accounting ba ON ba.block_hash = b.hash
+WHERE b.canonical
+```
+
+in ONE statement, deliberately via a `LEFT JOIN` rather than an inner join
+or a bare `COALESCE(SUM(...), 0)` over `block_accounting` alone: a
+canonical block with no accounting row still counts toward
+`canonical_blocks` (as a non-NULL `blocks` row joined against NULL
+`block_accounting` columns), while `count(ba.block_hash)` — ordinary SQL
+`COUNT(column)` semantics — only counts the non-NULL join hits. A database
+upgraded from before Phase 2H.1 that has not (yet) run
+`backfill-accounting` (§26) therefore has `accounted_blocks !=
+canonical_blocks`, which `SupplyOverview` detects and rejects with
+`query.ErrAccountingIncomplete` rather than silently summing only the
+rows that happen to exist and returning an understated total. This
+mirrors the exact "source-data completeness, not just presence" principle
+§26 already applies to `BackfillBlockAccounting`'s own NULL-fee/missing-
+coinbase-output detection — the identical class of silent-undercount bug,
+caught the same way, one layer up.
+
+An orphaned block's missing accounting row must NOT trigger this: only
+canonical coverage matters (`TestSupplyOverview_OrphanAccountingMissingDoesNotBlockCanonical`),
+since an orphan never contributes to canonical totals in the first place —
+`RollbackTo` never deletes a demoted block's `block_accounting` row (§26),
+it just stops mattering to this query's `WHERE b.canonical`.
+
+`internal/api`'s `handleSupply` maps `ErrAccountingIncomplete` to HTTP 503
+with the stable code `accounting_incomplete`; `internal/web`'s equivalent
+handler renders an explanatory HTML 503 mentioning
+`qoge-explorer backfill-accounting` as the operator remediation. Neither
+handler ever exposes a SQL string or other internal detail.
+
+### REPEATABLE READ snapshot: one coherent response, never a mixed one
+
+`SupplyOverview` opens one `Store.readTx` (`REPEATABLE READ`, `ReadOnly`)
+— the same composite-read-snapshot pattern `ExplorerOverview`/
+`DeploymentOverview` already use (§20/§25) — and reads, in order, inside
+that single transaction: the `sync_state` anchor (`statusFrom`), then the
+canonical accounting aggregate, then the current UTXO-set value, firing
+the existing `snapshotTestHook` immediately after the first statement.
+Because PostgreSQL fixes a REPEATABLE READ transaction's snapshot at its
+first statement and holds it for every later statement in the same
+transaction, a concurrent `ApplyBlock`/`RollbackTo` committing between
+these reads can never produce a response that pairs one canonical state's
+height/hash with another canonical state's monetary totals —
+`TestSnapshotConsistency_SupplyOverview_ConcurrentReorg` proves this
+deterministically (no `sleep`) exactly the way §19/§20's own snapshot
+tests do: an in-flight `SupplyOverview` whose snapshot was fixed on branch
+A (an underclaiming block) must still report branch A's totals in full
+even after a real, concurrent reorg to branch B (a full claim) commits
+mid-flight, while a fresh call issued afterward sees branch B in full.
+
+An uninitialized explorer (`sync_state.indexed_height = -1`, no blocks at
+all) is a valid HTTP 200 with every total at zero — `canonical_blocks` and
+`accounted_blocks` are both 0, so the completeness check trivially passes.
+The HTML page renders "No block has been indexed yet."; this is never
+described as, or confused with, "chain supply of zero."
+
+### Aggregate identity: defense in depth, in Go, with checked arithmetic
+
+Every individual `block_accounting` row already satisfies
+`block_accounting_reward_identity` (§26: `coinbase_output + unclaimed ==
+subsidy + fee`, DB-enforced). `SupplyOverview` re-verifies the AGGREGATE
+form of the same identity independently, in Go, using a checked `int64`
+addition (`checkedAddInt64` — duplicated from, not imported from,
+`internal/accounting`'s own `checkedAdd`, since `internal/query` must not
+depend on a write-adjacent package for two lines of arithmetic): summing
+already-individually-valid rows is cheap to get wrong in a way no single
+row's CHECK constraint would ever catch, so this is genuine defense in
+depth, not a redundant restatement. A failure here — `query.ErrSupplyIntegrity`
+— can only mean database corruption or an aggregation bug; `SupplyOverview`
+returns no data rather than a value it cannot vouch for.
+
+PostgreSQL's `SUM(BIGINT)` itself returns `NUMERIC`, not `int8` — the same
+scan-into-`int64` pattern this codebase already uses elsewhere
+(`recomputeAddress`'s balance aggregation, `BackfillBlockAccounting`'s fee/
+coinbase-output sums, both in `internal/store`) is reused here rather than
+inventing a new one, and it fails loudly (a Go `error` from `Scan`, never
+a silently wrapped/truncated value) if a corrupted or artificially extreme
+aggregate does not fit `int64` —
+`TestSupplyOverview_AggregateOverflowFailsLoudly` proves this directly by
+inflating two blocks' `block_accounting` rows (via test-only raw SQL,
+something real indexing's own checked arithmetic would never produce) to
+a magnitude whose SUM exceeds `math.MaxInt64`, and asserting
+`SupplyOverview` fails rather than returning a wrapped/negative-looking
+total.
+
+### UTXO-set value: real benchmark, no cache
+
+Per this phase's own instruction to benchmark before adding any caching
+layer, `internal/query`'s two aggregate queries were measured with
+`EXPLAIN (ANALYZE, BUFFERS)` against a real local PostgreSQL instance (the
+only PostgreSQL available in this development environment — there is no
+separate production-scale explorer database to measure against here),
+seeded with 25,000 synthetic canonical blocks (25,000 `block_accounting`
+rows, 24,999 unspent `utxo_state` rows — one fewer than blocks because
+genesis's coinbase output is never inserted into `utxo_state` at all, per
+above):
+
+| Query | Plan | Execution time |
+|---|---|---|
+| Canonical accounting aggregate | Hash Left Join, sequential scans on `blocks` (25,000 rows) and `block_accounting` (25,000 rows) | 29.3 ms |
+| UTXO-set value aggregate | Hash Join, sequential scans on `utxo_state` (24,999 unspent rows) and `transaction_outputs` (25,000 rows) | 19.8 ms |
+| Combined `SupplyOverview` (one REPEATABLE READ transaction, both queries plus the `sync_state` read) | — | ~45 ms, both cold and warm |
+
+Both plans choose a sequential scan on purpose, not for lack of an index:
+each query aggregates over (effectively) the entire table, so a full scan
+is the CORRECT plan regardless of indexing — an index on
+`block_accounting.block_hash`/`utxo_state (txid, vout_index)` (both
+already indexed, being primary keys) cannot make a whole-table aggregate
+cheaper than reading the whole table. No new index was added, and per
+this phase's own instruction, none is proposed: 45 ms combined is
+comfortably inside the "≤ 1 second" target with no caching layer, so
+`SupplyOverview` performs direct PostgreSQL aggregation on every request
+— no materialized view, no refresh job, no indexer-side running counter,
+no new migration. If a future, much larger chain ever makes this
+materially slower, that is a separately reviewed architecture decision,
+not one made speculatively here.
+
+### What Phase 2H.2 deliberately does not do
+
+No charts, no historical supply graph, no issuance-by-height graph, no
+AJAX polling, no `live.js` change, no homepage summary card — the existing
+`/supply` page is deliberately static per request, matching every other
+Phase 2E.1/2F.2/2G.2 page before live-refresh was separately, explicitly
+added (§21). No rich list, no `/addresses`, no top-balances/distribution
+view — deferred to Phase 2H.3. No `issued_supply`/`actual_supply`/
+`minted_supply` field: the relationship between scheduled subsidy,
+unclaimed reward, genesis, and Core-unspendable outputs makes a casual
+single "supply" number for public display unsafe without a separately
+reviewed semantic definition (§26's "Scheduled subsidy total" bullet) —
+Phase 2H.2 instead exposes the five source facts directly and lets the
+reader combine them with full context, which is exactly what
+`templates/supply.tmpl`'s explanatory text does.
