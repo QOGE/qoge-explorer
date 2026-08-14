@@ -30,15 +30,15 @@
   <dd>The consensus subsidy entitlement accumulated by the indexed canonical chain. It is not necessarily actual issuance: a miner may validly claim less than the maximum available reward.</dd>
 
   <dt>Coinbase outputs</dt>
-  <dd>The total value actually paid by canonical coinbase transaction outputs, including claimed transaction fees and the genesis coinbase.</dd>
+  <dd>The total value encoded in canonical coinbase transaction outputs, including claimed transaction fees and the genesis coinbase.</dd>
 
   <dt>Transaction fees</dt>
-  <dd>The total fees paid by canonical non-coinbase transactions &mdash; existing value transferred from transaction inputs, never newly issued coins.</dd>
+  <dd>The total input-minus-output value paid as fees by canonical non-coinbase transactions. Fees are existing value, not new issuance.</dd>
 
   <dt>Unclaimed reward</dt>
   <dd>The difference between the maximum available block reward and the actual coinbase payout. It cannot generally be uniquely split into unclaimed subsidy versus unclaimed fees, and is never described as burned or destroyed coins.</dd>
 
   <dt>Current UTXO-set value</dt>
-  <dd>The value currently represented by outputs the explorer tracks in Core-equivalent canonical UTXO state. It excludes the genesis coinbase output and any output Core itself never treats as spendable (for example OP_RETURN outputs).</dd>
+  <dd>The value currently represented by outputs the explorer tracks in Core-equivalent canonical UTXO state at the indexed tip. It excludes the genesis coinbase output and any output Core itself never treats as spendable (for example OP_RETURN outputs).</dd>
 </dl>
 {{end}}

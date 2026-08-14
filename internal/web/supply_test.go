@@ -45,26 +45,26 @@ func TestSupplyPage_GoldenPath(t *testing.T) {
 	bodyNotContains(t, rec, "No block has been indexed yet")
 }
 
-// TestSupplyPage_AccountingIncomplete is spec item 19: incomplete canonical
-// accounting renders an explanatory HTTP 503 mentioning the operator
-// remediation, never a partial page.
-func TestSupplyPage_AccountingIncomplete(t *testing.T) {
+// TestSupplyPage_RollupUnavailable is spec item 22: an initialized chain
+// whose indexed tip has no block_supply_rollup row renders an explanatory
+// HTTP 503 mentioning the operator remediation, never a partial page.
+func TestSupplyPage_RollupUnavailable(t *testing.T) {
 	ctx := context.Background()
 	s, st, pool := newTestServerWithPool(t)
 
-	g := block("web-supply-incomplete-g", 0, "", coinbaseTx("web-supply-incomplete-g", 100_00000000, "qWebSupplyIncG"))
+	g := block("web-supply-unavail-g", 0, "", coinbaseTx("web-supply-unavail-g", 100_00000000, "qWebSupplyUnavailG"))
 	if err := st.ApplyBlock(ctx, g); err != nil {
 		t.Fatalf("apply genesis: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", g.Hash); err != nil {
-		t.Fatalf("delete block_accounting: %v", err)
+	if _, err := pool.Exec(ctx, "DELETE FROM block_supply_rollup WHERE block_hash = $1", g.Hash); err != nil {
+		t.Fatalf("delete block_supply_rollup: %v", err)
 	}
 
 	rec := doRequest(t, s, "GET", "/supply")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503, body=%s", rec.Code, rec.Body.String())
 	}
-	bodyContains(t, rec, "backfill-accounting")
+	bodyContains(t, rec, "backfill-supply-rollup")
 }
 
 // TestSupplyPage_MethodNotAllowed mirrors

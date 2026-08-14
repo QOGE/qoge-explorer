@@ -4998,3 +4998,265 @@ Phase 2H.2b — adapting the previously-benchmarked-and-rejected `/supply`
 read surface (PR #14) to read from `block_supply_rollup` instead of
 aggregating live — is deliberately deferred to a separate PR, after this
 one merges.
+
+## 28. Supply and monetary accounting read surface (Phase 2H.2b)
+
+Phase 2H.2b makes §27's immutable `block_supply_rollup` foundation
+READABLE, via `GET /api/v1/supply` and `GET /supply` — the read surface
+originally attempted in Phase 2H.2 (PR #14) by directly aggregating
+`blocks`/`block_accounting`/`utxo_state`/`transaction_outputs` on every
+request. That original design was **benchmarked and rejected**: at
+2,500,000 synthetic canonical blocks, combined `SupplyOverview` measured
+5.6-7.7 seconds, cold and warm, 6-8x over the 1-second target (full
+numbers preserved in that work's own history, not reproduced here — its
+25,000-row, ~45 ms result was real but did not validate the full-chain
+path). Rather than bolt a cache or a mutable counter onto a fundamentally
+`O(chain size)` design, §27 replaced the data source itself with an
+immutable, reorg-safe, `O(1)`-lookup rollup; this section is the thin
+public layer on top of it.
+
+### Architecture: one exact primary-key lookup, nothing else
+
+```
+sync_state('main').indexed_block_hash
+    ->
+block_supply_rollup.block_hash PRIMARY KEY
+    ->
+cumulative values
+```
+
+`SupplyOverview` (`internal/query/supply.go`) opens one read-only
+`REPEATABLE READ` transaction (`readTx`, same pattern
+`ExplorerOverview`/`DeploymentOverview`/§27's own `SupplyOverview`
+predecessor already used) and reads, in order: the `sync_state` anchor
+(`statusFrom`), then — for an initialized explorer — exactly one
+`block_supply_rollup` row, by primary key, at that anchor's own hash:
+
+```sql
+SELECT
+    cumulative_subsidy_satoshis,
+    cumulative_fee_satoshis,
+    cumulative_coinbase_output_satoshis,
+    cumulative_unclaimed_reward_satoshis,
+    cumulative_excluded_output_satoshis,
+    cumulative_utxo_set_value_satoshis
+FROM block_supply_rollup
+WHERE block_hash = $1
+```
+
+No join. There is, deliberately, no request-time `SUM(block_accounting...)`,
+`COUNT(blocks...)`, `blocks.canonical` scan, `utxo_state`/
+`transaction_outputs` scan, or ancestry walk anywhere in this package —
+`checkCanonicalShape` and the old `canonicalAccountingAggregateFrom`/
+`utxoSetValueFrom` helpers from the rejected design are gone entirely, not
+merely unused. §27's own `TestSupplyRollupBenchmark_TipLookup` already
+measured this exact access pattern at 2.5M rows (6.0 ms cold, ~0.6-0.8 ms
+warm — reproduced in §27, not repeated here); this phase adds only a
+`sync_state` read, the one PK lookup, and constant-time Go arithmetic/
+formatting on top, so that benchmark's number is, to first order, still
+`SupplyOverview`'s number. No new cache, materialized view, or mutable
+counter was added on top of it — §27's own architecture note applies
+unchanged.
+
+### Public JSON contract
+
+Exactly these fields, `chain.Amount(...).String()` for every QOGE-string
+field (never a float, never scientific notation):
+
+```json
+{
+  "indexed_height": ...,
+  "indexed_block_hash": "...",
+
+  "scheduled_subsidy_sats": ...,
+  "scheduled_subsidy_qoge": "...",
+
+  "transaction_fees_sats": ...,
+  "transaction_fees_qoge": "...",
+
+  "coinbase_outputs_sats": ...,
+  "coinbase_outputs_qoge": "...",
+
+  "unclaimed_reward_sats": ...,
+  "unclaimed_reward_qoge": "...",
+
+  "utxo_set_value_sats": ...,
+  "utxo_set_value_qoge": "..."
+}
+```
+
+Exactly five monetary metrics — `block_supply_rollup`'s sixth column,
+`cumulative_excluded_output_satoshis`, is read (it's required by the UTXO
+identity check below) but never exposed publicly. There is no
+`circulating_supply` or `issued_supply` field, in code or in this
+document, for the same reasons §26 gave: genesis is intentionally absent
+from Core's own coins view, Core-unspendable outputs are absent from
+`utxo_state`, and neither `scheduled_subsidy`/`coinbase_outputs` alone is
+safely labelable "supply" without a UI carefully choosing its own
+terminology, which is exactly what `templates/supply.tmpl`'s explanatory
+text does (see "Terminology" below).
+
+### Terminology
+
+Each metric's public wording is deliberately precise about what it is and
+is not:
+
+- **Scheduled subsidy** — "The consensus subsidy entitlement accumulated
+  through the indexed canonical tip." Not necessarily actual issuance,
+  since §26 already established a miner may validly underclaim.
+- **Coinbase outputs** — "The total value encoded in canonical coinbase
+  transaction outputs, including claimed transaction fees and the genesis
+  coinbase." Deliberately "encoded in", not "actually paid": genesis's
+  coinbase output value is counted here even though Core never places it
+  in the spendable UTXO set (see "Genesis" below).
+- **Transaction fees** — "The total input-minus-output value paid as fees
+  by canonical non-coinbase transactions. Fees are existing value, not new
+  issuance." Never described as fully transferred to a miner — a block's
+  reward can be underclaimed.
+- **Unclaimed reward** — `subsidy + fees - coinbase_output`. Cannot
+  generally be uniquely partitioned into unclaimed subsidy versus
+  unclaimed fees, and is never called burn, destroyed coins, unissued
+  subsidy, or circulating loss.
+- **Current UTXO-set value** — labelled exactly that, never "circulating
+  supply", "spendable supply", or "issued supply". The value represented
+  by the explorer's Core-equivalent canonical UTXO state at the indexed
+  tip; genesis and Core-excluded outputs are not represented there.
+
+`templates/supply.tmpl` states prominently: "None of the values on this
+page is labelled circulating supply."
+
+### Genesis and Core-excluded outputs
+
+At a genesis-only chain: scheduled subsidy = coinbase outputs = the
+genesis subsidy, fees = unclaimed = UTXO-set value = 0 — genesis
+contributes to subsidy and coinbase outputs but never to UTXO-set value,
+exactly mirroring §27's `localExcludedOutputValue` (every output at height
+0 is excluded, unconditionally). The same exclusion applies at any height
+to OP_RETURN outputs and any output whose `scriptPubKey` exceeds
+`script.MaxScriptSize` — both covered by dedicated tests
+(`TestSupplyOverview_UnspendableOutputExcluded`,
+`TestSupplyOverview_OversizedScriptExcluded`). A spendable output with no
+`output_addresses` row (unrecognized/non-address script) still
+contributes to UTXO-set value — the public read has zero dependency on
+`addresses`/`output_addresses`/`output_participants`
+(`TestSupplyOverview_NonAddressUTXOIncluded`).
+
+### Integrity: two identities, checked in Go, from one row
+
+`checkSupplyRollupIdentities` (`internal/query/supply.go`) is a small,
+pure, DB-independent helper re-verifying, with checked `int64` arithmetic,
+the same two identities `migrations/0005_block_supply_rollup.up.sql`
+already enforces as CHECK constraints on the row itself:
+
+- **Reward identity**: `coinbase_outputs + unclaimed_reward ==
+  scheduled_subsidy + transaction_fees`.
+- **UTXO identity**: `utxo_set_value + transaction_fees + excluded_output
+  == coinbase_outputs` — this is why `cumulative_excluded_output_satoshis`
+  must be read even though it's never returned publicly.
+
+This is cheap defense in depth, not a redundant restatement of the CHECK
+constraints: being pure and DB-independent, it is directly unit-testable
+against reward mismatch, UTXO mismatch, and arithmetic overflow in both
+identities without corrupting a real row past its own constraints
+(`supply_identity_test.go`) — the same testability argument §26 made for
+its own checked-arithmetic functions. A failure here — or `sync_state`
+reporting `indexed_height >= 0` with a NULL `indexed_block_hash`, a state
+`sync_state_validate_checkpoint_trigger` should make unreachable through
+supported writes — returns `ErrSupplyIntegrity`, mapped to HTTP/HTML 500
+with no internal detail exposed.
+
+### Administrative trust boundary
+
+A privileged raw-SQL writer can, in principle, construct a
+constraint-valid but source-false `block_supply_rollup` row by changing
+several of its columns consistently (satisfying both CHECK constraints and
+`checkSupplyRollupIdentities` while still being wrong relative to the
+actual indexed chain). The public `O(1)` read deliberately trusts the
+persisted immutable tip row — detecting that class of corruption is
+`backfill-supply-rollup`'s job (its own independent cross-check against a
+direct scan of `utxo_state`/`block_accounting` — §27), replay
+verification, or database/operator integrity monitoring, never a
+per-request full-chain recomputation. Reintroducing a source scan on every
+request to defend against a threat model requiring raw database write
+access in the first place would recreate exactly the performance problem
+§27 was built to solve, against an attacker who could corrupt the source
+tables just as easily as the rollup.
+
+### Missing-rollup handling: HTTP 503, not 500 or a partial page
+
+An **uninitialized** explorer (`indexed_height = -1`, no blocks at all) is
+a valid HTTP 200 with every total at `0`/`"0.00000000"` — `zeroSupplyOverview`
+looks up no rollup row at all in this case, and this is never described as
+"chain supply of zero".
+
+An **initialized** explorer whose indexed tip has no `block_supply_rollup`
+row — not yet backfilled, or a database migrated only through 0004 (the
+table itself doesn't exist, PostgreSQL SQLSTATE `42P01`,
+`undefined_table`) — returns `ErrSupplyRollupUnavailable`. Both cases are
+deliberately not distinguished publicly; an operator gets the same
+remediation either way. `internal/api` maps this to HTTP 503 with stable
+JSON code `supply_rollup_unavailable`; `internal/web` renders an HTML 503
+naming both `qoge-explorer backfill-supply-rollup` and (if accounting
+itself was never backfilled) `qoge-explorer backfill-accounting`. Neither
+handler ever exposes a SQL string or other internal detail — the
+`pgconn.PgError`/SQLSTATE inspection happens once, inside
+`supplyRollupValuesFrom`, and only ever produces the same public sentinel
+error.
+
+An orphaned block's `block_supply_rollup` row being missing (deleted, or
+simply never backfilled for a pre-rollup orphan) does not affect a read
+anchored at the current indexed tip — `TestSupplyOverview_OrphanRollupMissing`
+proves this directly; public state depends ONLY on the exact indexed tip's
+own row, never on any other block's.
+
+### REPEATABLE READ snapshot, and why reorg safety is now structural, not just transactional
+
+`SupplyOverview` fires the existing `snapshotTestHook` immediately after
+its first statement (`statusFrom`), exactly as `ExplorerOverview`/
+`DeploymentOverview`/§27's own predecessor already do, so a concurrent
+`ApplyBlock`/`RollbackTo` committing between the anchor read and the
+rollup-row read can never produce a response pairing one canonical state's
+height/hash with another canonical state's monetary totals within a
+single request —
+`TestSnapshotConsistency_SupplyOverview_ConcurrentApplyBlock` (a real,
+concurrent chain extension) and
+`TestSnapshotConsistency_SupplyOverview_ConcurrentReorg` (a real,
+concurrent rollback + re-apply) both prove this deterministically, no
+`sleep`.
+
+This design is **more robust than transaction isolation alone**, though:
+because `block_supply_rollup` rows are immutable and never deleted by
+`RollbackTo` (§27's own invariant), the row a captured indexed hash names
+continues to exist and continues to mean the same thing indefinitely, even
+outside any transaction boundary. If a concurrent reorg changes the
+canonical tip from A to B between two entirely separate requests, the
+first request's in-flight response (already anchored to A) remains
+internally consistent purely because A's row is permanent — the
+`REPEATABLE READ` snapshot handles the single-request case; row
+immutability is what makes even a response already "in flight" past its
+own snapshot never able to observe a half-migrated state.
+
+### Non-mutation and Core independence
+
+`TestSupplyEndpoint_*`/`TestSupplyPage_*`'s non-mutation coverage
+fingerprints every relevant table (`blocks`, `transactions`,
+`transaction_inputs`, `transaction_outputs`, `block_transactions`,
+`utxo_state`, `addresses`, `block_accounting`, `block_supply_rollup`,
+`sync_state`, mempool and deployment tables) before/after a `SupplyOverview`/
+API/HTML read: no reader path writes. `TestRootHandler_SupplyRoutesCoreIndependent`
+(`cmd/qoge-explorer/serve_test.go`) confirms `/api/v1/supply` and `/supply`
+both work with `QOGE_RPC_USER`/`QOGE_RPC_PASSWORD` unset — structural, not
+coincidental, since `newRootHandler` is built from only a `*query.Store`
+and `serve` never constructs an RPC client.
+
+### Phase boundary
+
+Production changes are confined to `internal/query/supply.go`,
+`internal/api/handlers_supply.go`, `internal/web/handlers_supply.go`, and
+`internal/web/templates/supply.tmpl`. `internal/store`, `internal/accounting`,
+`internal/indexer`, `internal/mempool`, `internal/deployments`,
+`internal/rpc`, `internal/decode`, `internal/script`, and `internal/chain`
+are **untouched** — §27's rollup foundation is frozen; this phase only
+reads it. No new migration (`0001`-`0005` unchanged; no `0006`). No rich
+list, address rankings, or distribution chart — those remain out of scope
+for a future phase, not this one.

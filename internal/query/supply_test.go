@@ -3,19 +3,20 @@ package query
 import (
 	"context"
 	"errors"
-	"math"
+	"os"
 	"testing"
 
 	"github.com/QOGE/qoge-explorer/internal/chain"
 	"github.com/QOGE/qoge-explorer/internal/script"
+	"github.com/QOGE/qoge-explorer/internal/store"
 )
 
 const qoge = int64(chain.SatoshisPerQOGE)
 
 // coinbaseTxMulti builds a coinbase transaction with an arbitrary output
 // set — coinbaseTx (fixtures_test.go) only supports exactly one output,
-// which isn't enough to build an OP_RETURN-alongside-a-spendable-output or
-// a no-address fixture.
+// which isn't enough to build an OP_RETURN/oversized-script-alongside-a-
+// spendable-output or a no-address fixture.
 func coinbaseTxMulti(label string, outs []chain.Output) chain.Transaction {
 	txid := fakeHash(label + "-tx")
 	return chain.Transaction{
@@ -47,7 +48,7 @@ func p2pkhOutput(index uint32, valueSats int64, label, addr string) chain.Output
 // nulldataOutput builds a structurally valid OP_RETURN output — Core-
 // unspendable, so internal/store's applyOutput never adds it to
 // utxo_state even though it carries value and is faithfully preserved in
-// transaction_outputs (docs/ARCHITECTURE.md §2 item 3, §26).
+// transaction_outputs (docs/ARCHITECTURE.md §2 item 3, §27).
 func nulldataOutput(index uint32, valueSats int64) chain.Output {
 	return chain.Output{
 		Index:        index,
@@ -57,12 +58,28 @@ func nulldataOutput(index uint32, valueSats int64) chain.Output {
 	}
 }
 
+// oversizedScriptOutput builds a structurally valid, non-OP_RETURN output
+// whose scriptPubKey exceeds script.MaxScriptSize — the OTHER
+// script.IsUnspendable branch, independent of OP_RETURN (spec item 34).
+func oversizedScriptOutput(index uint32, valueSats int64) chain.Output {
+	s := make([]byte, script.MaxScriptSize+1)
+	for i := range s {
+		s[i] = 0x51 // OP_TRUE-ish filler, deliberately NOT OP_RETURN
+	}
+	return chain.Output{
+		Index:        index,
+		Value:        chain.Amount(valueSats),
+		ScriptPubKey: s,
+		ScriptType:   script.TypeUnknown,
+	}
+}
+
 // unknownNoAddressOutput builds a structurally valid, spendable-in-
 // principle output whose script this codebase's classifier does not
 // recognize (script_type='unknown') and which therefore has no owning
 // address at all (Address left unset) — proving SupplyOverview's UTXO-set
-// value comes from utxo_state/transaction_outputs directly, never from
-// output_addresses/addresses (spec item 25/47).
+// value comes from the rollup's own cumulative total, never from
+// output_addresses/addresses (spec item 35).
 func unknownNoAddressOutput(index uint32, valueSats int64) chain.Output {
 	return chain.Output{
 		Index:        index,
@@ -72,10 +89,10 @@ func unknownNoAddressOutput(index uint32, valueSats int64) chain.Output {
 	}
 }
 
-// TestSupplyOverview_EmptyDatabase is spec item 41: a freshly migrated
+// TestSupplyOverview_EmptyDatabase is spec item 18: a freshly migrated
 // database with no blocks at all is a valid HTTP 200 (query-layer: a valid
-// zero-value SupplyOverview, no error) — never confused with "chain supply
-// of zero".
+// zero-value SupplyOverview, no error, no rollup row required) — never
+// confused with "chain supply of zero".
 func TestSupplyOverview_EmptyDatabase(t *testing.T) {
 	ctx := context.Background()
 	q, _, _ := newTestQueryStore(t)
@@ -106,12 +123,13 @@ func TestSupplyOverview_EmptyDatabase(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_SingleBlock is spec item 42 (plus item 54's exact
-// sats/QOGE format check): one genesis block, fully claimed (coinbase ==
-// subsidy, no fees) — the simplest non-empty case. Genesis is never placed
-// into utxo_state (internal/store's applyOutput), so UTXOSetValueSatoshis
-// is legitimately 0 here; the exclusion is exercised with a non-zero
-// result by TestSupplyOverview_GenesisExcludedFromUTXOSet below.
+// TestSupplyOverview_SingleBlock is the simplest non-empty case: one
+// genesis block, fully claimed (coinbase == subsidy, no fees) — exercises
+// the exact rollup PK lookup end to end, plus the exact sats/QOGE format.
+// Genesis is never placed into utxo_state (internal/store's applyOutput),
+// so UTXOSetValueSatoshis is legitimately 0 here; the exclusion is
+// exercised with a non-zero result by
+// TestSupplyOverview_GenesisExcludedFromUTXOSet below.
 func TestSupplyOverview_SingleBlock(t *testing.T) {
 	ctx := context.Background()
 	q, st, _ := newTestQueryStore(t)
@@ -151,7 +169,7 @@ func TestSupplyOverview_SingleBlock(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_GenesisExcludedFromUTXOSet is spec item 45: genesis
+// TestSupplyOverview_GenesisExcludedFromUTXOSet is spec item 33: genesis
 // contributes to scheduled subsidy AND coinbase outputs, but its output is
 // never spendable — a critical semantic regression to keep pinned down.
 func TestSupplyOverview_GenesisExcludedFromUTXOSet(t *testing.T) {
@@ -182,7 +200,7 @@ func TestSupplyOverview_GenesisExcludedFromUTXOSet(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_FullClaim is spec item 44: coinbase == subsidy + fees
+// TestSupplyOverview_FullClaim is spec item 36: coinbase == subsidy + fees
 // implies unclaimed_reward == 0. Built with a real fee (via a spend tx),
 // not just the trivial fee=0 case TestSupplyOverview_SingleBlock already
 // covers.
@@ -221,9 +239,10 @@ func TestSupplyOverview_FullClaim(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_Underclaim is spec item 43: a positive fee with a
+// TestSupplyOverview_Underclaim is spec item 37: a positive fee with a
 // coinbase payout strictly less than subsidy+fee must report a positive,
-// accurate unclaimed_reward — never described anywhere as burn.
+// accurate unclaimed_reward — never described anywhere as burn — and the
+// response must satisfy both the reward and UTXO identities.
 func TestSupplyOverview_Underclaim(t *testing.T) {
 	ctx := context.Background()
 	q, st, _ := newTestQueryStore(t)
@@ -259,18 +278,22 @@ func TestSupplyOverview_Underclaim(t *testing.T) {
 	if want := 11 * qoge; got.UnclaimedRewardSatoshis != want {
 		t.Errorf("UnclaimedRewardSatoshis = %d, want %d", got.UnclaimedRewardSatoshis, want)
 	}
-	// Aggregate identity (spec item 53/22), checked directly against the
-	// response: coinbase_outputs + unclaimed_reward == scheduled_subsidy +
-	// transaction_fees.
+	// Reward identity, checked directly against the response: coinbase +
+	// unclaimed == scheduled_subsidy + transaction_fees. (The UTXO
+	// identity also holds, over cumulative_excluded_output_satoshis — but
+	// that field is deliberately never exposed publicly, so it isn't
+	// re-derivable from SupplyOverview's own JSON-visible fields here; it
+	// has direct coverage in checkSupplyRollupIdentities's own tests and
+	// in internal/store's rollup tests.)
 	if lhs, rhs := got.CoinbaseOutputsSatoshis+got.UnclaimedRewardSatoshis, got.ScheduledSubsidySatoshis+got.TransactionFeesSatoshis; lhs != rhs {
-		t.Errorf("aggregate identity violated: coinbase+unclaimed=%d, subsidy+fees=%d", lhs, rhs)
+		t.Errorf("reward identity violated: coinbase+unclaimed=%d, subsidy+fees=%d", lhs, rhs)
 	}
 }
 
-// TestSupplyOverview_UnspendableOutputExcluded is spec item 46: a
-// Core-unspendable (OP_RETURN) output contributes to coinbase_output_total
-// (it's part of what the coinbase transaction actually paid) but never to
-// UTXO-set value.
+// TestSupplyOverview_UnspendableOutputExcluded is spec item 34: Core-
+// unspendable outputs (both OP_RETURN and >MaxScriptSize) contribute to
+// coinbase_outputs (they're part of the value encoded in the coinbase
+// transaction's outputs) but never to UTXO-set value.
 func TestSupplyOverview_UnspendableOutputExcluded(t *testing.T) {
 	ctx := context.Background()
 	q, st, _ := newTestQueryStore(t)
@@ -299,11 +322,42 @@ func TestSupplyOverview_UnspendableOutputExcluded(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_NonAddressUTXOIncluded is spec item 47/25: an eligible
+// TestSupplyOverview_OversizedScriptExcluded is the other
+// script.IsUnspendable branch (spec item 34), independent of OP_RETURN.
+func TestSupplyOverview_OversizedScriptExcluded(t *testing.T) {
+	ctx := context.Background()
+	q, st, _ := newTestQueryStore(t)
+
+	g := block("supply-oversized-g", 0, "", coinbaseTx("supply-oversized-g", 100*qoge, "qSupplyOversizedG"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+	h1 := block("supply-oversized-h1", 1, g.Hash, coinbaseTxMulti("supply-oversized-h1", []chain.Output{
+		p2pkhOutput(0, 99*qoge, "supply-oversized-h1-normal", "qSupplyOversizedH1"),
+		oversizedScriptOutput(1, 1*qoge),
+	}))
+	if err := st.ApplyBlock(ctx, h1); err != nil {
+		t.Fatalf("apply height 1: %v", err)
+	}
+
+	got, err := q.SupplyOverview(ctx)
+	if err != nil {
+		t.Fatalf("SupplyOverview: %v", err)
+	}
+	if want := 200 * qoge; got.CoinbaseOutputsSatoshis != want {
+		t.Errorf("CoinbaseOutputsSatoshis = %d, want %d (includes the oversized-script output's value)", got.CoinbaseOutputsSatoshis, want)
+	}
+	if want := 99 * qoge; got.UTXOSetValueSatoshis != want {
+		t.Errorf("UTXOSetValueSatoshis = %d, want %d (oversized-script output must be excluded)", got.UTXOSetValueSatoshis, want)
+	}
+}
+
+// TestSupplyOverview_NonAddressUTXOIncluded is spec item 35: an eligible
 // output with no output_addresses row (an unrecognized script here — bare
 // multisig is the production example, but the point under test is
 // identical: no owning address) must still contribute to UTXO-set value —
-// proving the query is based on utxo_state, never the addresses cache.
+// proving the query is based on the rollup's own cumulative total, never
+// the addresses cache.
 func TestSupplyOverview_NonAddressUTXOIncluded(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
@@ -343,9 +397,9 @@ func TestSupplyOverview_NonAddressUTXOIncluded(t *testing.T) {
 }
 
 // TestSupplyOverview_OrphanExcludedAndReorgSwitchesTotals is spec items
-// 48/49/21: after a real reorg, canonical totals reflect ONLY the new
-// branch; the old branch's immutable accounting remains stored but
-// contributes zero.
+// 15/21: after a real reorg, canonical totals reflect ONLY the new
+// branch's own rollup row; the old branch's immutable rollup remains
+// stored but is never read once it's no longer the indexed tip.
 func TestSupplyOverview_OrphanExcludedAndReorgSwitchesTotals(t *testing.T) {
 	ctx := context.Background()
 	q, st, _ := newTestQueryStore(t)
@@ -390,118 +444,143 @@ func TestSupplyOverview_OrphanExcludedAndReorgSwitchesTotals(t *testing.T) {
 	}
 }
 
-// TestSupplyOverview_IncompleteAccountingRejected is spec item 51: a
-// canonical block with no block_accounting row (simulating a pre-2H.1
-// database that hasn't run backfill-accounting yet) must produce
-// ErrAccountingIncomplete, never an understated total.
-func TestSupplyOverview_IncompleteAccountingRejected(t *testing.T) {
+// TestSupplyOverview_TipRollupMissing is spec item 38: build a valid chain
+// through Store.ApplyBlock, then TEST-ONLY delete the current tip's
+// block_supply_rollup row. SupplyOverview must fail with
+// ErrSupplyRollupUnavailable, never silently succeed or panic.
+func TestSupplyOverview_TipRollupMissing(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
 
-	g := block("supply-incomplete-g", 0, "", coinbaseTx("supply-incomplete-g", 100*qoge, "qSupplyIncompleteG"))
+	g := block("supply-tipmissing-g", 0, "", coinbaseTx("supply-tipmissing-g", 100*qoge, "qSupplyTipMissingG"))
 	if err := st.ApplyBlock(ctx, g); err != nil {
 		t.Fatalf("apply genesis: %v", err)
 	}
-	h1 := block("supply-incomplete-h1", 1, g.Hash, coinbaseTx("supply-incomplete-h1", 100*qoge, "qSupplyIncompleteH1"))
+	h1 := block("supply-tipmissing-h1", 1, g.Hash, coinbaseTx("supply-tipmissing-h1", 100*qoge, "qSupplyTipMissingH1"))
 	if err := st.ApplyBlock(ctx, h1); err != nil {
 		t.Fatalf("apply height 1: %v", err)
 	}
 
-	// Simulate a legacy, pre-backfill database: strip height 1's
-	// accounting row via test-only raw SQL (never via production code).
-	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", h1.Hash); err != nil {
-		t.Fatalf("delete block_accounting for h1: %v", err)
+	if _, err := pool.Exec(ctx, "DELETE FROM block_supply_rollup WHERE block_hash = $1", h1.Hash); err != nil {
+		t.Fatalf("delete tip rollup row: %v", err)
 	}
 
 	_, err := q.SupplyOverview(ctx)
-	if !errors.Is(err, ErrAccountingIncomplete) {
-		t.Fatalf("SupplyOverview error = %v, want ErrAccountingIncomplete", err)
+	if !errors.Is(err, ErrSupplyRollupUnavailable) {
+		t.Fatalf("SupplyOverview error = %v, want ErrSupplyRollupUnavailable", err)
 	}
 }
 
-// TestSupplyOverview_OrphanAccountingMissingDoesNotBlockCanonical is spec
-// item 52: a missing block_accounting row for an ORPHANED block must NOT
-// make the current canonical supply unavailable — only canonical coverage
-// matters.
-func TestSupplyOverview_OrphanAccountingMissingDoesNotBlockCanonical(t *testing.T) {
+// TestSupplyOverview_OrphanRollupMissing is spec item 40: an orphaned
+// block's rollup row being missing must NOT affect a read anchored at the
+// current indexed tip — public state depends ONLY on the exact indexed
+// tip's own row.
+func TestSupplyOverview_OrphanRollupMissing(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
 
-	g := block("supply-orphanacct-g", 0, "", coinbaseTx("supply-orphanacct-g", 100*qoge, "qSupplyOrphanAcctG"))
+	g := block("supply-orphanmissing-g", 0, "", coinbaseTx("supply-orphanmissing-g", 100*qoge, "qSupplyOrphanMissingG"))
 	if err := st.ApplyBlock(ctx, g); err != nil {
 		t.Fatalf("apply genesis: %v", err)
 	}
-	a1 := block("supply-orphanacct-a1", 1, g.Hash, coinbaseTx("supply-orphanacct-a1", 100*qoge, "qSupplyOrphanAcctA1"))
+	a1 := block("supply-orphanmissing-a1", 1, g.Hash, coinbaseTx("supply-orphanmissing-a1", 100*qoge, "qSupplyOrphanMissingA1"))
 	if err := st.ApplyBlock(ctx, a1); err != nil {
 		t.Fatalf("apply A1: %v", err)
 	}
 	if err := st.RollbackTo(ctx, g.Hash); err != nil {
 		t.Fatalf("rollback to genesis: %v", err)
 	}
-	b1 := block("supply-orphanacct-b1", 1, g.Hash, coinbaseTx("supply-orphanacct-b1", 100*qoge, "qSupplyOrphanAcctB1"))
+	b1 := block("supply-orphanmissing-b1", 1, g.Hash, coinbaseTx("supply-orphanmissing-b1", 100*qoge, "qSupplyOrphanMissingB1"))
 	if err := st.ApplyBlock(ctx, b1); err != nil {
 		t.Fatalf("apply B1: %v", err)
 	}
 
-	// A1 is now orphaned but its accounting row remains (RollbackTo never
-	// deletes it — docs/ARCHITECTURE.md §26). Delete it anyway to prove the
-	// completeness check is genuinely canonical-only, not "every row that
-	// happens to reference blocks".
-	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", a1.Hash); err != nil {
-		t.Fatalf("delete orphan A1 accounting: %v", err)
+	// A1 is now orphaned; delete its rollup row with test-only SQL (RollbackTo
+	// itself never touches block_supply_rollup — docs/ARCHITECTURE.md §27).
+	if _, err := pool.Exec(ctx, "DELETE FROM block_supply_rollup WHERE block_hash = $1", a1.Hash); err != nil {
+		t.Fatalf("delete orphan A1 rollup: %v", err)
 	}
 
 	got, err := q.SupplyOverview(ctx)
 	if err != nil {
-		t.Fatalf("SupplyOverview: %v (must succeed — the missing row belongs to an orphaned block)", err)
+		t.Fatalf("SupplyOverview: %v (must succeed — the missing row belongs to an orphaned, non-tip block)", err)
 	}
 	if want := 200 * qoge; got.CoinbaseOutputsSatoshis != want {
 		t.Errorf("CoinbaseOutputsSatoshis = %d, want %d", got.CoinbaseOutputsSatoshis, want)
 	}
 }
 
-// TestSupplyOverview_AggregateOverflowFailsLoudly is spec item 23: corrupt/
-// extreme accounting data that would overflow int64 on summation must
-// cause SupplyOverview to fail loudly, never silently wrap into a bogus
-// (possibly negative-looking) total. Two canonical blocks are pushed to
-// carry an artificially huge, but individually
-// block_accounting_reward_identity-satisfying, subsidy/coinbase figure via
-// test-only raw SQL — something internal/accounting's own checked
-// arithmetic would never let real indexing produce, but which
-// SupplyOverview must still detect defensively (docs/ARCHITECTURE.md §26
-// "pure, checked-arithmetic functions").
-func TestSupplyOverview_AggregateOverflowFailsLoudly(t *testing.T) {
+// TestSupplyOverview_BlockAccountingDeletedDoesNotAffectRollupRead is spec
+// item 42: once a valid tip rollup exists, the public read trusts it and
+// never rescans block_accounting — deleting an old block_accounting row
+// must not affect SupplyOverview at all.
+func TestSupplyOverview_BlockAccountingDeletedDoesNotAffectRollupRead(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
 
-	g := block("supply-overflow-g", 0, "", coinbaseTx("supply-overflow-g", 100*qoge, "qSupplyOverflowG"))
+	g := block("supply-acctdel-g", 0, "", coinbaseTx("supply-acctdel-g", 100*qoge, "qSupplyAcctDelG"))
 	if err := st.ApplyBlock(ctx, g); err != nil {
 		t.Fatalf("apply genesis: %v", err)
 	}
-	h1 := block("supply-overflow-h1", 1, g.Hash, coinbaseTx("supply-overflow-h1", 100*qoge, "qSupplyOverflowH1"))
+	h1 := block("supply-acctdel-h1", 1, g.Hash, coinbaseTx("supply-acctdel-h1", 100*qoge, "qSupplyAcctDelH1"))
 	if err := st.ApplyBlock(ctx, h1); err != nil {
 		t.Fatalf("apply height 1: %v", err)
 	}
 
-	// math.MaxInt64 ~= 9.223e18. Two blocks at 6e18 each sum to 1.2e19,
-	// which overflows int64 but individually still satisfies
-	// coinbase + unclaimed == subsidy + fees (0 + 0 fees/unclaimed here).
-	huge := int64(6_000_000_000_000_000_000)
-	if huge <= math.MaxInt64/2 {
-		t.Fatalf("test constant %d is not actually > MaxInt64/2 as intended", huge)
-	}
-	for _, hash := range []string{g.Hash, h1.Hash} {
-		if _, err := pool.Exec(ctx, `
-			UPDATE block_accounting
-			SET subsidy_satoshis = $2, fee_satoshis = 0, coinbase_output_satoshis = $2, unclaimed_reward_satoshis = 0
-			WHERE block_hash = $1
-		`, hash, huge); err != nil {
-			t.Fatalf("inflate block_accounting for %s: %v", hash, err)
-		}
+	before, err := q.SupplyOverview(ctx)
+	if err != nil {
+		t.Fatalf("SupplyOverview before deleting block_accounting: %v", err)
 	}
 
-	_, err := q.SupplyOverview(ctx)
-	if err == nil {
-		t.Fatal("SupplyOverview succeeded on an overflowing aggregate, want a loud error")
+	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", g.Hash); err != nil {
+		t.Fatalf("delete genesis block_accounting: %v", err)
+	}
+
+	after, err := q.SupplyOverview(ctx)
+	if err != nil {
+		t.Fatalf("SupplyOverview after deleting block_accounting: %v (public read must trust the rollup, never rescan block_accounting)", err)
+	}
+	// SupplyOverview.IndexedHash is a *string, so plain struct equality
+	// would compare pointer identity, not value — compare monetary fields
+	// directly and the hash by dereferenced value instead.
+	if before.IndexedHeight != after.IndexedHeight ||
+		(before.IndexedHash == nil) != (after.IndexedHash == nil) ||
+		(before.IndexedHash != nil && *before.IndexedHash != *after.IndexedHash) ||
+		before.ScheduledSubsidySatoshis != after.ScheduledSubsidySatoshis ||
+		before.TransactionFeesSatoshis != after.TransactionFeesSatoshis ||
+		before.CoinbaseOutputsSatoshis != after.CoinbaseOutputsSatoshis ||
+		before.UnclaimedRewardSatoshis != after.UnclaimedRewardSatoshis ||
+		before.UTXOSetValueSatoshis != after.UTXOSetValueSatoshis {
+		t.Errorf("SupplyOverview changed after deleting an unrelated block_accounting row: before=%+v after=%+v", before, after)
+	}
+}
+
+// TestSupplyOverview_PreMigration0005Schema is spec item 39: a database
+// rolled back to only 0004 (block_supply_rollup does not exist) must
+// return ErrSupplyRollupUnavailable, never panic or leak a raw SQL error.
+// Store.ApplyBlock itself always writes a block_supply_rollup row, so the
+// fixture must be built on the FULLY migrated schema first, then rolled
+// back one step — exactly TestMigrations_SupplyRollupRoundTrip's own
+// up/down pattern (internal/store), reused here from the read side.
+func TestSupplyOverview_PreMigration0005Schema(t *testing.T) {
+	ctx := context.Background()
+	q, st, pool := newTestQueryStore(t)
+
+	g := block("supply-pre0005-g", 0, "", coinbaseTx("supply-pre0005-g", 100*qoge, "qSupplyPre0005G"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+
+	migrations, err := store.LoadMigrations(os.DirFS("../../migrations"))
+	if err != nil {
+		t.Fatalf("load migrations: %v", err)
+	}
+	if _, err := store.Down(ctx, pool, migrations, 1); err != nil {
+		t.Fatalf("roll back migration 0005: %v", err)
+	}
+
+	_, err = q.SupplyOverview(ctx)
+	if !errors.Is(err, ErrSupplyRollupUnavailable) {
+		t.Fatalf("SupplyOverview error = %v, want ErrSupplyRollupUnavailable", err)
 	}
 }

@@ -13,7 +13,7 @@ import (
 // deployment-cache tables (spec item 59). A coarse but cheap way to prove
 // SupplyOverview genuinely never writes.
 type supplyRowCounts struct {
-	syncState, blocks, txs, variants, blockTxs, inputs, witness, outputs, addrs, addrOut, participants, utxo, accounting int64
+	syncState, blocks, txs, variants, blockTxs, inputs, witness, outputs, addrs, addrOut, participants, utxo, accounting, rollup int64
 
 	mempoolState, mempoolTxs, mempoolInputs, mempoolWitness, mempoolOutputs, mempoolAddrs, mempoolParticipants, mempoolDeps int64
 
@@ -43,6 +43,7 @@ func snapshotSupplyRowCounts(t *testing.T, ctx context.Context, pool *pgxpool.Po
 		participants: count("output_participants"),
 		utxo:         count("utxo_state"),
 		accounting:   count("block_accounting"),
+		rollup:       count("block_supply_rollup"),
 
 		mempoolState:        count("mempool_state"),
 		mempoolTxs:          count("mempool_transactions"),
@@ -58,13 +59,13 @@ func snapshotSupplyRowCounts(t *testing.T, ctx context.Context, pool *pgxpool.Po
 	}
 }
 
-// TestSupplyOverview_NonMutation is spec item 59: repeated SupplyOverview
-// calls — across an empty database, a populated one, an incomplete-
-// accounting error path, and an overflow-error path — must never insert,
-// delete, or update a single row anywhere in the schema. query.Store's
-// read-only enforcement is already structural (every statement is a
-// SELECT — docs/ARCHITECTURE.md §19), but this is a genuine end-to-end
-// proof, not just a code-review claim.
+// TestSupplyOverview_NonMutation is spec item 44: repeated SupplyOverview
+// calls — across an empty database, a populated one, and a rollup-
+// unavailable error path — must never insert, delete, or update a single
+// row anywhere in the schema. query.Store's read-only enforcement is
+// already structural (every statement is a SELECT —
+// docs/ARCHITECTURE.md §19), but this is a genuine end-to-end proof, not
+// just a code-review claim.
 func TestSupplyOverview_NonMutation(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
@@ -96,15 +97,15 @@ func TestSupplyOverview_NonMutation(t *testing.T) {
 		t.Fatalf("row counts changed after repeated SupplyOverview calls: before=%+v after=%+v", before, got)
 	}
 
-	// The incomplete-accounting error path also must not mutate anything.
-	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", h1.Hash); err != nil {
-		t.Fatalf("delete block_accounting for h1: %v", err)
+	// The rollup-unavailable error path also must not mutate anything.
+	if _, err := pool.Exec(ctx, "DELETE FROM block_supply_rollup WHERE block_hash = $1", h1.Hash); err != nil {
+		t.Fatalf("delete block_supply_rollup for h1: %v", err)
 	}
 	before = snapshotSupplyRowCounts(t, ctx, pool)
 	if _, err := q.SupplyOverview(ctx); err == nil {
-		t.Fatal("SupplyOverview succeeded despite incomplete accounting")
+		t.Fatal("SupplyOverview succeeded despite missing tip rollup")
 	}
 	if got := snapshotSupplyRowCounts(t, ctx, pool); got != before {
-		t.Fatalf("row counts changed after the incomplete-accounting error path: before=%+v after=%+v", before, got)
+		t.Fatalf("row counts changed after the rollup-unavailable error path: before=%+v after=%+v", before, got)
 	}
 }

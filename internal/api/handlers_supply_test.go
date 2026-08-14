@@ -84,23 +84,23 @@ func TestSupplyEndpoint_GoldenPath(t *testing.T) {
 	}
 }
 
-// TestSupplyEndpoint_AccountingIncomplete is spec item 18: incomplete
-// canonical block_accounting coverage must return HTTP 503
-// "accounting_incomplete", never a partial/understated 200.
-func TestSupplyEndpoint_AccountingIncomplete(t *testing.T) {
+// TestSupplyEndpoint_RollupUnavailable is spec item 21: an initialized
+// chain whose indexed tip has no block_supply_rollup row must return HTTP
+// 503 "supply_rollup_unavailable", never a partial/understated 200.
+func TestSupplyEndpoint_RollupUnavailable(t *testing.T) {
 	ctx := context.Background()
 	s, st, pool := newTestServerWithPool(t)
 
-	g := block("api-supply-incomplete-g", 0, "", coinbaseTx("api-supply-incomplete-g", 100_00000000, "qApiSupplyIncG"))
+	g := block("api-supply-unavail-g", 0, "", coinbaseTx("api-supply-unavail-g", 100_00000000, "qApiSupplyUnavailG"))
 	if err := st.ApplyBlock(ctx, g); err != nil {
 		t.Fatalf("apply genesis: %v", err)
 	}
-	if _, err := pool.Exec(ctx, "DELETE FROM block_accounting WHERE block_hash = $1", g.Hash); err != nil {
-		t.Fatalf("delete block_accounting: %v", err)
+	if _, err := pool.Exec(ctx, "DELETE FROM block_supply_rollup WHERE block_hash = $1", g.Hash); err != nil {
+		t.Fatalf("delete block_supply_rollup: %v", err)
 	}
 
 	rec := doRequest(t, s, "GET", "/api/v1/supply")
-	assertJSONError(t, rec, http.StatusServiceUnavailable, "accounting_incomplete")
+	assertJSONError(t, rec, http.StatusServiceUnavailable, "supply_rollup_unavailable")
 }
 
 // TestSupplyEndpoint_MethodNotAllowed mirrors

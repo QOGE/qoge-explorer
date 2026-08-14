@@ -7,15 +7,14 @@ import (
 	"github.com/QOGE/qoge-explorer/internal/query"
 )
 
-// handleSupply resolves GET /api/v1/supply. An indexed chain with
-// incomplete canonical block_accounting coverage (a database upgraded from
-// before Phase 2H.1 that has not yet run `backfill-accounting`) returns
-// HTTP 503 rather than an understated total — docs/ARCHITECTURE.md's Phase
-// 2H.2 section.
+// handleSupply resolves GET /api/v1/supply. An initialized indexed chain
+// whose tip has no block_supply_rollup row yet (not backfilled, or a
+// pre-0005 schema) returns HTTP 503 rather than an understated total —
+// docs/ARCHITECTURE.md §28.
 func (s *Server) handleSupply(w http.ResponseWriter, r *http.Request) {
 	overview, err := s.q.SupplyOverview(r.Context())
-	if errors.Is(err, query.ErrAccountingIncomplete) {
-		writeError(w, http.StatusServiceUnavailable, "accounting_incomplete", "monetary accounting is incomplete for the indexed canonical chain")
+	if errors.Is(err, query.ErrSupplyRollupUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "supply_rollup_unavailable", "supply rollup is unavailable for the indexed tip")
 		return
 	}
 	if err != nil {

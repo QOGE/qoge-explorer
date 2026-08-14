@@ -6,55 +6,74 @@ import (
 	"fmt"
 
 	"github.com/QOGE/qoge-explorer/internal/chain"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// ErrAccountingIncomplete means the indexed canonical chain has one or more
-// blocks with no corresponding block_accounting row — a database upgraded
-// from before Phase 2H.1 whose `backfill-accounting` has not (yet) run to
-// completion. Returning understated monetary totals in that situation would
-// be worse than refusing to answer at all: internal/api maps this to HTTP
-// 503 ("accounting_incomplete"), internal/web to an explanatory HTML 503
-// page (docs/ARCHITECTURE.md's Phase 2H.2 section).
-var ErrAccountingIncomplete = errors.New("query: canonical block accounting is incomplete for the indexed chain")
+// ErrSupplyRollupUnavailable means the database is initialized
+// (sync_state.indexed_height >= 0) but no block_supply_rollup row exists
+// for the exact indexed tip — either because Phase 2H.2a's rollup
+// migration/backfill hasn't run yet against this database (including the
+// pre-0005-schema case, where the table itself doesn't exist:
+// PostgreSQL's undefined_table, SQLSTATE 42P01), or because the tip's own
+// row is missing for some other reason (manual deletion, an incompletely
+// applied backfill). internal/api maps this to HTTP 503
+// ("supply_rollup_unavailable"), internal/web to an explanatory HTML 503
+// pointing at `qoge-explorer backfill-supply-rollup` — see
+// docs/ARCHITECTURE.md §28.
+var ErrSupplyRollupUnavailable = errors.New("query: block_supply_rollup is unavailable for the indexed tip")
 
-// ErrSupplyIntegrity means the aggregate cross-check
-// (coinbase_outputs + unclaimed_reward == scheduled_subsidy + fees), or the
-// checked-arithmetic addition it depends on, failed — despite every
-// individual block_accounting row already satisfying
-// block_accounting_reward_identity on its own. This is cheap defense in
-// depth (docs/ARCHITECTURE.md §26 "internal/accounting: pure, checked-
-// arithmetic functions"): it can only result from database corruption or an
-// aggregation bug, never from ordinary valid chain state, and must never
-// happen in production.
-var ErrSupplyIntegrity = errors.New("query: supply aggregate identity check failed")
-
-// SupplyOverview is Phase 2H.2's public monetary read surface: five precise
-// metrics, read from ONE read-only REPEATABLE READ snapshot (readTx) —
-// same snapshot-consistency property ExplorerOverview/DeploymentOverview
-// already give their own composite responses. None of these fields is, or
-// is described as, "circulating supply" — see docs/ARCHITECTURE.md's Phase
-// 2H.2 section for the full rationale:
+// ErrSupplyIntegrity means one of two things, both defense in depth on top
+// of block_supply_rollup's own CHECK constraints
+// (block_supply_rollup_reward_identity / _utxo_identity in
+// migrations/0005_block_supply_rollup.up.sql), and both indicating
+// database corruption or a bug — never ordinary chain state:
 //
-//   - ScheduledSubsidy is the consensus subsidy entitlement accumulated by
-//     the indexed canonical chain — a ceiling, not necessarily actual
-//     issuance, because a miner may validly underclaim.
-//   - TransactionFees is existing value transferred by non-coinbase
-//     transactions, never newly issued coins.
-//   - CoinbaseOutputs is what canonical coinbase transactions actually
-//     paid out (subsidy plus whatever fees were claimed), including
-//     genesis.
+//   - sync_state reports indexed_height >= 0 but indexed_block_hash is
+//     NULL — a state the sync_state_validate_checkpoint_trigger
+//     (migrations/0001_initial.up.sql) should make unreachable through
+//     supported writes.
+//   - the reward identity (coinbase_outputs + unclaimed_reward ==
+//     scheduled_subsidy + transaction_fees) or the UTXO identity
+//     (utxo_set_value + transaction_fees + excluded_output ==
+//     coinbase_outputs) fails when re-verified in Go with checked int64
+//     arithmetic, from the one rollup row already read — see
+//     checkSupplyRollupIdentities.
+var ErrSupplyIntegrity = errors.New("query: supply integrity check failed")
+
+// SupplyOverview is Phase 2H.2b's public monetary read surface: five
+// precise metrics, read in O(1) from the indexed tip's single immutable
+// block_supply_rollup row (Phase 2H.2a) inside one read-only REPEATABLE
+// READ snapshot (readTx) — same snapshot-consistency property
+// ExplorerOverview/DeploymentOverview already give their own composite
+// responses. None of these fields is, or is described as, "circulating
+// supply" — see docs/ARCHITECTURE.md §28 for the full rationale:
+//
+//   - ScheduledSubsidy is the consensus subsidy entitlement accumulated
+//     through the indexed canonical tip — a ceiling, not necessarily
+//     actual issuance, because a miner may validly underclaim.
+//   - TransactionFees is the total input-minus-output value paid as fees
+//     by canonical non-coinbase transactions — existing value, never
+//     newly issued coins.
+//   - CoinbaseOutputs is the total value encoded in canonical coinbase
+//     transaction outputs, including claimed transaction fees and the
+//     genesis coinbase — deliberately "encoded in", not "actually paid":
+//     genesis is counted here even though Core never places its coinbase
+//     output in the spendable UTXO set.
 //   - UnclaimedReward is the residual `subsidy + fees - coinbase_output`;
 //     it cannot generally be partitioned into unclaimed subsidy vs.
 //     unclaimed fees, and is never called "burn" or "unissued subsidy".
 //   - UTXOSetValue is the value currently held by the explorer's
-//     Core-equivalent canonical UTXO set — it deliberately excludes the
-//     genesis coinbase output and any output Core itself never treats as
-//     spendable (see internal/store's applyOutput doc comment), so it is
-//     NOT expected to equal CoinbaseOutputs.
+//     Core-equivalent canonical UTXO set at the indexed tip — it
+//     deliberately excludes the genesis coinbase output and any output
+//     Core itself never treats as spendable, so it is NOT expected to
+//     equal CoinbaseOutputs.
 //
-// Every metric is computed exclusively from the CANONICAL chain
-// (blocks.canonical = true); an orphaned block's immutable accounting
-// remains queryable as audit history but never contributes here.
+// cumulative_excluded_output_satoshis, the sixth column
+// block_supply_rollup stores, is deliberately never exposed here — it
+// exists purely to support the UTXO identity check and
+// internal/store/internal/store's own UTXO cross-check (§27), not as a
+// public metric.
 type SupplyOverview struct {
 	IndexedHeight int64   `json:"indexed_height"`
 	IndexedHash   *string `json:"indexed_block_hash"`
@@ -75,82 +94,65 @@ type SupplyOverview struct {
 	UTXOSetValueQOGE     string `json:"utxo_set_value_qoge"`
 }
 
-// canonicalAccountingAggregate is the raw result of the canonical
-// block_accounting aggregate query, before the completeness check and the
-// QOGE-string formatting SupplyOverview applies to it.
-type canonicalAccountingAggregate struct {
-	canonicalBlocks int64
-	accountedBlocks int64
-	subsidy         int64
-	fees            int64
-	coinbase        int64
-	unclaimed       int64
+// supplyRollupValues is the raw six-column shape of one block_supply_rollup
+// row — private, since only SupplyOverview's public five-metric shape and
+// checkSupplyRollupIdentities' arithmetic ever need it.
+type supplyRollupValues struct {
+	subsidy   int64
+	fees      int64
+	coinbase  int64
+	unclaimed int64
+	excluded  int64
+	utxo      int64
 }
 
-// canonicalAccountingAggregateFrom reads, in one statement, both the
-// canonical block count and the canonical block_accounting sums — via a
-// LEFT JOIN so a canonical block with no accounting row is still counted
-// (as a non-NULL blocks row joined against NULL block_accounting columns),
-// never silently absent from canonicalBlocks. This is what lets the caller
-// structurally compare canonicalBlocks against accountedBlocks
-// (count(ba.block_hash), which — ordinary SQL COUNT(column) semantics —
-// only counts non-NULL join hits) rather than trusting a bare
-// COALESCE(SUM(...), 0) over whatever accounting rows happen to already
-// exist (docs/ARCHITECTURE.md §26 "Source-data completeness, not just
-// presence" applies the identical principle to backfill).
-func canonicalAccountingAggregateFrom(ctx context.Context, q querier) (canonicalAccountingAggregate, error) {
-	var a canonicalAccountingAggregate
+// pgUndefinedTable is PostgreSQL's SQLSTATE for "relation does not exist"
+// (undefined_table) — used below to distinguish "this database predates
+// migration 0005" from any other, genuinely unexpected error.
+const pgUndefinedTable = "42P01"
+
+// supplyRollupValuesFrom is SupplyOverview's ONLY monetary data source: an
+// exact primary-key lookup on block_supply_rollup by the indexed tip's own
+// hash — O(1) relative to chain length, never a SUM/COUNT/JOIN over
+// blocks, block_accounting, utxo_state, or transaction_outputs (see
+// docs/ARCHITECTURE.md §28). A missing row (pgx.ErrNoRows) and a missing
+// TABLE (pre-0005 schema, SQLSTATE 42P01) are both
+// ErrSupplyRollupUnavailable — the public read surface does not
+// distinguish "not backfilled yet" from "not migrated yet"; both point an
+// operator at the same remediation.
+func supplyRollupValuesFrom(ctx context.Context, q querier, blockHash string) (supplyRollupValues, error) {
+	var v supplyRollupValues
 	err := q.QueryRow(ctx, `
 		SELECT
-			count(*),
-			count(ba.block_hash),
-			COALESCE(sum(ba.subsidy_satoshis), 0),
-			COALESCE(sum(ba.fee_satoshis), 0),
-			COALESCE(sum(ba.coinbase_output_satoshis), 0),
-			COALESCE(sum(ba.unclaimed_reward_satoshis), 0)
-		FROM blocks b
-		LEFT JOIN block_accounting ba ON ba.block_hash = b.hash
-		WHERE b.canonical
-	`).Scan(&a.canonicalBlocks, &a.accountedBlocks, &a.subsidy, &a.fees, &a.coinbase, &a.unclaimed)
-	if err != nil {
-		return canonicalAccountingAggregate{}, fmt.Errorf("query: canonical accounting aggregate: %w", err)
+			cumulative_subsidy_satoshis,
+			cumulative_fee_satoshis,
+			cumulative_coinbase_output_satoshis,
+			cumulative_unclaimed_reward_satoshis,
+			cumulative_excluded_output_satoshis,
+			cumulative_utxo_set_value_satoshis
+		FROM block_supply_rollup
+		WHERE block_hash = $1
+	`, blockHash).Scan(&v.subsidy, &v.fees, &v.coinbase, &v.unclaimed, &v.excluded, &v.utxo)
+	if err == nil {
+		return v, nil
 	}
-	return a, nil
-}
-
-// utxoSetValueFrom sums the value of every currently-unspent canonical
-// output — utxo_state joined to transaction_outputs for the value, exactly
-// as docs/ARCHITECTURE.md §6/§26 specify. This deliberately does not use
-// addresses.balance_satoshis (internal/store's derived balance cache
-// intentionally excludes bare-multisig outputs — see output_participants
-// vs. output_addresses in migrations/0001_initial.up.sql) and does not
-// require an output to have any recognized owning address at all: an
-// eligible unknown/non-addressed output still has a utxo_state row and
-// still contributes here.
-func utxoSetValueFrom(ctx context.Context, q querier) (int64, error) {
-	var v int64
-	err := q.QueryRow(ctx, `
-		SELECT COALESCE(SUM(o.value_satoshis), 0)
-		FROM utxo_state u
-		JOIN transaction_outputs o ON o.txid = u.txid AND o.vout_index = u.vout_index
-		WHERE NOT u.spent
-	`).Scan(&v)
-	if err != nil {
-		return 0, fmt.Errorf("query: utxo set value: %w", err)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return supplyRollupValues{}, fmt.Errorf("%w: no block_supply_rollup row for indexed tip %s", ErrSupplyRollupUnavailable, blockHash)
 	}
-	return v, nil
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == pgUndefinedTable {
+		return supplyRollupValues{}, fmt.Errorf("%w: block_supply_rollup table does not exist (pre-0005 schema)", ErrSupplyRollupUnavailable)
+	}
+	return supplyRollupValues{}, fmt.Errorf("query: supply rollup lookup: %w", err)
 }
 
 // checkedAddInt64 mirrors internal/accounting's own checked-addition
-// policy (internal/accounting/subsidy.go's checkedAdd) — duplicated rather
-// than imported because internal/query must not depend on
-// internal/accounting's write-adjacent package for a two-line arithmetic
-// helper; PostgreSQL's SUM(BIGINT) already returns NUMERIC (not int8), and
-// pgx's numeric-to-int64 scan itself fails loudly (never silently wraps)
-// if a corrupted/extreme aggregate does not fit int64 — see
-// TestSupplyOverview_AggregateOverflowFailsLoudly. This function guards the
-// SEPARATE addition SupplyOverview performs in Go once the two aggregate
-// sums are already in hand.
+// policy (internal/accounting/subsidy.go's checkedAdd) and
+// internal/store's addChecked — duplicated rather than imported because
+// internal/query must not depend on either write-adjacent package for a
+// two-line arithmetic helper. block_supply_rollup's own CHECK constraints
+// already guard the stored row; this guards the SEPARATE additions
+// checkSupplyRollupIdentities performs in Go once the row is in hand.
 func checkedAddInt64(a, b int64) (int64, bool) {
 	sum := a + b
 	if (b > 0 && sum < a) || (b < 0 && sum > a) {
@@ -159,22 +161,104 @@ func checkedAddInt64(a, b int64) (int64, bool) {
 	return sum, true
 }
 
-// SupplyOverview reads Phase 2H.2's five public monetary metrics from one
-// snapshot, in the order docs/ARCHITECTURE.md's Phase 2H.2 section
-// specifies: the sync_state anchor, then the canonical accounting
-// aggregate (with its completeness check), then the current UTXO-set
-// value. A concurrent ApplyBlock/RollbackTo committing between these reads
-// can therefore never produce a response mixing height/hash from one
-// canonical state with monetary totals from another — same
-// REPEATABLE-READ guarantee ExplorerOverview/DeploymentOverview already
-// give their own composite responses.
+// checkSupplyRollupIdentities is a small, pure, DB-independent helper
+// (deliberately factored out so overflow/mismatch edge cases are testable
+// directly, without corrupting a real block_supply_rollup row past its own
+// CHECK constraints — see supply_identity_test.go) re-verifying, in Go
+// with checked int64 arithmetic, the same two identities
+// migrations/0005_block_supply_rollup.up.sql already enforces at the
+// database level:
+//
+//   - reward identity: coinbase_outputs + unclaimed_reward ==
+//     scheduled_subsidy + transaction_fees
+//   - UTXO identity: utxo_set_value + transaction_fees + excluded_output
+//     == coinbase_outputs
+//
+// This is cheap defense in depth, not a redundant restatement: a
+// privileged raw-SQL writer could in principle construct a row that
+// individually satisfies both CHECK constraints from a source-false
+// combination of fields, and re-deriving the arithmetic here (rather than
+// only trusting the constraints exist) catches at least the case where
+// even that arithmetic doesn't hold. Either failure returns
+// ErrSupplyIntegrity; SupplyOverview returns no data rather than a value
+// it cannot vouch for.
+func checkSupplyRollupIdentities(v supplyRollupValues) error {
+	rewardLHS, ok := checkedAddInt64(v.coinbase, v.unclaimed)
+	if !ok {
+		return fmt.Errorf("%w: coinbase_outputs(%d) + unclaimed_reward(%d) overflows int64", ErrSupplyIntegrity, v.coinbase, v.unclaimed)
+	}
+	rewardRHS, ok := checkedAddInt64(v.subsidy, v.fees)
+	if !ok {
+		return fmt.Errorf("%w: scheduled_subsidy(%d) + transaction_fees(%d) overflows int64", ErrSupplyIntegrity, v.subsidy, v.fees)
+	}
+	if rewardLHS != rewardRHS {
+		return fmt.Errorf("%w: reward identity violated: coinbase_outputs+unclaimed_reward=%d, scheduled_subsidy+transaction_fees=%d",
+			ErrSupplyIntegrity, rewardLHS, rewardRHS)
+	}
+
+	utxoLHS, ok := checkedAddInt64(v.utxo, v.fees)
+	if !ok {
+		return fmt.Errorf("%w: utxo_set_value(%d) + transaction_fees(%d) overflows int64", ErrSupplyIntegrity, v.utxo, v.fees)
+	}
+	utxoLHS, ok = checkedAddInt64(utxoLHS, v.excluded)
+	if !ok {
+		return fmt.Errorf("%w: utxo_set_value+transaction_fees(%d) + excluded_output(%d) overflows int64", ErrSupplyIntegrity, utxoLHS, v.excluded)
+	}
+	if utxoLHS != v.coinbase {
+		return fmt.Errorf("%w: utxo identity violated: utxo_set_value+transaction_fees+excluded_output=%d, coinbase_outputs=%d",
+			ErrSupplyIntegrity, utxoLHS, v.coinbase)
+	}
+	return nil
+}
+
+// zeroSupplyOverview is the valid HTTP 200 response for an uninitialized
+// explorer (sync_state.indexed_height == -1, no blocks at all): every
+// total at zero, never confused with "chain supply of zero" — no rollup
+// row is required or looked up in this case (docs/ARCHITECTURE.md §28,
+// "Uninitialized database").
+func zeroSupplyOverview(status Status) SupplyOverview {
+	zero := chain.Amount(0).String()
+	return SupplyOverview{
+		IndexedHeight: status.IndexedHeight,
+		IndexedHash:   status.IndexedHash,
+
+		ScheduledSubsidySatoshis: 0,
+		ScheduledSubsidyQOGE:     zero,
+		TransactionFeesSatoshis:  0,
+		TransactionFeesQOGE:      zero,
+		CoinbaseOutputsSatoshis:  0,
+		CoinbaseOutputsQOGE:      zero,
+		UnclaimedRewardSatoshis:  0,
+		UnclaimedRewardQOGE:      zero,
+		UTXOSetValueSatoshis:     0,
+		UTXOSetValueQOGE:         zero,
+	}
+}
+
+// SupplyOverview reads Phase 2H.2b's five public monetary metrics from one
+// snapshot: the sync_state anchor, then (for an initialized explorer) an
+// exact block_supply_rollup primary-key lookup on that anchor's own
+// hash — O(1) relative to chain length, never a request-time
+// block_accounting/UTXO aggregate, canonical scan, or ancestry scan (see
+// docs/ARCHITECTURE.md §28). A concurrent ApplyBlock/RollbackTo committing
+// between these two reads can therefore never produce a response mixing
+// height/hash from one canonical state with monetary totals from
+// another — same REPEATABLE-READ guarantee ExplorerOverview/
+// DeploymentOverview already give their own composite responses, and,
+// independently, because block_supply_rollup rows are immutable and never
+// deleted on rollback: even outside a transaction, the row a captured
+// indexed hash names always still exists and still means the same thing.
 //
 // An uninitialized explorer (sync_state.indexed_height = -1, no blocks at
-// all) is a valid HTTP 200 response with every total at zero — the
-// canonical-block count and accounted-block count are both 0 in that case,
-// so the completeness check trivially passes; this is never confused with
-// "chain supply of zero" (docs/ARCHITECTURE.md's Phase 2H.2 section,
-// "Uninitialized database").
+// all) is a valid HTTP 200 response with every total at zero
+// (zeroSupplyOverview) — never confused with "chain supply of zero". An
+// initialized explorer whose indexed tip has no block_supply_rollup row
+// (not yet backfilled, or a pre-0005 schema) returns
+// ErrSupplyRollupUnavailable. sync_state reporting indexed_height >= 0
+// with a NULL indexed_block_hash — a state the database's own
+// sync_state_validate_checkpoint_trigger should make unreachable — returns
+// ErrSupplyIntegrity rather than being treated as ordinary uninitialized
+// state.
 func (s *Store) SupplyOverview(ctx context.Context) (SupplyOverview, error) {
 	tx, done, err := s.readTx(ctx)
 	if err != nil {
@@ -188,57 +272,38 @@ func (s *Store) SupplyOverview(ctx context.Context) (SupplyOverview, error) {
 	}
 	fireSnapshotTestHook() // snapshot is now fixed as of this first statement
 
-	agg, err := canonicalAccountingAggregateFrom(ctx, tx)
+	if status.IndexedHeight == -1 {
+		return zeroSupplyOverview(status), nil
+	}
+	if status.IndexedHash == nil {
+		return SupplyOverview{}, fmt.Errorf("%w: indexed_height=%d but indexed_block_hash is NULL", ErrSupplyIntegrity, status.IndexedHeight)
+	}
+
+	v, err := supplyRollupValuesFrom(ctx, tx, *status.IndexedHash)
 	if err != nil {
 		return SupplyOverview{}, err
 	}
-	if agg.accountedBlocks != agg.canonicalBlocks {
-		return SupplyOverview{}, fmt.Errorf("%w: %d of %d canonical blocks have a block_accounting row",
-			ErrAccountingIncomplete, agg.accountedBlocks, agg.canonicalBlocks)
-	}
-
-	utxoValue, err := utxoSetValueFrom(ctx, tx)
-	if err != nil {
+	if err := checkSupplyRollupIdentities(v); err != nil {
 		return SupplyOverview{}, err
-	}
-
-	// Defense in depth (docs/ARCHITECTURE.md §26): every individual
-	// block_accounting row already satisfies
-	// block_accounting_reward_identity, but the aggregate is independently
-	// re-verified here, in Go, with checked arithmetic — never trusting
-	// that summing already-valid rows can't itself go wrong.
-	lhs, ok := checkedAddInt64(agg.coinbase, agg.unclaimed)
-	if !ok {
-		return SupplyOverview{}, fmt.Errorf("%w: coinbase_outputs(%d) + unclaimed_reward(%d) overflows int64",
-			ErrSupplyIntegrity, agg.coinbase, agg.unclaimed)
-	}
-	rhs, ok := checkedAddInt64(agg.subsidy, agg.fees)
-	if !ok {
-		return SupplyOverview{}, fmt.Errorf("%w: scheduled_subsidy(%d) + transaction_fees(%d) overflows int64",
-			ErrSupplyIntegrity, agg.subsidy, agg.fees)
-	}
-	if lhs != rhs {
-		return SupplyOverview{}, fmt.Errorf("%w: coinbase_outputs + unclaimed_reward = %d, scheduled_subsidy + transaction_fees = %d",
-			ErrSupplyIntegrity, lhs, rhs)
 	}
 
 	return SupplyOverview{
 		IndexedHeight: status.IndexedHeight,
 		IndexedHash:   status.IndexedHash,
 
-		ScheduledSubsidySatoshis: agg.subsidy,
-		ScheduledSubsidyQOGE:     chain.Amount(agg.subsidy).String(),
+		ScheduledSubsidySatoshis: v.subsidy,
+		ScheduledSubsidyQOGE:     chain.Amount(v.subsidy).String(),
 
-		TransactionFeesSatoshis: agg.fees,
-		TransactionFeesQOGE:     chain.Amount(agg.fees).String(),
+		TransactionFeesSatoshis: v.fees,
+		TransactionFeesQOGE:     chain.Amount(v.fees).String(),
 
-		CoinbaseOutputsSatoshis: agg.coinbase,
-		CoinbaseOutputsQOGE:     chain.Amount(agg.coinbase).String(),
+		CoinbaseOutputsSatoshis: v.coinbase,
+		CoinbaseOutputsQOGE:     chain.Amount(v.coinbase).String(),
 
-		UnclaimedRewardSatoshis: agg.unclaimed,
-		UnclaimedRewardQOGE:     chain.Amount(agg.unclaimed).String(),
+		UnclaimedRewardSatoshis: v.unclaimed,
+		UnclaimedRewardQOGE:     chain.Amount(v.unclaimed).String(),
 
-		UTXOSetValueSatoshis: utxoValue,
-		UTXOSetValueQOGE:     chain.Amount(utxoValue).String(),
+		UTXOSetValueSatoshis: v.utxo,
+		UTXOSetValueQOGE:     chain.Amount(v.utxo).String(),
 	}, nil
 }
