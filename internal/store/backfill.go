@@ -37,15 +37,20 @@ var ErrSchemaIdentityUnavailable = errors.New("store: backfill accounting: could
 
 // schemaScopedLockKey reads the schema `conn`'s session actually resolves
 // unqualified names against (current_schema(), i.e. the first existing
-// schema on search_path) and derives a deterministic PostgreSQL advisory
-// lock key pair from it: a fixed namespace
-// (backfillAccountingAdvisoryLockNamespace) plus hashtext(schema name).
+// schema on search_path) and derives a deterministic hashtext(schema name)
+// key — the SCHEMA half of a two-key PostgreSQL advisory lock
+// (pg_try_advisory_lock(namespace, schema_key)). The caller supplies its
+// own fixed namespace constant separately (see
+// backfillAccountingAdvisoryLockNamespace, this file, and
+// backfillSupplyRollupAdvisoryLockNamespace,
+// supply_rollup_backfill.go) — this function deliberately doesn't take or
+// return one, so distinct backfill commands can each pick their own
+// namespace and never contend with each other even against the same
+// schema, while two runs of the SAME command against the SAME schema
+// always compute the same key pair and correctly exclude each other.
 //
-// This makes the lock schema-scoped rather than database-global: two
-// BackfillAccounting runs against the SAME schema always compute the same
-// key pair and correctly exclude each other, while two runs against
-// DIFFERENT schemas in the same database (this project's PostgreSQL
-// package tests each use their own throwaway schema, per
+// Two runs against DIFFERENT schemas in the same database (this project's
+// PostgreSQL package tests each use their own throwaway schema, per
 // dbtest_test.go's newTestSchema) compute different key pairs and do not
 // contend — matching the fact that they read and write entirely disjoint
 // tables. hashtext() is deterministic for a given input across processes,
@@ -57,19 +62,19 @@ var ErrSchemaIdentityUnavailable = errors.New("store: backfill accounting: could
 // key.
 func schemaScopedLockKey(ctx context.Context, conn interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
-}) (namespace, schemaKey int32, schemaName string, err error) {
+}) (schemaKey int32, schemaName string, err error) {
 	var name *string
 	if err := conn.QueryRow(ctx, `SELECT current_schema()`).Scan(&name); err != nil {
-		return 0, 0, "", fmt.Errorf("store: backfill accounting: read current_schema: %w", err)
+		return 0, "", fmt.Errorf("store: backfill: read current_schema: %w", err)
 	}
 	if name == nil || *name == "" {
-		return 0, 0, "", ErrSchemaIdentityUnavailable
+		return 0, "", ErrSchemaIdentityUnavailable
 	}
 	var key int32
 	if err := conn.QueryRow(ctx, `SELECT hashtext($1)`, *name).Scan(&key); err != nil {
-		return 0, 0, "", fmt.Errorf("store: backfill accounting: hash schema name: %w", err)
+		return 0, "", fmt.Errorf("store: backfill: hash schema name: %w", err)
 	}
-	return backfillAccountingAdvisoryLockNamespace, key, *name, nil
+	return key, *name, nil
 }
 
 // ErrIncompleteAccountingSource means the already-indexed PostgreSQL data
@@ -155,10 +160,11 @@ func (s *Store) BackfillAccounting(ctx context.Context) (BackfillAccountingResul
 	}
 	defer conn.Release()
 
-	namespace, schemaKey, _, err := schemaScopedLockKey(ctx, conn)
+	schemaKey, _, err := schemaScopedLockKey(ctx, conn)
 	if err != nil {
 		return BackfillAccountingResult{}, fmt.Errorf("store: backfill accounting: %w", err)
 	}
+	namespace := backfillAccountingAdvisoryLockNamespace
 
 	var locked bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespace, schemaKey).Scan(&locked); err != nil {

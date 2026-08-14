@@ -4671,225 +4671,330 @@ independently useful metrics, but neither is safely labelable
 terminology, which is explicitly deferred (Phase 2H.2/2H.3), not decided
 here.
 
-## 27. Supply and monetary accounting read surface (Phase 2H.2)
+## 27. Immutable block supply rollup foundation (Phase 2H.2a)
 
-Phase 2H.2 makes Phase 2H.1's immutable per-block monetary facts
-(`subsidy_satoshis`, `fee_satoshis`, `coinbase_output_satoshis`,
-`unclaimed_reward_satoshis`) READABLE, via `GET /api/v1/supply` and
-`GET /supply`. It is a strict read layer: no indexing change, no
-accounting-writer change, no new mutable monetary state, no migration
-0005, no rich list, no circulating-supply claim. `internal/query/supply.go`
-is the only new production query file; `internal/api/handlers_supply.go`
-and `internal/web/handlers_supply.go` are thin callers, exactly like every
-other Phase 2D.1/2E.1 handler (§19/§20) — neither issues SQL directly.
+**Architecture pivot.** The originally-planned Phase 2H.2 (`GET
+/api/v1/supply`, `/supply`) computed its five public metrics by directly
+aggregating `blocks`/`block_accounting` (for the four monetary totals) and
+`utxo_state`/`transaction_outputs` (for UTXO-set value) on every request.
+A realistic large-scale benchmark — 2,500,000 synthetic canonical blocks —
+found this consistently 6-8x over a 1-second target, both cold and warm
+(full numbers preserved in that work's own history; not reproduced here).
+Rather than bolt a cache or a mutable counter onto that design, Phase
+2H.2a introduces an immutable, reorg-safe, `O(1)`-lookup rollup as its own
+foundation layer, with **no public route of any kind** — `/api/v1/supply`
+and `/supply` remain future work (Phase 2H.2b) built on top of this.
 
-### Five public metrics, none of them "circulating supply"
+### Design: one immutable row per block hash, not per height
 
-`query.Store.SupplyOverview` exposes exactly five monetary quantities,
-each computed exclusively from the CANONICAL chain
-(`blocks.canonical = true`):
+`block_supply_rollup` (migration `0005_block_supply_rollup`) has exactly
+one row per block hash — never per canonical height, never a single
+mutable global row. Each row means "the cumulative monetary state from
+genesis through THIS block, along this block's own immutable ancestry."
+There is deliberately **no canonical flag** on this table: canonical
+selection remains exclusively `blocks.canonical` /
+`sync_state.indexed_block_hash`, exactly as everywhere else in this
+schema; a future public reader follows `sync_state`'s tip hash to find
+which row is "the" current answer.
 
-- **Scheduled subsidy** (`scheduled_subsidy_sats`/`_qoge`) —
-  `SUM(block_accounting.subsidy_satoshis)`. The consensus subsidy
-  entitlement accumulated by the indexed canonical chain — a ceiling, not
-  necessarily actual issuance, since §26 already established that a miner
-  may validly underclaim.
-- **Transaction fees** (`transaction_fees_sats`/`_qoge`) —
-  `SUM(block_accounting.fee_satoshis)`. Existing value transferred from
-  non-coinbase transaction inputs — never described as newly issued coins.
-- **Coinbase outputs** (`coinbase_outputs_sats`/`_qoge`) —
-  `SUM(block_accounting.coinbase_output_satoshis)`. What canonical
-  coinbase transactions actually paid out — some mix of subsidy and
-  claimed fees, including genesis — and therefore not, by itself, a supply
-  figure.
-- **Unclaimed reward** (`unclaimed_reward_sats`/`_qoge`) —
-  `SUM(block_accounting.unclaimed_reward_satoshis)`. The residual
-  `subsidy + fees - coinbase_output`, which §26 already established cannot
-  generally be partitioned into unclaimed subsidy vs. unclaimed fees. Never
-  labeled "burn", "unissued subsidy", "destroyed coins", or "circulating
-  loss".
-- **Current UTXO-set value** (`utxo_set_value_sats`/`_qoge`) —
-  `COALESCE(SUM(o.value_satoshis), 0)` from `utxo_state` joined to
-  `transaction_outputs` for every currently-unspent row. This is the ONLY
-  metric of the five not sourced from `block_accounting` — it reads
-  current canonical UTXO membership directly, deliberately never via
-  `addresses.balance_satoshis` (§13.A's bare-multisig exclusion would
-  silently undercount) and never conditioned on an output having any
-  `output_addresses` row at all (an eligible unknown/non-addressed output
-  is still a real coin — `TestSupplyOverview_NonAddressUTXOIncluded`).
+This is explicitly **not** an eIquidus-style additive global counter
+(§2). There is no `+=` on `ApplyBlock` and no `-=` on `RollbackTo` — a
+row, once written, is **never** `UPDATE`d. Reorg safety comes entirely
+from the rows being branch-addressed and immutable, not from careful
+increment/decrement bookkeeping:
 
-None of these five fields, and no combination of them, is exposed or
-described as `circulating_supply`/`issued_supply`/`minted_supply`
-anywhere in the API, the HTML page, or this document. The API's JSON keys
-and the HTML page's own text both say explicitly that none of these
-values is circulating supply — see `internal/web/templates/supply.tmpl`.
+- A block's parent hash, its own `block_accounting` facts, and its
+  transaction/output body are all already immutable (§16, §26).
+  Therefore the cumulative values through that EXACT block are also
+  immutable, forever, regardless of whether the block is later orphaned.
+- If canonical chain `A → B → C` later reorgs to `A → D → E`, `B` and
+  `C`'s rollup rows remain valid historical facts about that specific,
+  no-longer-canonical branch. `RollbackTo` (`internal/store/reorg.go`) is
+  completely unmodified by this migration and never deletes, modifies, or
+  decrements a `block_supply_rollup` row — proven by
+  `TestSupplyRollup_Reorg`.
+- A future public reader simply follows `sync_state.indexed_block_hash`
+  and reads THAT block's rollup row — an ordinary indexed primary-key
+  lookup, `O(1)` regardless of chain length (§"Read performance target"
+  below).
 
-### Genesis and Core-unspendable outputs: two more reasons `coinbase_outputs != utxo_set_value`
+### Cumulative identities
 
-`CoinbaseOutputsSatoshis` and `UTXOSetValueSatoshis` are INTENTIONALLY
-different quantities, for two independent reasons already established at
-the `internal/store` layer (§16 "Core UTXO semantics", this section's own
-§26 predecessor):
+Two identities hold for every row, enforced by CHECK constraints AND by
+how the values are computed in Go (defense in depth, matching
+`block_accounting_reward_identity`'s existing two-layer pattern, §26):
 
-- The genesis coinbase output exists as a real `transaction_outputs` row,
-  counts toward both scheduled subsidy and coinbase outputs, but is never
-  inserted into `utxo_state` at all (`applyOutput`'s `isGenesis`
-  exclusion) — Core itself never treats it as spendable.
-- Any output `script.IsUnspendable` classifies as unspendable (OP_RETURN,
-  or a script exceeding `script.MaxScriptSize`) is likewise preserved in
-  `transaction_outputs` (and counted in whichever transaction's total —
-  coinbase or otherwise — it belongs to) but never inserted into
-  `utxo_state`.
+- **Reward identity** (cumulative form of `block_accounting`'s own
+  identity): `cumulative_coinbase_output + cumulative_unclaimed_reward =
+  cumulative_subsidy + cumulative_fee`. Holds automatically because each
+  cumulative field is the running sum of an already-identity-respecting
+  per-block fact.
+- **UTXO identity**: `cumulative_utxo_set_value + cumulative_fee +
+  cumulative_excluded_output = cumulative_coinbase_output`. Unlike the
+  other four cumulative fields, `cumulative_utxo_set_value_satoshis` is
+  **not** accumulated independently — it is *derived* from the other
+  three via this identity (`coinbase - fee - excluded`), so the identity
+  holds by construction, not by coincidence.
 
-Both are proven directly, not just asserted: `TestSupplyOverview_GenesisExcludedFromUTXOSet`
-and `TestSupplyOverview_UnspendableOutputExcluded`. Neither exclusion is
-"corrected" or reconciled — a smaller UTXO-set value than a naive
-`coinbase_outputs - fees` calculation would suggest is expected, not a
-bug, and Phase 2H.2 deliberately does not invent a "burned supply" metric
-to account for the gap (that would require a complete burn taxonomy,
-explicitly out of scope here).
+  **Why this algebra is valid** (the telescoping argument): every
+  non-coinbase transaction's value telescopes through history. Core
+  requires `input value ≥ output value + fee` for a non-coinbase
+  transaction, and this codebase's fee is computed as exactly that
+  difference (`applyTransaction`, §16). A spent output's value cancels
+  exactly against the later input that consumed it — it neither creates
+  nor destroys UTXO-set value on its own. What survives, summed across
+  the whole canonical prefix, is: every satoshi any coinbase transaction
+  ever created (`cumulative_coinbase_output`), minus every satoshi ever
+  paid as a fee (a transfer of pre-existing value into a miner's
+  coinbase claim — already counted once it re-enters via
+  `cumulative_coinbase_output`, so it must be subtracted out of the
+  non-coinbase side to avoid double-counting), minus every satoshi ever
+  encoded in an output Core's own coins view never admitted at creation
+  (`cumulative_excluded_output` — see below). A block's own underclaimed
+  reward needs no separate adjustment: it is already reflected by
+  `cumulative_coinbase_output` being smaller than
+  `cumulative_subsidy + cumulative_fee` would otherwise allow
+  (`TestSupplyRollup_Underclaim`).
 
-### Canonical-only, with a completeness check — never an understated total
+### Core-excluded output value — not "burn"
 
-`SupplyOverview`'s core aggregate reads
+`excluded_output_satoshis` (per block) / `cumulative_excluded_output_satoshis`
+(running total) is the value encoded in transaction outputs Core's own
+coins view never adds at creation, mirroring `applyOutput`'s existing
+`utxo_state` exclusion **exactly** (§16 "Core UTXO semantics"):
 
-```sql
-SELECT
-    count(*)                          AS canonical_blocks,
-    count(ba.block_hash)              AS accounted_blocks,
-    COALESCE(sum(ba.subsidy_satoshis), 0), ...
-FROM blocks b
-LEFT JOIN block_accounting ba ON ba.block_hash = b.hash
-WHERE b.canonical
-```
+- **Height 0 (genesis):** every output value, unconditionally — Core's
+  `ConnectBlock` never connects the genesis block's transactions at all.
+- **Height > 0:** an output is excluded iff `script.IsUnspendable`
+  (`(len>0 && first byte==OP_RETURN) || len>MAX_SCRIPT_SIZE`) — the exact
+  byte-level rule already governing live `utxo_state` creation, never
+  re-derived from `script_type`.
 
-in ONE statement, deliberately via a `LEFT JOIN` rather than an inner join
-or a bare `COALESCE(SUM(...), 0)` over `block_accounting` alone: a
-canonical block with no accounting row still counts toward
-`canonical_blocks` (as a non-NULL `blocks` row joined against NULL
-`block_accounting` columns), while `count(ba.block_hash)` — ordinary SQL
-`COUNT(column)` semantics — only counts the non-NULL join hits. A database
-upgraded from before Phase 2H.1 that has not (yet) run
-`backfill-accounting` (§26) therefore has `accounted_blocks !=
-canonical_blocks`, which `SupplyOverview` detects and rejects with
-`query.ErrAccountingIncomplete` rather than silently summing only the
-rows that happen to exist and returning an understated total. This
-mirrors the exact "source-data completeness, not just presence" principle
-§26 already applies to `BackfillBlockAccounting`'s own NULL-fee/missing-
-coinbase-output detection — the identical class of silent-undercount bug,
-caught the same way, one layer up.
+This is deliberately **not** called "burned supply," "destroyed supply,"
+or "circulating loss" anywhere in code or documentation. Genesis belongs
+to this category for UTXO-accounting purposes, but it is not an
+`OP_RETURN` burn — conflating the two would misrepresent genesis's
+well-understood, deliberate exclusion as an economic destruction event.
 
-An orphaned block's missing accounting row must NOT trigger this: only
-canonical coverage matters (`TestSupplyOverview_OrphanAccountingMissingDoesNotBlockCanonical`),
-since an orphan never contributes to canonical totals in the first place —
-`RollbackTo` never deletes a demoted block's `block_accounting` row (§26),
-it just stops mattering to this query's `WHERE b.canonical`.
+### `ApplyBlock` integration
 
-`internal/api`'s `handleSupply` maps `ErrAccountingIncomplete` to HTTP 503
-with the stable code `accounting_incomplete`; `internal/web`'s equivalent
-handler renders an explanatory HTML 503 mentioning
-`qoge-explorer backfill-accounting` as the operator remediation. Neither
-handler ever exposes a SQL string or other internal detail.
+`applySupplyRollup` (`internal/store/supply_rollup.go`) runs inside the
+SAME PostgreSQL transaction as the rest of `ApplyBlock`, immediately after
+`applyBlockAccounting` and strictly before the `sync_state` checkpoint
+update (still the final logical write — §16 task item 10). It consumes
+the EXACT `accounting.BlockFacts` `applyBlockAccounting` already computed
+for this same block in this same call — `applyBlockAccounting` was
+refactored to return them rather than recomputing a second time — so
+there is still only one fee/subsidy algorithm in this codebase (§26 "Fee
+source").
 
-### REPEATABLE READ snapshot: one coherent response, never a mixed one
+**Parent lookup is by `block.PreviousHash`, never `height - 1`** — the
+same reorg-correctness reasoning `checkCanonicalContinuity` already
+applies to canonical-tip continuity applies here too: a replacement
+branch's blocks must thread through their OWN immutable ancestry's rollup
+rows, not whatever happened to sit at the same height on a different,
+now-orphaned branch.
 
-`SupplyOverview` opens one `Store.readTx` (`REPEATABLE READ`, `ReadOnly`)
-— the same composite-read-snapshot pattern `ExplorerOverview`/
-`DeploymentOverview` already use (§20/§25) — and reads, in order, inside
-that single transaction: the `sync_state` anchor (`statusFrom`), then the
-canonical accounting aggregate, then the current UTXO-set value, firing
-the existing `snapshotTestHook` immediately after the first statement.
-Because PostgreSQL fixes a REPEATABLE READ transaction's snapshot at its
-first statement and holds it for every later statement in the same
-transaction, a concurrent `ApplyBlock`/`RollbackTo` committing between
-these reads can never produce a response that pairs one canonical state's
-height/hash with another canonical state's monetary totals —
-`TestSnapshotConsistency_SupplyOverview_ConcurrentReorg` proves this
-deterministically (no `sleep`) exactly the way §19/§20's own snapshot
-tests do: an in-flight `SupplyOverview` whose snapshot was fixed on branch
-A (an underclaiming block) must still report branch A's totals in full
-even after a real, concurrent reorg to branch B (a full claim) commits
-mid-flight, while a fresh call issued afterward sees branch B in full.
+**Arbitrary bootstrap and missing-parent policy** (this codebase's frozen
+test convenience — §16, §18 — lets an uninitialized `Store` bootstrap
+`ApplyBlock` at an arbitrary non-zero synthetic height, which numerous
+existing test suites depend on and which this phase must not weaken):
 
-An uninitialized explorer (`sync_state.indexed_height = -1`, no blocks at
-all) is a valid HTTP 200 with every total at zero — `canonical_blocks` and
-`accounted_blocks` are both 0, so the completeness check trivially passes.
-The HTML page renders "No block has been indexed yet."; this is never
-described as, or confused with, "chain supply of zero."
+- Height 0 (real genesis) always gets a rollup — parent is the zero
+  value.
+- A non-zero-height block applied as the very first call to an
+  uninitialized store (an arbitrary synthetic bootstrap) gets **no**
+  rollup row at all, silently — no fabricated zero-based row is ever
+  invented for it (`TestSupplyRollup_ArbitraryBootstrap`). Every later
+  block appended on top of that same bootstrap chain also finds no
+  parent rollup and, seeing genesis itself has none either
+  (`genesisRollupExists`), silently propagates the same "no lineage"
+  state forever.
+- Once a chain's real genesis (height 0) DOES have a rollup, any later
+  block whose immediate parent unexpectedly lacks one is a genuine
+  integrity failure — `ErrRollupParentMissing`, and the whole `ApplyBlock`
+  transaction rolls back rather than inventing a fabricated row
+  (`TestSupplyRollup_MissingParent`). `genesisRollupExists` is the single
+  source of truth distinguishing these two cases: it is the only
+  condition that could ever cause a "missing parent" observation to mean
+  something different than "this chain never had a lineage."
 
-### Aggregate identity: defense in depth, in Go, with checked arithmetic
+**Idempotency.** Uses the exact same `insertOrVerifyIdempotent` path as
+every other immutable identity in this package (`ErrImmutableConflict` on
+a contradictory row, a safe no-op verification on an exact replay). A
+previously-orphaned block whose rollup row survived `RollbackTo`
+untouched simply re-verifies on re-promotion
+(`TestSupplyRollup_RePromotion`); a pre-0005 historical orphan with no
+rollup at all, legitimately re-promoted later, gets one inserted fresh at
+that point, computed from its (canonical, rollup-bearing) parent.
 
-Every individual `block_accounting` row already satisfies
-`block_accounting_reward_identity` (§26: `coinbase_output + unclaimed ==
-subsidy + fee`, DB-enforced). `SupplyOverview` re-verifies the AGGREGATE
-form of the same identity independently, in Go, using a checked `int64`
-addition (`checkedAddInt64` — duplicated from, not imported from,
-`internal/accounting`'s own `checkedAdd`, since `internal/query` must not
-depend on a write-adjacent package for two lines of arithmetic): summing
-already-individually-valid rows is cheap to get wrong in a way no single
-row's CHECK constraint would ever catch, so this is genuine defense in
-depth, not a redundant restatement. A failure here — `query.ErrSupplyIntegrity`
-— can only mean database corruption or an aggregation bug; `SupplyOverview`
-returns no data rather than a value it cannot vouch for.
+**Checked arithmetic.** Every cumulative addition/subtraction uses the
+same checked-arithmetic policy as the rest of this package (`addChecked`,
+plus a new `subChecked` for the UTXO-value derivation) — overflow fails
+the whole `ApplyBlock` transaction with `ErrAmountOverflow` rather than
+silently wrapping (`TestSupplyRollup_Overflow`, which fabricates a
+near-`math.MaxInt64` parent row directly via SQL to force a real overflow
+deterministically, since no real chain state could reach it).
 
-PostgreSQL's `SUM(BIGINT)` itself returns `NUMERIC`, not `int8` — the same
-scan-into-`int64` pattern this codebase already uses elsewhere
-(`recomputeAddress`'s balance aggregation, `BackfillBlockAccounting`'s fee/
-coinbase-output sums, both in `internal/store`) is reused here rather than
-inventing a new one, and it fails loudly (a Go `error` from `Scan`, never
-a silently wrapped/truncated value) if a corrupted or artificially extreme
-aggregate does not fit `int64` —
-`TestSupplyOverview_AggregateOverflowFailsLoudly` proves this directly by
-inflating two blocks' `block_accounting` rows (via test-only raw SQL,
-something real indexing's own checked arithmetic would never produce) to
-a magnitude whose SUM exceeds `math.MaxInt64`, and asserting
-`SupplyOverview` fails rather than returning a wrapped/negative-looking
-total.
+### Backfill: `qoge-explorer backfill-supply-rollup`
 
-### UTXO-set value: real benchmark, no cache
+Mirrors `backfill-accounting`'s operator-command shape (§26) but is
+implemented as a single **set-based** SQL operation
+(`internal/store/supply_rollup_backfill.go`), not 2,500,000 Go/SQL round
+trips:
 
-Per this phase's own instruction to benchmark before adding any caching
-layer, `internal/query`'s two aggregate queries were measured with
-`EXPLAIN (ANALYZE, BUFFERS)` against a real local PostgreSQL instance (the
-only PostgreSQL available in this development environment — there is no
-separate production-scale explorer database to measure against here),
-seeded with 25,000 synthetic canonical blocks (25,000 `block_accounting`
-rows, 24,999 unspent `utxo_state` rows — one fewer than blocks because
-genesis's coinbase output is never inserted into `utxo_state` at all, per
-above):
+- **Schema-only migration, explicit backfill.** `0005_block_supply_rollup`
+  writes no data row itself, exactly like `0004_block_accounting` before
+  it. An already-indexed legacy database gets this table populated only
+  by explicitly running `backfill-supply-rollup`.
+- **Canonical-only, current-tip scope.** Backfills the canonical chain
+  from genesis through `sync_state`'s tip only — never every historical
+  orphan. A historical orphan gains a rollup only via live re-promotion
+  through `Store.ApplyBlock`, per the policy above.
+- **One window-function pass.** A single `SUM(...) OVER (ORDER BY
+  height)` query, materialized into a transaction-scoped `TEMP TABLE`
+  (`ON COMMIT DROP`), computes every canonical block's cumulative values
+  in one pass. Per-block excluded-output value is computed by joining
+  `blocks → block_transactions → transaction_outputs`, filtered to
+  canonical block OCCURRENCES — never a global per-`txid` attribution,
+  since a `txid` can have more than one historical block occurrence
+  across a resolved reorg.
+- **Canonical shape AND ancestry preflight — acceptable ONLY here.** Before
+  computing anything, an `O(chain-size)` scan proves the canonical block
+  set is exactly `[0, indexed_height]` (count, minimum height, maximum
+  height — the same three-condition proof structure considered, but never
+  shipped, for the rejected direct-aggregation Phase 2H.2 design). A
+  **second**, independent scan then proves that height-contiguous set is
+  also exactly ONE parent-linked chain, not merely a set of blocks that
+  happen to occupy the right heights: genesis's `prev_hash` is `NULL`, and
+  every other canonical block's `prev_hash` equals the canonical block's
+  `hash` at `height-1` (`findCanonicalAncestryBreach`,
+  `ErrSupplyRollupCanonicalAncestryInvalid`), via a single
+  `lag(hash) OVER (ORDER BY height)` query — safe from join ambiguity
+  because `blocks_height_canonical_uidx` (migration 0001, frozen) already
+  guarantees at most one canonical block per height. **The shape check
+  alone cannot prove ancestry**: a height-contiguous canonical set could
+  still have one block's `prev_hash` pointing at an orphaned block instead
+  of its true canonical predecessor (external corruption, a hand-edited
+  fixture, or any other divergence between "the right set of hashes" and
+  "the right chain of hashes") — `supplyRollupStagingSQL`'s
+  `SUM(...) OVER (ORDER BY height)` would silently window-aggregate across
+  that break as if it were one valid chain, since a window function has no
+  way to know it should have followed `prev_hash` links instead of trusting
+  the height ordering. The ancestry scan mechanically proves that
+  assumption before any aggregation runs, rather than trusting it. Finally,
+  every canonical block must already have a `block_accounting` row. All of
+  this full-chain scanning is acceptable ONLY on this one-time operator
+  path and explicitly forbidden from ever reaching a public HTTP route,
+  `VerifySupplyRollupCoverage`'s `index`-startup check (which stays a
+  single `O(1)` primary-key lookup), or `Store.ApplyBlock` itself (which
+  already proves continuity incrementally, one block at a time, via
+  `checkCanonicalContinuity` — §16).
+- **Atomic publication, one transaction.** The ENTIRE operation — shape
+  preflight, the window-function computation, the insert, and both
+  independent cross-checks below — runs inside one PostgreSQL
+  transaction. Any failure at any point rolls back the whole thing; not
+  one row is ever published if anything disagrees.
+- **Two independent cross-checks before commit.** The tip's freshly
+  computed cumulative UTXO value is compared against an INDEPENDENT
+  direct full scan of `utxo_state` joined to `transaction_outputs` (the
+  exact expensive query the rejected direct-aggregation design used —
+  acceptable ONCE here, never per HTTP request), and the tip's cumulative
+  monetary totals are compared against an independent direct `SUM` over
+  canonical `block_accounting`. Either mismatch aborts the whole
+  transaction (`ErrSupplyRollupCrossCheckFailed`) — nothing is ever
+  published on unverified trust in the window-function arithmetic alone.
+- **Idempotent and restartable.** Already-existing rows are compared
+  against the freshly computed values before anything is inserted; any
+  mismatch aborts the whole run (`ErrImmutableConflict`) rather than
+  overwriting. `INSERT ... ON CONFLICT (block_hash) DO NOTHING` then
+  fills exactly the missing rows.
+- **Concurrency.** A schema-scoped, transaction-scoped advisory lock
+  (`pg_try_advisory_xact_lock`, auto-released at commit/rollback) in a
+  namespace DISTINCT from `backfill-accounting`'s own — the two commands
+  never contend with each other even against the same schema, but two
+  `backfill-supply-rollup` runs against the SAME schema are mechanically
+  excluded. `schemaScopedLockKey` (§26) was generalized to accept the
+  namespace as a parameter rather than a hardcoded constant, so both
+  commands share the underlying schema-hashing logic. Does NOT serialize
+  against a live `index` process — that remains an operational
+  requirement (stop `index` first), identical to `backfill-accounting`.
+- **Network preflight.** Reuses `store.VerifyNetworkIdentity` exactly as
+  `backfill-accounting` does, even though the rollup computation itself
+  never touches the subsidy schedule — applied consistently across every
+  write-capable command this codebase has.
 
-| Query | Plan | Execution time |
-|---|---|---|
-| Canonical accounting aggregate | Hash Left Join, sequential scans on `blocks` (25,000 rows) and `block_accounting` (25,000 rows) | 29.3 ms |
-| UTXO-set value aggregate | Hash Join, sequential scans on `utxo_state` (24,999 unspent rows) and `transaction_outputs` (25,000 rows) | 19.8 ms |
-| Combined `SupplyOverview` (one REPEATABLE READ transaction, both queries plus the `sync_state` read) | — | ~45 ms, both cold and warm |
+### `index` startup preflight
 
-Both plans choose a sequential scan on purpose, not for lack of an index:
-each query aggregates over (effectively) the entire table, so a full scan
-is the CORRECT plan regardless of indexing — an index on
-`block_accounting.block_hash`/`utxo_state (txid, vout_index)` (both
-already indexed, being primary keys) cannot make a whole-table aggregate
-cheaper than reading the whole table. No new index was added, and per
-this phase's own instruction, none is proposed: 45 ms combined is
-comfortably inside the "≤ 1 second" target with no caching layer, so
-`SupplyOverview` performs direct PostgreSQL aggregation on every request
-— no materialized view, no refresh job, no indexer-side running counter,
-no new migration. If a future, much larger chain ever makes this
-materially slower, that is a separately reviewed architecture decision,
-not one made speculatively here.
+`store.VerifySupplyRollupCoverage` (called from `runIndex`, never
+automatically by `Store` itself — same pattern as
+`VerifyNetworkIdentity`) fails `index` early, before the first live block
+fetch, if the database already has an indexed canonical tip, migration
+0005 has been applied, but that tip has no `block_supply_rollup` row —
+the exact "migrated 0005 but forgot to run backfill-supply-rollup" gap,
+caught with an actionable message rather than only failing later on the
+first live `ApplyBlock` call. It is a single `O(1)` primary-key existence
+check (never a full-chain scan — that stays exclusive to the backfill
+command's own preflight), and does not fire against a completely fresh,
+pre-genesis database.
 
-### What Phase 2H.2 deliberately does not do
+### Read performance target
 
-No charts, no historical supply graph, no issuance-by-height graph, no
-AJAX polling, no `live.js` change, no homepage summary card — the existing
-`/supply` page is deliberately static per request, matching every other
-Phase 2E.1/2F.2/2G.2 page before live-refresh was separately, explicitly
-added (§21). No rich list, no `/addresses`, no top-balances/distribution
-view — deferred to Phase 2H.3. No `issued_supply`/`actual_supply`/
-`minted_supply` field: the relationship between scheduled subsidy,
-unclaimed reward, genesis, and Core-unspendable outputs makes a casual
-single "supply" number for public display unsafe without a separately
-reviewed semantic definition (§26's "Scheduled subsidy total" bullet) —
-Phase 2H.2 instead exposes the five source facts directly and lets the
-reader combine them with full context, which is exactly what
-`templates/supply.tmpl`'s explanatory text does.
+Although Phase 2H.2a adds no public route, `TestSupplyRollupBenchmark_TipLookup`
+(env-var-gated, deleted before commit — see §26's identical benchmark
+convention) measured the intended future access pattern — exact
+`sync_state` tip hash → one `block_supply_rollup` row, a primary-key
+lookup — against a 2,500,000-row synthetic fixture in a disposable
+PostgreSQL schema:
+
+| rows      | table size | PK index size | total size | cold    | warm #1  | warm #2  | warm #3  |
+|-----------|-----------|---------------|------------|---------|----------|----------|----------|
+| 2,500,000 | 399 MB    | 231 MB        | 629 MB     | 6.0 ms  | 0.60 ms  | 0.76 ms  | 0.69 ms  |
+
+Comfortably below the 100 ms target — in fact below even the "single/low-
+double-digit ms warm" stretch goal, both cold and warm, consistent with
+what an ordinary indexed `PRIMARY KEY` lookup should cost regardless of
+how many other rows share the table: PostgreSQL's B-tree index descent is
+`O(log n)`, not `O(n)`, and at this row count that is a handful of page
+reads either way. This is the qualitative difference from the rejected
+direct-aggregation design (§26/history): that design's cost scaled with
+the number of blocks/UTXOs being aggregated on every request; this
+design's cost is fixed by the depth of one B-tree, independent of chain
+length.
+
+### Phase boundary
+
+Production changes are confined to `migrations/0005_block_supply_rollup.*`,
+`internal/store/supply_rollup*.go`, a small integration point in
+`internal/store/apply.go` and `internal/store/accounting.go` (returning
+already-computed facts rather than recomputing them), and
+`cmd/qoge-explorer/main.go` (the new `backfill-supply-rollup` command and
+the `index` startup preflight). `internal/query`, `internal/api`, and
+`internal/web` are **untouched** — there is still no `/api/v1/supply`, no
+`/supply` page, no public metric, and no rich list. `internal/accounting`,
+`internal/indexer`, `internal/mempool`, `internal/deployments`,
+`internal/rpc`, `internal/decode`, `internal/script`, and
+`internal/chain` are likewise untouched. Migrations 0001-0004 are
+byte-for-byte unchanged. `docs/ARCHITECTURE.md` and this section, plus
+the three prior-phase migration round-trip tests below, are the only
+non-`internal/store`/`cmd` changes.
+
+**Prior-phase migration test updates (test-only, not a phase-boundary
+violation).** Adding migration 0005 shifted the "how many migrations sit
+on top of X" arithmetic three existing round-trip tests hardcoded:
+`internal/deployments/migrate_test.go` (`TestMigrationRoundTrip_PreservesExistingData`,
+rolling back to v2), `internal/deployments/migrate_0004_test.go`
+(`TestMigrationRoundTrip_0004PreservesExistingData`, rolling back to v3),
+and `internal/mempool/migration_test.go` (`TestMigration_0002RoundTrip`,
+rolling back to v1). Each now computes its step count as `len(migrations)
+- targetVersion` instead of a hardcoded literal, so they will not need
+editing again the next time a migration is added on top — a robustness
+fix, not a behavioral change to anything Phase 2G/2F's own tests actually
+verify (which remains: their own migration's tables round-trip cleanly,
+and neither confirmed-chain nor mempool data is ever touched by the
+cycle).
+
+Phase 2H.2b — adapting the previously-benchmarked-and-rejected `/supply`
+read surface (PR #14) to read from `block_supply_rollup` instead of
+aggregating live — is deliberately deferred to a separate PR, after this
+one merges.

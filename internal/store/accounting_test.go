@@ -612,10 +612,11 @@ func TestBackfillAccounting_ConcurrentRunRejected(t *testing.T) {
 	}
 	defer conn.Release()
 
-	namespace, schemaKey, _, err := schemaScopedLockKey(ctx, conn)
+	schemaKey, _, err := schemaScopedLockKey(ctx, conn)
 	if err != nil {
 		t.Fatalf("schemaScopedLockKey: %v", err)
 	}
+	namespace := backfillAccountingAdvisoryLockNamespace
 
 	var locked bool
 	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespace, schemaKey).Scan(&locked); err != nil {
@@ -661,10 +662,11 @@ func TestBackfillAccounting_DifferentSchemaNotBlocked(t *testing.T) {
 	}
 	defer connA.Release()
 
-	namespaceA, schemaKeyA, schemaNameA, err := schemaScopedLockKey(ctx, connA)
+	schemaKeyA, schemaNameA, err := schemaScopedLockKey(ctx, connA)
 	if err != nil {
 		t.Fatalf("schemaScopedLockKey(A): %v", err)
 	}
+	namespaceA := backfillAccountingAdvisoryLockNamespace
 
 	var lockedA bool
 	if err := connA.QueryRow(ctx, `SELECT pg_try_advisory_lock($1, $2)`, namespaceA, schemaKeyA).Scan(&lockedA); err != nil {
@@ -684,7 +686,7 @@ func TestBackfillAccounting_DifferentSchemaNotBlocked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("acquire schema B connection: %v", err)
 	}
-	_, schemaKeyB, schemaNameB, err := schemaScopedLockKey(ctx, connB)
+	schemaKeyB, schemaNameB, err := schemaScopedLockKey(ctx, connB)
 	connB.Release()
 	if err != nil {
 		t.Fatalf("schemaScopedLockKey(B): %v", err)
