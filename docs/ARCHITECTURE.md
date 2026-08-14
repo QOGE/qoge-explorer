@@ -4859,14 +4859,37 @@ trips:
   canonical block OCCURRENCES — never a global per-`txid` attribution,
   since a `txid` can have more than one historical block occurrence
   across a resolved reorg.
-- **Canonical shape preflight — acceptable ONLY here.** Before computing
-  anything, an `O(chain-size)` scan proves the canonical block set is
-  exactly `[0, indexed_height]` (count, minimum height, maximum height —
-  the same three-condition proof structure considered, but never shipped,
-  for the rejected direct-aggregation Phase 2H.2 design) and that every
-  canonical block already has a `block_accounting` row. This full-chain
-  scan is acceptable on this one-time operator path and explicitly
-  forbidden from ever reaching a public HTTP route.
+- **Canonical shape AND ancestry preflight — acceptable ONLY here.** Before
+  computing anything, an `O(chain-size)` scan proves the canonical block
+  set is exactly `[0, indexed_height]` (count, minimum height, maximum
+  height — the same three-condition proof structure considered, but never
+  shipped, for the rejected direct-aggregation Phase 2H.2 design). A
+  **second**, independent scan then proves that height-contiguous set is
+  also exactly ONE parent-linked chain, not merely a set of blocks that
+  happen to occupy the right heights: genesis's `prev_hash` is `NULL`, and
+  every other canonical block's `prev_hash` equals the canonical block's
+  `hash` at `height-1` (`findCanonicalAncestryBreach`,
+  `ErrSupplyRollupCanonicalAncestryInvalid`), via a single
+  `lag(hash) OVER (ORDER BY height)` query — safe from join ambiguity
+  because `blocks_height_canonical_uidx` (migration 0001, frozen) already
+  guarantees at most one canonical block per height. **The shape check
+  alone cannot prove ancestry**: a height-contiguous canonical set could
+  still have one block's `prev_hash` pointing at an orphaned block instead
+  of its true canonical predecessor (external corruption, a hand-edited
+  fixture, or any other divergence between "the right set of hashes" and
+  "the right chain of hashes") — `supplyRollupStagingSQL`'s
+  `SUM(...) OVER (ORDER BY height)` would silently window-aggregate across
+  that break as if it were one valid chain, since a window function has no
+  way to know it should have followed `prev_hash` links instead of trusting
+  the height ordering. The ancestry scan mechanically proves that
+  assumption before any aggregation runs, rather than trusting it. Finally,
+  every canonical block must already have a `block_accounting` row. All of
+  this full-chain scanning is acceptable ONLY on this one-time operator
+  path and explicitly forbidden from ever reaching a public HTTP route,
+  `VerifySupplyRollupCoverage`'s `index`-startup check (which stays a
+  single `O(1)` primary-key lookup), or `Store.ApplyBlock` itself (which
+  already proves continuity incrementally, one block at a time, via
+  `checkCanonicalContinuity` — §16).
 - **Atomic publication, one transaction.** The ENTIRE operation — shape
   preflight, the window-function computation, the insert, and both
   independent cross-checks below — runs inside one PostgreSQL

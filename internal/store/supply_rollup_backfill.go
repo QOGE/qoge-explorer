@@ -5,15 +5,32 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // backfillSupplyRollupAdvisoryLockNamespace is a namespace DISTINCT from
-// backfillAccountingAdvisoryLockNamespace (backfill.go) — a concurrent
+// backfillAccountingAdvisoryLockNamespace (backfill.go), so a concurrent
 // backfill-accounting run and a concurrent backfill-supply-rollup run
-// against the same schema do not contend with each other (they touch
-// disjoint tables), only two backfill-supply-rollup runs against the SAME
-// schema do (see schemaScopedLockKey, reused verbatim from backfill.go).
+// against the same schema do not contend for the SAME advisory lock key —
+// only two backfill-supply-rollup runs against the SAME schema do (see
+// schemaScopedLockKey, reused verbatim from backfill.go).
+//
+// This does NOT mean the two commands are independent of each other's
+// DATA: backfill-supply-rollup READS block_accounting (backfill-accounting
+// WRITES it), so a supply-rollup backfill genuinely depends on
+// backfill-accounting having already completed for every canonical block —
+// this dependency is enforced by BackfillSupplyRollup's own preflight
+// (ErrSupplyRollupSourceIncomplete below), not by the lock. Using separate
+// lock namespaces instead of one shared lock remains safe specifically
+// because: block_accounting rows are immutable once written (never
+// UPDATEd — §26), so a supply-rollup backfill running concurrently with an
+// UNRELATED backfill-accounting pass over a DIFFERENT set of blocks cannot
+// observe a row change mid-read; and if backfill-accounting's pass is
+// still incomplete for the canonical set this command needs, the
+// source-completeness preflight fails closed and nothing is published —
+// never a half-computed rollup silently built from a partially-backfilled
+// accounting table.
 const backfillSupplyRollupAdvisoryLockNamespace int32 = 728341002
 
 // ErrSupplyRollupBackfillAlreadyRunning means another BackfillSupplyRollup
@@ -29,6 +46,21 @@ var ErrSupplyRollupBackfillAlreadyRunning = errors.New("store: another backfill-
 // operator-path integrity gate (task item 29) — never run against the hot
 // public read path.
 var ErrSupplyRollupCanonicalShapeInvalid = errors.New("store: backfill supply rollup: canonical chain shape does not match sync_state")
+
+// ErrSupplyRollupCanonicalAncestryInvalid means the canonical block SET has
+// the right shape (count/min/max — ErrSupplyRollupCanonicalShapeInvalid
+// above) but is NOT one single parent-linked chain: some canonical block's
+// prev_hash does not equal the canonical block's hash at the immediately
+// lower height (or, for height 0, is not NULL). The height-ordered shape
+// check alone cannot catch this — a set of canonical blocks at heights
+// 0..N could, in principle, disagree with each other about ancestry while
+// still satisfying count==N+1, min==0, max==N (e.g. a stray prev_hash
+// pointing at an orphaned block instead of the actual canonical
+// predecessor). supplyRollupStagingSQL's SUM(...) OVER (ORDER BY height)
+// silently assumes the canonical height sequence IS the one valid
+// parent-linked chain — this preflight mechanically proves that assumption
+// before any window aggregation runs, rather than trusting it.
+var ErrSupplyRollupCanonicalAncestryInvalid = errors.New("store: backfill supply rollup: canonical chain ancestry is not a single parent-linked chain")
 
 // ErrSupplyRollupSourceIncomplete means at least one canonical block has no
 // block_accounting row — BackfillSupplyRollup refuses to guess a missing
@@ -86,9 +118,12 @@ type SupplyRollupBackfillResult struct {
 // released at commit or rollback, no manual unlock bookkeeping needed) with
 // a schema-scoped key from schemaScopedLockKey (backfill.go) under a
 // DIFFERENT namespace than backfill-accounting's lock — the two commands
-// don't serialize against each other (they touch disjoint tables), but two
+// don't contend for the same LOCK, but backfill-supply-rollup genuinely
+// READS block_accounting (which backfill-accounting writes); see
+// backfillSupplyRollupAdvisoryLockNamespace's doc comment for exactly why
+// separate lock namespaces remain safe despite that data dependency. Two
 // backfill-supply-rollup runs against the SAME schema are mechanically
-// excluded; runs against different schemas are independent.
+// excluded by this lock; runs against different schemas are independent.
 //
 // # Preflight (task item 29)
 //
@@ -102,7 +137,19 @@ type SupplyRollupBackfillResult struct {
 //     count=3=want but min=1). This full-chain scan is acceptable ONLY
 //     here, on this operator/backfill path — never on the hot public read
 //     path (task item 29).
-//  3. Every canonical block must already have a block_accounting row (run
+//  3. The canonical block set must also be exactly ONE parent-linked
+//     chain, not merely height-contiguous: genesis's prev_hash is NULL,
+//     and every other canonical block's prev_hash equals the canonical
+//     block's hash at height-1 (findCanonicalAncestryBreach,
+//     ErrSupplyRollupCanonicalAncestryInvalid). The shape check above
+//     proves the canonical set occupies exactly [0, indexed_height]; this
+//     check additionally proves those blocks actually agree with each
+//     other about ancestry — a height-contiguous set could otherwise
+//     satisfy the shape check while one block's prev_hash points at an
+//     orphan instead of its true canonical predecessor, which the
+//     window-function computation below would silently aggregate across
+//     as if it were a single valid chain.
+//  4. Every canonical block must already have a block_accounting row (run
 //     `backfill-accounting` first if not).
 //
 // # Set-based computation (task item 26/27/28)
@@ -191,6 +238,14 @@ func BackfillSupplyRollup(ctx context.Context, pool *pgxpool.Pool) (SupplyRollup
 	if maxHeight == nil || *maxHeight != indexedHeight {
 		return SupplyRollupBackfillResult{}, fmt.Errorf("%w: maximum canonical height = %s, want %d (indexed_height)",
 			ErrSupplyRollupCanonicalShapeInvalid, formatHeightPtr(maxHeight), indexedHeight)
+	}
+
+	if breach, err := findCanonicalAncestryBreach(ctx, tx); err != nil {
+		return SupplyRollupBackfillResult{}, fmt.Errorf("store: backfill supply rollup: canonical ancestry scan: %w", err)
+	} else if breach != nil {
+		return SupplyRollupBackfillResult{}, fmt.Errorf("%w: child %s (height %d) has prev_hash %s, want canonical parent %s",
+			ErrSupplyRollupCanonicalAncestryInvalid, breach.childHash, breach.childHeight,
+			formatNullableHash(breach.observedPrevHash), formatNullableHash(breach.expectedPrevHash))
 	}
 
 	var missingAccounting int64
@@ -283,6 +338,78 @@ func formatHeightPtr(h *int64) string {
 		return "none"
 	}
 	return fmt.Sprintf("%d", *h)
+}
+
+// formatNullableHash renders a nullable hash for an error message — "NULL"
+// for nil (genesis's expected/observed prev_hash) rather than a bare
+// "<nil>".
+func formatNullableHash(h *string) string {
+	if h == nil {
+		return "NULL"
+	}
+	return *h
+}
+
+// ancestryBreach describes the first canonical block found whose prev_hash
+// does not match its canonical predecessor (see
+// ErrSupplyRollupCanonicalAncestryInvalid).
+type ancestryBreach struct {
+	childHash        string
+	childHeight      int64
+	observedPrevHash *string
+	expectedPrevHash *string
+}
+
+// findCanonicalAncestryBreach proves the canonical block set forms exactly
+// ONE parent-linked chain, not merely a height-contiguous set (task item 2
+// of the ancestry correction): genesis (height 0) must have prev_hash
+// NULL, and every other canonical block's prev_hash must equal the
+// canonical block's hash at height-1. Because
+// blocks_height_canonical_uidx (migration 0001, frozen) already guarantees
+// at most one canonical block per height, and the caller has already
+// proven the canonical set is exactly the contiguous range
+// [0, indexed_height] (canonical count/min/max — checked immediately
+// before this call), lag(hash) OVER (ORDER BY height) unambiguously
+// identifies "the canonical block one height below" for every row — no
+// join ambiguity is possible.
+//
+// This is NOT redundant with the shape check: a set of canonical blocks at
+// heights 0..N can satisfy count==N+1, min==0, max==N while one of them
+// has a prev_hash pointing at an orphaned block instead of its actual
+// canonical predecessor (e.g. external corruption, or a hand-edited
+// fixture) — supplyRollupStagingSQL's SUM(...) OVER (ORDER BY height)
+// would silently window-aggregate across that break as if it were a valid
+// chain. This scan proves that assumption before any aggregation runs.
+//
+// Returns the first breach found (deterministic: lowest height), or nil if
+// none exists. This is an O(chain-size) scan, acceptable ONLY on this
+// operator/backfill path (task item 9 of the ancestry correction — never
+// the hot public read path, and never Store.ApplyBlock, which already
+// proves continuity incrementally one block at a time via
+// checkCanonicalContinuity).
+func findCanonicalAncestryBreach(ctx context.Context, tx pgx.Tx) (*ancestryBreach, error) {
+	var breach ancestryBreach
+	err := tx.QueryRow(ctx, `
+		WITH canonical_chain AS (
+			SELECT hash, height, prev_hash,
+			       lag(hash) OVER (ORDER BY height) AS expected_prev_hash
+			FROM blocks
+			WHERE canonical
+		)
+		SELECT hash, height, prev_hash, expected_prev_hash
+		FROM canonical_chain
+		WHERE (height = 0 AND prev_hash IS NOT NULL)
+		   OR (height > 0 AND prev_hash IS DISTINCT FROM expected_prev_hash)
+		ORDER BY height
+		LIMIT 1
+	`).Scan(&breach.childHash, &breach.childHeight, &breach.observedPrevHash, &breach.expectedPrevHash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &breach, nil
 }
 
 // supplyRollupStagingSQL builds supply_rollup_staging, a transaction-scoped
