@@ -18,11 +18,12 @@ import (
 )
 
 // TestRootHandler_SupplyRoutesCoreIndependent is Phase 2H.2 spec items
-// 57/58: newRootHandler is built from ONLY a *query.Store — it takes no
-// Core RPC configuration at all (see newRootHandler's signature in
-// main.go), so /api/v1/supply and /supply working with QOGE_RPC_USER/
-// QOGE_RPC_PASSWORD deliberately unset in this test process is not a
-// coincidence, it's structural: `serve` never constructs an RPC client.
+// 57/58, extended by Phase 2H.3 spec item 37 to cover /api/v1/richlist and
+// /richlist: newRootHandler is built from ONLY a *query.Store — it takes
+// no Core RPC configuration at all (see newRootHandler's signature in
+// main.go), so these routes working with QOGE_RPC_USER/QOGE_RPC_PASSWORD
+// deliberately unset in this test process is not a coincidence, it's
+// structural: `serve` never constructs an RPC client.
 func TestRootHandler_SupplyRoutesCoreIndependent(t *testing.T) {
 	t.Setenv("QOGE_RPC_USER", "")
 	t.Setenv("QOGE_RPC_PASSWORD", "")
@@ -48,6 +49,26 @@ func TestRootHandler_SupplyRoutesCoreIndependent(t *testing.T) {
 	ct = rec.Header().Get("Content-Type")
 	if !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("/supply Content-Type = %q, want text/html", ct)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/richlist", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/v1/richlist status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	ct = rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("/api/v1/richlist Content-Type = %q, want application/json", ct)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/richlist", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/richlist status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	ct = rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("/richlist Content-Type = %q, want text/html", ct)
 	}
 }
 

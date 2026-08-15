@@ -39,6 +39,7 @@ var pageTemplateFiles = map[string]string{
 	"deployments": "templates/deployments.tmpl",
 	"deployment":  "templates/deployment.tmpl",
 	"supply":      "templates/supply.tmpl",
+	"richlist":    "templates/richlist.tmpl",
 }
 
 // pages maps a page name to its fully-parsed layout+page *template.Template

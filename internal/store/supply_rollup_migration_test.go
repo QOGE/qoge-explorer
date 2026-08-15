@@ -9,7 +9,11 @@ import (
 
 // TestMigrations_SupplyRollupRoundTrip is task item 38: 0004 -> 0005 -> 0004
 // -> 0005, proving existing data (from 0004 and earlier) survives the round
-// trip and 0005's down migration removes ONLY block_supply_rollup.
+// trip and 0005's down migration removes ONLY block_supply_rollup. Bounded
+// explicitly to the 0001-0005 prefix (through0005), not the full loaded
+// migration set: Phase 2H.3 added migration 0006 on top of 0005, and this
+// test's own "Up to 0005" / "Down one step (0005)" steps must stay pinned
+// to 0005 regardless of what's layered on top later.
 func TestMigrations_SupplyRollupRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestSchema(t)
@@ -25,6 +29,7 @@ func TestMigrations_SupplyRollupRoundTrip(t *testing.T) {
 		t.Fatal("migration 0005 not found among loaded migrations")
 	}
 	through0004 := migrations[:idx0005]
+	through0005 := migrations[:idx0005+1]
 
 	if _, err := Up(ctx, pool, through0004); err != nil {
 		t.Fatalf("Up through 0004: %v", err)
@@ -53,7 +58,7 @@ func TestMigrations_SupplyRollupRoundTrip(t *testing.T) {
 	}
 
 	// 0004 -> 0005
-	if _, err := Up(ctx, pool, migrations); err != nil {
+	if _, err := Up(ctx, pool, through0005); err != nil {
 		t.Fatalf("Up to 0005: %v", err)
 	}
 	if !tableExists(t, ctx, pool, "block_supply_rollup") {
@@ -61,7 +66,7 @@ func TestMigrations_SupplyRollupRoundTrip(t *testing.T) {
 	}
 
 	// 0005 -> 0004 (down one step)
-	if _, err := Down(ctx, pool, migrations, 1); err != nil {
+	if _, err := Down(ctx, pool, through0005, 1); err != nil {
 		t.Fatalf("Down 1 (0005): %v", err)
 	}
 	if tableExists(t, ctx, pool, "block_supply_rollup") {
@@ -74,7 +79,7 @@ func TestMigrations_SupplyRollupRoundTrip(t *testing.T) {
 	requireCount(t, ctx, pool, "blocks", blockHash, 1)
 
 	// 0004 -> 0005 again
-	if _, err := Up(ctx, pool, migrations); err != nil {
+	if _, err := Up(ctx, pool, through0005); err != nil {
 		t.Fatalf("re-Up to 0005: %v", err)
 	}
 	if !tableExists(t, ctx, pool, "block_supply_rollup") {
@@ -96,8 +101,12 @@ func requireCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, table, 
 }
 
 func pkColumn(table string) string {
-	if table == "blocks" {
+	switch table {
+	case "blocks":
 		return "hash"
+	case "addresses":
+		return "address"
+	default:
+		return "block_hash"
 	}
-	return "block_hash"
 }

@@ -65,6 +65,7 @@ var knownGETRoutes = []string{
 	"/deployments",
 	"/deployments/{name}",
 	"/supply",
+	"/richlist",
 	"/static/",
 }
 
@@ -82,6 +83,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /deployments/{name}", s.handleDeployment)
 
 	s.mux.HandleFunc("GET /supply", s.handleSupply)
+
+	s.mux.HandleFunc("GET /richlist", s.handleRichList)
 
 	staticSub, err := fs.Sub(staticFS, "static")
 	if err != nil {
