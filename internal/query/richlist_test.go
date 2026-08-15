@@ -450,6 +450,87 @@ func TestRichListOverview_P2QPKParticipatesNormally(t *testing.T) {
 	}
 }
 
+// TestRichListOverview_RePromotionRestoresRanking is the Phase 2H.3 internal
+// review correction: the fourth reorg-adjacent gate (new output / spend /
+// reorg / RE-PROMOTION) that spec item 41 required but the original test
+// matrix omitted. A1 is applied, rolled back (orphaned but still persisted
+// by internal/store), superseded by an unrelated B1, B1 is then also rolled
+// back, and the EXACT SAME previously-persisted A1 block (same label, same
+// deterministic hash — see fixtures_test.go's block/fakeHash) is re-applied
+// via the real Store.ApplyBlock/RollbackTo paths. This must exercise
+// Store's existing orphan re-promotion path, not a freshly constructed
+// A1-like block with a different hash. The rich list must end up showing
+// exactly A's restored balance/ranking and nothing of B's.
+func TestRichListOverview_RePromotionRestoresRanking(t *testing.T) {
+	ctx := context.Background()
+	q, st, _ := newTestQueryStore(t)
+
+	g := block("richlist-repromote-g", 0, "", coinbaseTx("richlist-repromote-g", 100*qoge, "qRichlistRepromoteG"))
+	if err := st.ApplyBlock(ctx, g); err != nil {
+		t.Fatalf("apply genesis: %v", err)
+	}
+
+	a1 := block("richlist-repromote-a1", 1, g.Hash, coinbaseTx("richlist-repromote-a1", 70*qoge, "qRichlistRepromoteA"))
+	if err := st.ApplyBlock(ctx, a1); err != nil {
+		t.Fatalf("apply A1: %v", err)
+	}
+
+	afterA, err := q.RichListOverview(ctx)
+	if err != nil {
+		t.Fatalf("RichListOverview after A1: %v", err)
+	}
+	if len(afterA.Entries) != 1 || afterA.Entries[0].Address != "qRichlistRepromoteA" || afterA.Entries[0].Rank != 1 || afterA.Entries[0].BalanceSatoshis != 70*qoge {
+		t.Fatalf("after A1 Entries = %+v, want [rank=1 qRichlistRepromoteA balance=%d]", afterA.Entries, 70*qoge)
+	}
+
+	// Orphan A1 (still persisted by internal/store, just not canonical).
+	if err := st.RollbackTo(ctx, g.Hash); err != nil {
+		t.Fatalf("rollback to genesis (orphan A1): %v", err)
+	}
+
+	b1 := block("richlist-repromote-b1", 1, g.Hash, coinbaseTx("richlist-repromote-b1", 50*qoge, "qRichlistRepromoteB"))
+	if err := st.ApplyBlock(ctx, b1); err != nil {
+		t.Fatalf("apply B1: %v", err)
+	}
+
+	afterB, err := q.RichListOverview(ctx)
+	if err != nil {
+		t.Fatalf("RichListOverview after B1: %v", err)
+	}
+	if len(afterB.Entries) != 1 || afterB.Entries[0].Address != "qRichlistRepromoteB" || afterB.Entries[0].BalanceSatoshis != 50*qoge {
+		t.Fatalf("after B1 Entries = %+v, want ONLY [qRichlistRepromoteB balance=%d] (A must not leak)", afterB.Entries, 50*qoge)
+	}
+
+	// Orphan B1 too, then re-apply the EXACT SAME previously-persisted A1
+	// block (same label -> same deterministic hash), exercising Store's
+	// orphan re-promotion path rather than constructing a new block.
+	if err := st.RollbackTo(ctx, g.Hash); err != nil {
+		t.Fatalf("rollback to genesis (orphan B1): %v", err)
+	}
+	if err := st.ApplyBlock(ctx, a1); err != nil {
+		t.Fatalf("re-apply persisted A1 (orphan re-promotion): %v", err)
+	}
+
+	final, err := q.RichListOverview(ctx)
+	if err != nil {
+		t.Fatalf("RichListOverview after A1 re-promotion: %v", err)
+	}
+	if final.IndexedHash == nil || *final.IndexedHash != a1.Hash {
+		t.Fatalf("IndexedHash = %v, want restored to A1's hash %s", final.IndexedHash, a1.Hash)
+	}
+	if len(final.Entries) != 1 {
+		t.Fatalf("final Entries = %+v, want exactly 1 (no duplicate A entry, no orphan B leakage)", final.Entries)
+	}
+	if final.Entries[0].Address != "qRichlistRepromoteA" || final.Entries[0].Rank != 1 || final.Entries[0].BalanceSatoshis != 70*qoge {
+		t.Fatalf("final Entries[0] = %+v, want rank=1 address=qRichlistRepromoteA balance=%d", final.Entries[0], 70*qoge)
+	}
+	for _, e := range final.Entries {
+		if e.Address == "qRichlistRepromoteB" {
+			t.Fatalf("final Entries unexpectedly still contains orphaned B: %+v", final.Entries)
+		}
+	}
+}
+
 // TestRichListOverview_Top100Boundary is spec item 51: with more than 100
 // positive-balance addresses, exactly 100 must be returned — the 101st
 // (lowest-ranked) address must be absent.
