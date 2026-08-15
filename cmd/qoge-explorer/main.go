@@ -60,6 +60,8 @@ func main() {
 		os.Exit(runBackfillAccounting(cfg, log))
 	case "backfill-supply-rollup":
 		os.Exit(runBackfillSupplyRollup(cfg, log))
+	case "backfill-address-distribution":
+		os.Exit(runBackfillAddressDistribution(cfg, log))
 	case "-h", "--help", "help":
 		usage()
 	default:
@@ -173,6 +175,42 @@ Usage:
                                      disagreement aborts the entire run
                                      with zero rows written — see
                                      docs/ARCHITECTURE.md §27.
+  qoge-explorer backfill-address-distribution
+                                     Reconstruct address_balance_distribution
+                                     (Phase 2H.4a) — the eight fixed
+                                     positive-balance buckets — for the
+                                     CURRENT addresses table, from
+                                     already-indexed PostgreSQL data only;
+                                     never calls Core RPC and never infers
+                                     ownership/entity information. Only
+                                     needed on a database that was indexed
+                                     before migration 0007 existed; a
+                                     database indexed entirely on or after
+                                     0007 already has every bucket kept
+                                     correct live (ApplyBlock/RollbackTo
+                                     write it incrementally). Idempotent
+                                     and safely restartable. REQUIRES the
+                                     index process to be stopped first: this
+                                     command takes a PostgreSQL advisory
+                                     lock against a second CONCURRENT
+                                     backfill-address-distribution run (in
+                                     its own namespace, distinct from
+                                     backfill-accounting's and
+                                     backfill-supply-rollup's), but that
+                                     lock does not, and cannot, serialize
+                                     against a live indexer writing new
+                                     blocks at the same time. Does not
+                                     require QOGE_NETWORK: unlike
+                                     backfill-accounting/
+                                     backfill-supply-rollup, this
+                                     reconstruction never touches the
+                                     subsidy schedule. Before publishing
+                                     any row, independently cross-checks
+                                     its own computed totals — per bucket
+                                     and globally — against a direct
+                                     aggregate of addresses.balance_satoshis;
+                                     any disagreement aborts the entire run
+                                     with zero rows written.
 
 Configuration is read from environment variables:
   QOGE_RPC_HOST             default 127.0.0.1 (check-rpc, index)
@@ -574,6 +612,56 @@ func runBackfillSupplyRollup(cfg config.Config, log *slog.Logger) int {
 	return 0
 }
 
+// runBackfillAddressDistribution reconstructs address_balance_distribution
+// (Phase 2H.4a) for the current addresses table from PostgreSQL data
+// alone — see store.BackfillAddressDistribution's doc comment for the full
+// atomicity/idempotency/cross-check contract. Unlike
+// runBackfillAccounting/runBackfillSupplyRollup, this does NOT require
+// QOGE_NETWORK or run a network-identity preflight: the distribution
+// rollup is a snapshot of the already-authoritative addresses cache, never
+// touches the subsidy schedule, and is well-defined regardless of which
+// network the database was indexed against.
+func runBackfillAddressDistribution(cfg config.Config, log *slog.Logger) int {
+	if cfg.DatabaseURL == "" {
+		log.Error("config error", "error", "QOGE_DATABASE_URL is not set")
+		return 1
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	pool, err := store.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Error("database connection failed", "error", err)
+		return 1
+	}
+	defer pool.Close()
+
+	log.Info("starting address distribution backfill")
+
+	start := time.Now()
+	result, err := store.BackfillAddressDistribution(ctx, pool)
+	elapsed := time.Since(start)
+	if err != nil {
+		log.Error("address distribution backfill failed", "error", err, "elapsed", elapsed.String())
+		return 1
+	}
+
+	fmt.Println("qoge-explorer backfill-address-distribution")
+	fmt.Println("---------------------------------------------")
+	fmt.Printf("positive addresses: %d\n", result.TotalPositiveAddresses)
+	fmt.Printf("total balance:       %d satoshis\n", result.TotalBalanceSatoshis)
+	if result.AnchorHash != "" {
+		fmt.Printf("anchor:              %s (height %d)\n", result.AnchorHash, result.AnchorHeight)
+	} else {
+		fmt.Println("anchor:              none (sync_state uninitialized; nothing to backfill yet)")
+	}
+	fmt.Printf("elapsed:             %s\n", elapsed)
+
+	log.Info("address distribution backfill complete", "elapsed", elapsed.String())
+	return 0
+}
+
 // runIndex validates the Core/database/network environment, then runs
 // historical sync + the live reorg-aware polling loop
 // (docs/ARCHITECTURE.md §18) until SIGINT/SIGTERM. It never starts
@@ -637,6 +725,16 @@ func runIndex(cfg config.Config, log *slog.Logger) int {
 	// states this does and doesn't flag.
 	if err := store.VerifySupplyRollupCoverage(ctx, pool); err != nil {
 		log.Error("supply rollup coverage preflight failed", "error", err)
+		return 1
+	}
+
+	// Phase 2H.4a: fail fast, before the first live block fetch, if this
+	// database already has an indexed canonical tip but
+	// address_balance_distribution_state doesn't match it — e.g. migration
+	// 0007 was applied but backfill-address-distribution was never run.
+	// See store.VerifyDistributionCoverage's doc comment.
+	if err := store.VerifyDistributionCoverage(ctx, pool); err != nil {
+		log.Error("address distribution coverage preflight failed", "error", err)
 		return 1
 	}
 

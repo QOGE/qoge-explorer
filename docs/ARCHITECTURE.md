@@ -5510,3 +5510,206 @@ reach the pre-0005 schema it needs, and
 0001-0005 migration prefix rather than the full loaded migration set, so
 its own "up to 0005" / "down one step (0005)" steps stay pinned to 0005
 regardless of what is layered on top later.
+
+## 30. Address balance distribution rollup foundation (Phase 2H.4a)
+
+Phase 2H.4a adds an exact, canonical, reorg-safe rollup of the CURRENT
+distribution of confirmed address balances across eight fixed buckets.
+This is **foundation only**: no `/api/v1/address-distribution`, no
+`/address-distribution`, no navigation, no charts, no percentages, no
+concentration statistics (top-N share, Gini, Lorenz curves), no entity
+clustering or wallet ownership inference, and no historical distribution
+snapshots. Those are explicitly deferred to Phase 2H.4b.
+
+Like §29's rich list, this is an **ADDRESS** distribution — never
+described as a holder, person, wallet, entity, or whale distribution.
+`address_count` means the number of current addresses with
+`balance_satoshis > 0` inside a bucket's range, never a UTXO count, a
+transaction count, or a count of people/wallets/entities.
+
+### Semantic source: the existing address cache, never a second engine
+
+The only balance source is `addresses.balance_satoshis` — the same
+canonical, derived cache `internal/store` already maintains
+(`recomputeAddress`, §7/§13.A/§29). This phase does not independently
+reconstruct balances from `transaction_outputs`/`output_addresses`/
+`transaction_inputs`/`utxo_state`; it only ever reads or incrementally
+tracks the deltas of the address cache's own recomputation.
+
+### Exact fixed buckets, exact integer arithmetic
+
+Eight fixed, positive-balance buckets, boundaries in exact satoshis
+(1 QOGE = 100,000,000 satoshis), both ends inclusive except the
+open-ended top bucket:
+
+| bucket_id  | range (QOGE)         | range (satoshis)                          |
+|------------|-----------------------|--------------------------------------------|
+| `lt_1`     | [0, 1)                | [1, 99,999,999]                            |
+| `1_10`     | [1, 10)                | [100,000,000, 999,999,999]                 |
+| `10_100`   | [10, 100)              | [1,000,000,000, 9,999,999,999]             |
+| `100_1k`   | [100, 1,000)           | [10,000,000,000, 99,999,999,999]           |
+| `1k_10k`   | [1,000, 10,000)        | [100,000,000,000, 999,999,999,999]         |
+| `10k_100k` | [10,000, 100,000)      | [1,000,000,000,000, 9,999,999,999,999]     |
+| `100k_1m`  | [100,000, 1,000,000)   | [10,000,000,000,000, 99,999,999,999,999]   |
+| `gte_1m`   | [1,000,000, ∞)         | [100,000,000,000,000, ∞)                   |
+
+Zero balances belong to no bucket; every positive balance belongs to
+exactly one. `chain.Amount.WholeQOGE()` is never used for bucket
+classification — it truncates by design (documented on `Amount` itself),
+which would misclassify a balance one satoshi below a QOGE boundary (e.g.
+99,999,999 satoshis must stay in `lt_1`, not silently read as "0 QOGE" and
+fall through). `internal/store/distribution.go`'s `bucketForBalance`
+classifies by exact integer comparison, and
+`TestDistributionBuckets_MatchMigrationSeed` cross-checks those hardcoded
+Go boundaries against migration 0007's own seeded rows so the two
+representations can never drift apart.
+
+### Migration 0007: two tables, seeded, schema only
+
+`migrations/0007_address_balance_distribution.up.sql` (0001-0006
+byte-for-byte unchanged; no 0008) adds exactly two tables:
+
+- **`address_balance_distribution`** — one row per fixed bucket
+  (`bucket_id` primary key, `min_balance_satoshis`,
+  `max_balance_satoshis` nullable only for `gte_1m`, `address_count`,
+  `balance_satoshis`). A `CHECK` constraint fixes `bucket_id` to exactly
+  the eight legal values, and a trigger
+  (`address_balance_distribution_immutable_bounds_trigger`) forbids
+  deleting a row or changing its own `bucket_id`/min/max after seeding —
+  only `address_count`/`balance_satoshis` are ever mutable. Combined with
+  the migration seeding all eight rows and nothing ever inserting a
+  ninth, the table can never contain anything other than exactly these
+  eight rows for the database's lifetime.
+- **`address_balance_distribution_state`** — a singleton anchor,
+  structurally identical to `sync_state` (same bootstrap representation:
+  `height=-1`/`hash=NULL` for "never built"; same hash-format and
+  bootstrap-consistency `CHECK`s; the same
+  "derive `indexed_height` from `blocks.height`, require canonical"
+  trigger pattern as `sync_state_validate_checkpoint`).
+
+Both are seeded at their zero/uninitialized values — this migration is
+schema only, exactly like §27's `block_supply_rollup` and §29's rich-list
+index: filling an already-indexed database is the separate, explicit
+`qoge-explorer backfill-address-distribution` command, never hidden
+inside a migration.
+
+### No arbitrary-bootstrap carve-out (unlike §27)
+
+`block_supply_rollup`'s cumulative anchor has a documented "arbitrary
+synthetic bootstrap: no lineage" case (§27) because its values are
+genesis-rooted cumulative totals that cannot be computed without a
+complete ancestry back to height 0. The distribution rollup has no such
+case: it is a snapshot of `addresses.balance_satoshis` as it currently
+stands, well-defined regardless of which height a Store instance was
+bootstrapped from. Consequently `address_balance_distribution_state` is
+updated **unconditionally** on every `ApplyBlock`/`RollbackTo` call — the
+core invariant is that it equals `sync_state`'s own checkpoint exactly at
+every committed canonical state, full stop, never only at states where a
+distribution-relevant address happened to change.
+
+### Hot-path incremental maintenance, never a full-table scan
+
+The normal `ApplyBlock`/`RollbackTo` path never runs
+`SELECT ... FROM addresses WHERE balance_satoshis > 0` over the whole
+table. Both call sites now route every touched address's recomputation
+through `recomputeAddressTracked` (`distribution.go`): it reads the
+address's balance immediately before `recomputeAddress` overwrites or
+deletes it, calls `recomputeAddress` exactly as before (now returning the
+resulting balance — 0 if the row was deleted — instead of only an error),
+and accumulates the old→new transition into a `distributionDelta`. One
+address touched several times within a block still nets to a single
+observation (the `touched` map itself already deduplicates, as it always
+has for `recomputeAddress`).
+
+`distributionDelta` accumulates every touched address's contribution into
+per-bucket count/balance deltas — zero→positive, positive→zero,
+cross-bucket, and same-bucket (count unchanged, balance shifts by
+new−old) all fall out of one `observe(oldBalance, newBalance)` call — so a
+block touching many addresses produces at most eight bucket UPDATEs
+total, never one per touched address. `applyDistributionDeltas` reads
+each touched bucket's current values, computes and validates the
+resulting new values in Go, and only then issues the UPDATE — the same
+"compute, check the invariant, then persist" discipline `applySupplyRollup`
+already uses for `cumulative_utxo_set_value_satoshis`/`ErrRollupInvariant`
+(§27), so a negative `address_count`/`balance_satoshis` (§16, a hard
+integrity error, never clamped to zero) always surfaces as the clear,
+typed `ErrDistributionInvariant` rather than a raw `CHECK`-constraint
+failure — the migration's own `CHECK` constraints remain a second,
+independent guard that should never actually fire given this ordering.
+
+Everything — the address recomputation, the bucket deltas, and the anchor
+update — runs inside the SAME PostgreSQL transaction `ApplyBlock`/
+`RollbackTo` already holds (serialized, like every other canonical
+mutation, by `lockCheckpoint`'s row lock on `sync_state`). A failed
+delta application rolls back the entire block, exactly like every other
+integrity failure this transaction can produce.
+
+### Attribution semantics preserved exactly
+
+No-address UTXOs and bare-multisig participant addresses (`output_participants`)
+never get an `addresses` row in the first place (§7/§10/§13.A, unchanged
+by this phase), so they structurally cannot appear in any bucket — proven
+directly (`TestApplyBlock_Distribution_NoAddressExcluded`,
+`TestApplyBlock_Distribution_BareMultisigExcluded`). A P2QPK destination
+address participates exactly like any ordinary address
+(`TestApplyBlock_Distribution_P2QPKParticipatesNormally`) — no
+P2QPK-specific distribution accounting.
+
+### Reorg and orphan re-promotion
+
+`RollbackTo` derives its distribution deltas from the exact same
+old→new balance transitions that already drive its `utxo_state`/
+`addresses` reconstruction (§16) — never a second, independent
+mechanism. A normal reorg leaves the distribution representing only the
+surviving chain, with no contribution from the orphaned branch
+(`TestRollbackTo_Distribution_NormalReorg`). Re-applying an
+already-persisted orphaned block through the real orphan re-promotion
+path (§16's "Safe orphan re-promotion") restores the distribution to
+exactly that block's state — no doubled counts or balances, no leakage
+from whatever superseded it in between
+(`TestApplyBlock_Distribution_OrphanRePromotion`, mirroring §29's own
+rich-list re-promotion test pattern).
+
+### Startup guard and backfill
+
+For an upgraded, already-indexed database, migration 0007 alone leaves
+`address_balance_distribution_state` at its seeded `-1`/`NULL` while
+`sync_state` may already be far ahead — applying incremental deltas on
+top of that nonexistent baseline would silently under-count every bucket
+forever. `store.VerifyDistributionCoverage` (called by `index` startup,
+mirroring `VerifySupplyRollupCoverage`'s shape — §27 — but requiring full
+EQUALITY with `sync_state`'s checkpoint, not just tip existence) refuses
+to proceed in that case with `ErrDistributionCoverageMissing`, pointing
+at the fix: `qoge-explorer backfill-address-distribution`
+(`store.BackfillAddressDistribution`). The backfill rebuilds all eight
+buckets from a single aggregate join against `addresses`, independently
+cross-checks the result — both per bucket and in global total — against
+a SEPARATE SQL formulation using literal satoshi boundaries (not a second
+read of the same join), refuses to publish anything on any disagreement
+(`ErrDistributionCrossCheckFailed`), and — unlike
+`backfill-accounting`/`backfill-supply-rollup` — needs no `QOGE_NETWORK`
+preflight, since it never touches the subsidy schedule.
+
+### Global identity and non-UTXO-set semantics
+
+`sum(bucket.address_count)` always equals
+`SELECT count(*) FROM addresses WHERE balance_satoshis > 0`, and
+`sum(bucket.balance_satoshis)` always equals the corresponding `SUM`
+— every test in `internal/store/distribution_test.go` and
+`distribution_backfill_test.go` checks this identity
+(`requireBucketsSumToAddresses`) after every scenario. Exactly like
+§29's rich list, this total is **attributed address balance**, not
+UTXO-set value or circulating supply — bare-multisig and no-address
+value are excluded by construction, so it is never divided by subsidy,
+coinbase totals, or UTXO-set value, and no percentage is ever computed
+from it in this phase.
+
+**Prior-phase migration test update (test-only, not a phase-boundary
+violation).** Adding migration 0007 shifted the same "how many migrations
+sit on top of 0005" arithmetic §29's own note already flagged once:
+`internal/query/supply_test.go`'s `TestSupplyOverview_PreMigration0005Schema`
+now computes its rollback step count as `len(migrations)-4` (mirroring
+the `len(migrations)-N` convention `internal/deployments` and
+`internal/mempool`'s own migration tests already use) instead of a
+hardcoded literal, so it survives whatever gets layered on top of 0005
+next without needing another edit.

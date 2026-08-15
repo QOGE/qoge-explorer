@@ -123,10 +123,22 @@ func (s *Store) RollbackTo(ctx context.Context, ancestorHash string) error {
 		}
 	}
 
+	// Phase 2H.4a: same tracked-recompute + accumulated-delta pattern
+	// ApplyBlock uses (internal/store/distribution.go) — RollbackTo's
+	// distribution updates are derived from the SAME old->new balance
+	// transitions that already drive utxo_state/addresses reconstruction
+	// above, never a second independent mechanism.
+	distDeltas := newDistributionDelta()
 	for addr := range touched {
-		if err := recomputeAddress(ctx, tx, addr); err != nil {
+		if err := recomputeAddressTracked(ctx, tx, addr, distDeltas); err != nil {
 			return fmt.Errorf("store: rollback: recompute address %s: %w", addr, err)
 		}
+	}
+	if err := applyDistributionDeltas(ctx, tx, distDeltas); err != nil {
+		return fmt.Errorf("store: rollback: %w", err)
+	}
+	if err := setDistributionAnchor(ctx, tx, &ancestorHash); err != nil {
+		return fmt.Errorf("store: rollback: %w", err)
 	}
 
 	if _, err := tx.Exec(ctx, `
