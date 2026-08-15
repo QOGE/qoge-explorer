@@ -48,6 +48,12 @@ func TestMigrations_DistributionRoundTrip(t *testing.T) {
 	if tableExists(t, ctx, pool, "address_balance_distribution_state") {
 		t.Fatal("address_balance_distribution_state must not exist before 0007 is applied")
 	}
+	if functionExists(t, ctx, pool, "address_balance_distribution_immutable_bounds()") {
+		t.Fatal("address_balance_distribution_immutable_bounds() must not exist before 0007 is applied")
+	}
+	if functionExists(t, ctx, pool, "address_balance_distribution_state_validate_checkpoint()") {
+		t.Fatal("address_balance_distribution_state_validate_checkpoint() must not exist before 0007 is applied")
+	}
 
 	addr := "qDistributionMigrationTestAddr"
 	if _, err := pool.Exec(ctx, `
@@ -70,6 +76,12 @@ func TestMigrations_DistributionRoundTrip(t *testing.T) {
 	requireCount(t, ctx, pool, "addresses", addr, 1)
 	requireDistributionBucketCount(t, ctx, pool, 8)
 	requireDistributionStateUninitialized(t, ctx, pool)
+	if !functionExists(t, ctx, pool, "address_balance_distribution_immutable_bounds()") {
+		t.Error("expected address_balance_distribution_immutable_bounds() to exist after 0007")
+	}
+	if !functionExists(t, ctx, pool, "address_balance_distribution_state_validate_checkpoint()") {
+		t.Error("expected address_balance_distribution_state_validate_checkpoint() to exist after 0007")
+	}
 
 	// 0007 -> 0006 (down one step)
 	if _, err := Down(ctx, pool, through0007, 1); err != nil {
@@ -80,6 +92,12 @@ func TestMigrations_DistributionRoundTrip(t *testing.T) {
 	}
 	if tableExists(t, ctx, pool, "address_balance_distribution_state") {
 		t.Error("address_balance_distribution_state must be gone after rolling back 0007")
+	}
+	if functionExists(t, ctx, pool, "address_balance_distribution_immutable_bounds()") {
+		t.Error("address_balance_distribution_immutable_bounds() must be gone after rolling back 0007")
+	}
+	if functionExists(t, ctx, pool, "address_balance_distribution_state_validate_checkpoint()") {
+		t.Error("address_balance_distribution_state_validate_checkpoint() must be gone after rolling back 0007")
 	}
 	if !tableExists(t, ctx, pool, "addresses") {
 		t.Fatal("addresses table must survive rolling back 0007 (0007's down must remove ONLY its own tables)")
@@ -96,6 +114,21 @@ func TestMigrations_DistributionRoundTrip(t *testing.T) {
 	requireCount(t, ctx, pool, "addresses", addr, 1)
 	requireDistributionBucketCount(t, ctx, pool, 8)
 	requireDistributionStateUninitialized(t, ctx, pool)
+	if !functionExists(t, ctx, pool, "address_balance_distribution_immutable_bounds()") {
+		t.Error("expected address_balance_distribution_immutable_bounds() to exist after re-applying 0007")
+	}
+	if !functionExists(t, ctx, pool, "address_balance_distribution_state_validate_checkpoint()") {
+		t.Error("expected address_balance_distribution_state_validate_checkpoint() to exist after re-applying 0007")
+	}
+}
+
+func functionExists(t *testing.T, ctx context.Context, pool *pgxpool.Pool, signature string) bool {
+	t.Helper()
+	var regprocedure *string
+	if err := pool.QueryRow(ctx, `SELECT to_regprocedure($1)::text`, signature).Scan(&regprocedure); err != nil {
+		t.Fatalf("to_regprocedure(%s): %v", signature, err)
+	}
+	return regprocedure != nil
 }
 
 func requireDistributionBucketCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, want int) {
