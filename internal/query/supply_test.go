@@ -560,8 +560,11 @@ func TestSupplyOverview_BlockAccountingDeletedDoesNotAffectRollupRead(t *testing
 // return ErrSupplyRollupUnavailable, never panic or leak a raw SQL error.
 // Store.ApplyBlock itself always writes a block_supply_rollup row, so the
 // fixture must be built on the FULLY migrated schema first, then rolled
-// back one step — exactly TestMigrations_SupplyRollupRoundTrip's own
-// up/down pattern (internal/store), reused here from the read side.
+// back to 0004 — exactly TestMigrations_SupplyRollupRoundTrip's own
+// up/down pattern (internal/store), reused here from the read side. Rolls
+// back TWO steps, not one: Phase 2H.3's migration 0006
+// (addresses_richlist_index) now sits on top of 0005, so reaching 0004
+// requires undoing both 0006 and 0005.
 func TestSupplyOverview_PreMigration0005Schema(t *testing.T) {
 	ctx := context.Background()
 	q, st, pool := newTestQueryStore(t)
@@ -575,8 +578,8 @@ func TestSupplyOverview_PreMigration0005Schema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load migrations: %v", err)
 	}
-	if _, err := store.Down(ctx, pool, migrations, 1); err != nil {
-		t.Fatalf("roll back migration 0005: %v", err)
+	if _, err := store.Down(ctx, pool, migrations, 2); err != nil {
+		t.Fatalf("roll back migrations 0006 and 0005: %v", err)
 	}
 
 	_, err = q.SupplyOverview(ctx)

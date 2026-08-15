@@ -1,0 +1,43 @@
+{{define "body"}}
+<h1>Rich List</h1>
+<p class="muted">Top confirmed address balances</p>
+
+{{if eq .Overview.IndexedHeight -1}}
+<p class="status-line">No block has been indexed yet.</p>
+{{else}}
+<table class="kv-table">
+<tr><th>Indexed Height</th><td>{{.Overview.IndexedHeight}}</td></tr>
+<tr><th>Indexed Block Hash</th><td class="mono wrap">{{if .Overview.IndexedHash}}{{.Overview.IndexedHash}}{{end}}</td></tr>
+</table>
+
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>Rank</th><th>Address</th><th>Balance (QOGE)</th><th>Balance (satoshis)</th></tr></thead>
+<tbody>
+{{range .Overview.Entries}}
+<tr>
+  <td>{{.Rank}}</td>
+  <td class="mono wrap"><a href="/address/{{.Address}}">{{.Address}}</a></td>
+  <td class="mono">{{.BalanceQOGE}}</td>
+  <td class="mono">{{.BalanceSatoshis}}</td>
+</tr>
+{{else}}
+<tr><td colspan="4">No positive address balances yet.</td></tr>
+{{end}}
+</tbody>
+</table>
+</div>
+{{end}}
+
+<h2>What this list is</h2>
+<p><strong>This list ranks addresses, not people, wallets, or entities.</strong> An address appearing here says nothing about who controls it, and the same person or organization may control several addresses, or none of the addresses shown.</p>
+<p>Rows show confirmed canonical balances only — mempool transactions never affect this ranking. A few technical exclusions mean these rows do not represent all value the explorer tracks:</p>
+<dl>
+  <dt>Bare-multisig outputs</dt>
+  <dd>A bare-multisig output's co-signer identities are recorded separately for search/display purposes and are never treated as owning that output's value; the value is not attributed to, or divided among, any participant address.</dd>
+
+  <dt>Outputs with no recognized destination address</dt>
+  <dd>A spendable output whose script has no single attributed destination address is absent from this list entirely, even though it still counts toward the current UTXO-set value shown on the <a href="/supply">Supply</a> page.</dd>
+</dl>
+<p>Because of these exclusions, the sum of the balances shown here is not expected to equal the current UTXO-set value.</p>
+{{end}}

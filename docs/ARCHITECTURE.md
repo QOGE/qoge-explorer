@@ -5260,3 +5260,253 @@ are **untouched** — §27's rollup foundation is frozen; this phase only
 reads it. No new migration (`0001`-`0005` unchanged; no `0006`). No rich
 list, address rankings, or distribution chart — those remain out of scope
 for a future phase, not this one.
+
+## 29. Ranked address balance rich list (Phase 2H.3)
+
+Phase 2H.3 adds QOGE Explorer's first native rich list: `GET
+/api/v1/richlist` and `GET /richlist`, ranking the current confirmed
+canonical balances of balance-accounting destination addresses. This is an
+**ADDRESS ranking** — never described as a holder, person, wallet, or
+entity ranking, and never as a circulating-supply or
+ownership-concentration calculation. Broader distribution analytics
+(clustering, exchange labels, wallet ownership inference, entity
+identification, supply percentages, concentration charts, Lorenz
+curves/Gini coefficients, historical rich-list snapshots or time series,
+CSV exports, distribution buckets) are explicitly out of scope for this
+phase.
+
+### Architecture: the existing address cache, never a second balance engine
+
+`addresses.balance_satoshis` is already the canonical, derived
+balance-accounting cache `internal/store` maintains
+(`recomputeAddress` — §7/§13.A). The rich list reads exactly that cache,
+never recomputing balances from `transaction_outputs`/`output_addresses`/
+`transaction_inputs`/`utxo_state` on every request, and never SUMing the
+whole UTXO set per request:
+
+```sql
+SELECT address, balance_satoshis
+FROM addresses
+WHERE balance_satoshis > 0
+ORDER BY balance_satoshis DESC, address COLLATE "C" ASC
+LIMIT 100
+```
+
+`RichListOverview` (`internal/query/richlist.go`) opens the same
+`readTx` read-only `REPEATABLE READ` transaction pattern
+`SupplyOverview`/`ExplorerOverview`/`DeploymentOverview` already use,
+reading the `sync_state` anchor (`statusFrom`) and this one query from a
+single snapshot. Ranks are assigned 1..N in Go after the rows come back —
+this is a list **position**, not a statistical dense rank: because ties
+are broken by a deterministic address tie-break, two equal-balance
+addresses still receive distinct, stable positions (§ "Deterministic
+ordering and the top-100 bound" below).
+
+### Address ≠ holder
+
+The rich list ranks addresses, not owners. `docs/ARCHITECTURE.md`,
+`templates/richlist.tmpl`, and every doc comment in
+`internal/query/richlist.go` deliberately avoid "top holders", "richest
+users/wallets", "whales", or "ownership percentage" — the same discipline
+§28 already applies to "circulating supply". `templates/richlist.tmpl`
+states prominently: "This list ranks addresses, not people, wallets, or
+entities."
+
+### Attribution limit: rich-list sum ≠ UTXO-set value
+
+The address cache deliberately does not attribute every UTXO to an
+address — two independent gaps, both already true of
+`recomputeAddress` before this phase, just newly visible through a public
+ranking:
+
+- **Bare-multisig participants** (`output_participants`) are search/
+  display identities only, never balance-accounting destinations (§7/
+  §13.A) — a bare-multisig output's value is never divided among, or
+  credited in full to, any participant address.
+- **No-address UTXOs.** A spendable output with no recognized destination
+  address (an unrecognized/non-address script) contributes to canonical
+  UTXO-set value (§28's `UTXOSetValueSatoshis`) but to no `addresses` row
+  at all.
+
+Consequently `SUM(rich-list balances)` is **not** necessarily equal to
+`query.SupplyOverview.UTXOSetValueSatoshis` — documented explicitly in
+`RichListOverview`'s doc comment and on the rendered page, in the same
+compact, non-alarming technical register §28 already established for
+supply terminology.
+
+### No supply percentage
+
+The JSON and HTML contracts never expose `percentage_of_supply`,
+`percent_supply`, `supply_share`, `ownership_share`, `concentration`,
+`top_10_share`, or `top_100_share` — dividing an address balance by
+scheduled subsidy, coinbase outputs, or UTXO-set value is explicitly
+deferred to a future phase with its own semantic treatment, not decided
+here.
+
+### Deterministic ordering and the top-100 bound
+
+Order is `balance_satoshis DESC`, then `address COLLATE "C" ASC` as a
+deterministic tie-break — bytewise PostgreSQL ordering, matched exactly by
+`migrations/0006_addresses_richlist_index.up.sql`'s own index key order,
+so equal-balance addresses receive stable, repeatable positions across
+calls (`TestRichListOverview_TieOrder`). The list is intentionally bounded
+to the top 100 (`query.RichListLimit`) — no pagination, no `OFFSET` over
+potentially millions of addresses, no unlimited endpoint
+(`TestRichListOverview_Top100Boundary` proves the 101st-ranked address is
+never returned).
+
+### Index: `addresses_richlist_positive_balance_idx` (migration 0006)
+
+Without a dedicated index, `ORDER BY balance_satoshis DESC LIMIT 100`
+would require sorting/scanning the complete `addresses` table — unaffordable
+as address count grows. Migration `0006_addresses_richlist_index` (the
+first migration added since §27's `0005`; `0001`-`0005` remain
+byte-for-byte unchanged) adds exactly one partial index:
+
+```sql
+CREATE INDEX addresses_richlist_positive_balance_idx
+    ON addresses (
+        balance_satoshis DESC,
+        address COLLATE "C" ASC
+    )
+    WHERE balance_satoshis > 0;
+```
+
+The index's own key order matches the production query's `ORDER BY`
+exactly, and its partial predicate (`balance_satoshis > 0`) matches the
+query's `WHERE` clause exactly — the precondition for PostgreSQL to use a
+partial index at all. The down migration drops only this index; it does
+not touch the `addresses` table or any row in it
+(`TestMigrations_RichListIndexRoundTrip`, `internal/store`, mirrors §27's
+own `TestMigrations_SupplyRollupRoundTrip` pattern: 0005 → 0006 → 0005 →
+0006, proving a seeded `addresses` row survives the round trip
+untouched). `internal/store` itself required zero production changes: the
+existing `recomputeAddress` write path already keeps
+`addresses.balance_satoshis` correct through every `ApplyBlock`/
+`RollbackTo`, including reorgs — the index is purely a read-side
+accelerant with nothing new to keep consistent.
+
+### Realistic-scale benchmark
+
+Following §26/§27's benchmark convention exactly (an env-var-gated test,
+run manually, its numbers captured here, then deleted before commit — the
+file never lands in the repository), the production top-100 query was
+benchmarked against 2,500,000 synthetic positive-balance `addresses` rows
+in a disposable PostgreSQL schema:
+
+| rows      | table size | index size | plan                                                              | cold     | warm #1  | warm #2  | warm #3  |
+|-----------|-----------|------------|--------------------------------------------------------------------|----------|----------|----------|----------|
+| 2,500,000 | 279 MB    | 248 MB     | `Index Only Scan using addresses_richlist_positive_balance_idx` | 10.98 ms | 2.49 ms  | 1.93 ms  | 1.06 ms  |
+
+`EXPLAIN (ANALYZE, BUFFERS)` confirmed an `Index Only Scan` on
+`addresses_richlist_positive_balance_idx` with `Execution Time: 0.054 ms`
+and no `Sort Method`/`Seq Scan on addresses` line anywhere in the plan —
+the hard architectural gate this phase set for itself: no full-table
+sort/scan for the top-100 endpoint, at any row count. Comfortably within
+budget both cold and warm; no cache or materialized view was added on top
+of the index, consistent with §27/§28's own "don't bolt on a cache the
+indexed access pattern doesn't need" precedent.
+
+### Reorg and snapshot consistency
+
+`RichListOverview` fires `snapshotTestHook` immediately after `statusFrom`,
+exactly as `SupplyOverview` does, so a concurrent `ApplyBlock`/
+`RollbackTo` committing between the anchor read and the ranking query can
+never pair one canonical state's height/hash with another canonical
+state's ranking —
+`TestSnapshotConsistency_RichListOverview_ConcurrentApplyBlock` and
+`TestSnapshotConsistency_RichListOverview_ConcurrentReorg` both prove this
+deterministically (no `sleep`), mirroring §28's identical pair of tests.
+`TestRichListOverview_Reorg` additionally proves an orphaned branch's
+balances never leak into a fresh read after a real rollback + re-apply.
+
+### Uninitialized and genesis-only databases
+
+An uninitialized explorer (`indexed_height = -1`) is a valid HTTP 200 with
+`entries: []` — never described as "zero wealth" or "zero holders".
+Genesis outputs are never placed in Core's UTXO set
+(`internal/store`'s `applyOutput`, §2/§16), so `recomputeAddress`'s
+`addr_utxos` CTE — which joins `output_addresses` to `utxo_state` — never
+produces a row for the genesis destination address, and the `addresses`
+cache never gains an entry for it. A genesis-only database therefore also
+reports `entries: []`, even though `SupplyOverview` reports non-zero
+scheduled-subsidy/coinbase-output values for the very same chain
+(`TestRichListOverview_GenesisOnly`) — the same "genesis is excluded from
+UTXO-set value but not from coinbase outputs" split §28 already documents,
+now visible on the address-cache side too.
+
+### Non-mutation and Core independence
+
+`TestRichListOverview_NonMutation` fingerprints `sync_state`, `blocks`,
+and `addresses` before/after repeated `RichListOverview` calls — no
+insert/update/delete anywhere. Structurally, `richListEntriesFrom` issues
+exactly one `SELECT`, inside `readTx`'s `READ ONLY`/`REPEATABLE READ`
+transaction — the same structural guarantee §28 already established for
+`SupplyOverview`.
+`TestRootHandler_SupplyRoutesCoreIndependent` (`cmd/qoge-explorer/serve_test.go`)
+was extended to also confirm `/api/v1/richlist` and `/richlist` work with
+`QOGE_RPC_USER`/`QOGE_RPC_PASSWORD` unset — structural, not coincidental,
+for the same reason `/supply` already is: `newRootHandler` is built from
+only a `*query.Store`.
+
+### Public contracts
+
+`GET /api/v1/richlist` returns exactly:
+
+```json
+{
+  "indexed_height": ...,
+  "indexed_block_hash": "...",
+  "entries": [
+    {
+      "rank": 1,
+      "address": "...",
+      "balance_sats": ...,
+      "balance_qoge": "..."
+    }
+  ]
+}
+```
+
+`balance_sats` is a JSON integer, `balance_qoge` is
+`chain.Amount(...).String()` — never a float, never scientific notation,
+mirroring §28's own contract discipline exactly. No `total_supply`,
+`percentage`, `holder`, `owner`, `entity`, `excluded_output`,
+`circulating_supply`, or `issued_supply` field, in code or in this
+document. `GET /richlist` renders the same data as an HTML table (Rank,
+Address, Balance (QOGE), Balance (satoshis)), each address linking to
+`/address/{address}`, with the address-vs-owner/bare-multisig/no-address
+disclaimer described above. Both routes reject non-GET methods with a
+405 (JSON `method_not_allowed` / HTML) exactly like every other route in
+this codebase; unknown API paths remain a JSON 404. No mempool table is
+ever queried — ranking reflects confirmed canonical balances only.
+
+### Phase boundary
+
+Production changes are confined to `migrations/0006_addresses_richlist_index.*`,
+`internal/query/richlist.go`, `internal/api/handlers_richlist.go`,
+`internal/web/handlers_richlist.go`, `internal/web/templates/richlist.tmpl`,
+and `internal/web/templates/header.tmpl`'s new nav link.
+`internal/store`, `internal/accounting`, `internal/indexer`,
+`internal/mempool`, `internal/deployments`, `internal/rpc`,
+`internal/decode`, `internal/script`, and `internal/chain` are
+**untouched** — the existing address-balance cache is already
+authoritative; this phase only reads it. `internal/query/supply.go`,
+`/api/v1/supply`, and `/supply` are behaviorally unchanged. Migrations
+0001-0005 are byte-for-byte unchanged; only 0006 is new; no 0007. No
+address clustering, exchange labels, wallet ownership inference, entity
+identification, supply percentages, concentration charts, Lorenz
+curves/Gini coefficients, historical rich-list snapshots or time series,
+CSV exports, or distribution buckets.
+
+**Prior-phase migration test updates (test-only, not a phase-boundary
+violation).** Adding migration 0006 shifted the "how many migrations sit
+on top of 0005" arithmetic one existing test relied on:
+`internal/query/supply_test.go`'s `TestSupplyOverview_PreMigration0005Schema`
+now rolls back two steps (undoing both 0006 and 0005) instead of one to
+reach the pre-0005 schema it needs, and
+`internal/store/supply_rollup_migration_test.go`'s
+`TestMigrations_SupplyRollupRoundTrip` now explicitly bounds itself to the
+0001-0005 migration prefix rather than the full loaded migration set, so
+its own "up to 0005" / "down one step (0005)" steps stay pinned to 0005
+regardless of what is layered on top later.
