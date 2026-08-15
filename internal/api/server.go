@@ -58,6 +58,7 @@ var knownGETRoutes = []string{
 	"/api/v1/mempool/tx/{id}",
 	"/api/v1/deployments",
 	"/api/v1/deployments/{name}",
+	"/api/v1/supply",
 }
 
 func (s *Server) routes() {
@@ -79,6 +80,8 @@ func (s *Server) routes() {
 
 	s.mux.HandleFunc("GET /api/v1/deployments", s.handleDeployments)
 	s.mux.HandleFunc("GET /api/v1/deployments/{name}", s.handleDeployment)
+
+	s.mux.HandleFunc("GET /api/v1/supply", s.handleSupply)
 
 	for _, pattern := range knownGETRoutes {
 		s.mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {

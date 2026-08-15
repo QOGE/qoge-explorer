@@ -134,6 +134,11 @@ type deploymentsView struct {
 	Deployments []query.Deployment
 }
 
+// supplyView backs templates/supply.tmpl.
+type supplyView struct {
+	Overview query.SupplyOverview
+}
+
 // deploymentView backs templates/deployment.tmpl. RawJSON is the
 // deployment's persisted raw_json rendered as a plain string, computed
 // once here so the template never handles the json.RawMessage byte slice

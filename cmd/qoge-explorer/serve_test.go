@@ -17,6 +17,40 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TestRootHandler_SupplyRoutesCoreIndependent is Phase 2H.2 spec items
+// 57/58: newRootHandler is built from ONLY a *query.Store — it takes no
+// Core RPC configuration at all (see newRootHandler's signature in
+// main.go), so /api/v1/supply and /supply working with QOGE_RPC_USER/
+// QOGE_RPC_PASSWORD deliberately unset in this test process is not a
+// coincidence, it's structural: `serve` never constructs an RPC client.
+func TestRootHandler_SupplyRoutesCoreIndependent(t *testing.T) {
+	t.Setenv("QOGE_RPC_USER", "")
+	t.Setenv("QOGE_RPC_PASSWORD", "")
+
+	pool := newTestPool(t)
+	handler := newRootHandler(query.New(pool), nil)
+
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/supply", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/v1/supply status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	ct := rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("/api/v1/supply Content-Type = %q, want application/json", ct)
+	}
+
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/supply", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/supply status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	ct = rec.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("/supply Content-Type = %q, want text/html", ct)
+	}
+}
+
 // newTestPool mirrors internal/api's, internal/query's, and internal/web's
 // dbtest_test.go pattern — duplicated per-package on purpose. This is the
 // one test file allowed to exercise the ACTUAL Phase 2E.1 route
@@ -99,6 +133,7 @@ func TestRootHandler_APIRoutesStayJSON(t *testing.T) {
 		"/api/v1/tx/" + strings.Repeat("a", 64),
 		"/api/v1/address/qSomeAddress",
 		"/api/v1/address/qSomeAddress/transactions",
+		"/api/v1/supply",
 	} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
@@ -121,7 +156,7 @@ func TestRootHandler_WebRoutesStayHTML(t *testing.T) {
 	pool := newTestPool(t)
 	handler := newRootHandler(query.New(pool), nil)
 
-	for _, path := range []string{"/", "/blocks", "/block/1", "/search?q=1"} {
+	for _, path := range []string{"/", "/blocks", "/block/1", "/search?q=1", "/supply"} {
 		req := httptest.NewRequest(http.MethodGet, path, nil)
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, req)

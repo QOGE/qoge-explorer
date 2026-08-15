@@ -1,0 +1,44 @@
+{{define "body"}}
+<h1>Supply &amp; Monetary Accounting</h1>
+
+{{if eq .Overview.IndexedHeight -1}}
+<p class="status-line">No block has been indexed yet.</p>
+{{else}}
+<table class="kv-table">
+<tr><th>Indexed Height</th><td>{{.Overview.IndexedHeight}}</td></tr>
+<tr><th>Indexed Block Hash</th><td class="mono wrap">{{if .Overview.IndexedHash}}{{.Overview.IndexedHash}}{{end}}</td></tr>
+</table>
+
+<div class="table-scroll">
+<table class="data-table">
+<thead><tr><th>Metric</th><th>QOGE</th><th>Satoshis</th></tr></thead>
+<tbody>
+<tr><td>Scheduled subsidy</td><td class="mono">{{.Overview.ScheduledSubsidyQOGE}}</td><td class="mono">{{.Overview.ScheduledSubsidySatoshis}}</td></tr>
+<tr><td>Coinbase outputs</td><td class="mono">{{.Overview.CoinbaseOutputsQOGE}}</td><td class="mono">{{.Overview.CoinbaseOutputsSatoshis}}</td></tr>
+<tr><td>Transaction fees</td><td class="mono">{{.Overview.TransactionFeesQOGE}}</td><td class="mono">{{.Overview.TransactionFeesSatoshis}}</td></tr>
+<tr><td>Unclaimed reward</td><td class="mono">{{.Overview.UnclaimedRewardQOGE}}</td><td class="mono">{{.Overview.UnclaimedRewardSatoshis}}</td></tr>
+<tr><td>Current UTXO-set value</td><td class="mono">{{.Overview.UTXOSetValueQOGE}}</td><td class="mono">{{.Overview.UTXOSetValueSatoshis}}</td></tr>
+</tbody>
+</table>
+</div>
+{{end}}
+
+<h2>What these numbers mean</h2>
+<p><strong>None of the values on this page is labelled circulating supply.</strong></p>
+<dl>
+  <dt>Scheduled subsidy</dt>
+  <dd>The consensus subsidy entitlement accumulated by the indexed canonical chain. It is not necessarily actual issuance: a miner may validly claim less than the maximum available reward.</dd>
+
+  <dt>Coinbase outputs</dt>
+  <dd>The total value encoded in canonical coinbase transaction outputs, including claimed transaction fees and the genesis coinbase.</dd>
+
+  <dt>Transaction fees</dt>
+  <dd>The total input-minus-output value paid as fees by canonical non-coinbase transactions. Fees are existing value, not new issuance.</dd>
+
+  <dt>Unclaimed reward</dt>
+  <dd>The difference between the maximum available block reward and the actual coinbase payout. It cannot generally be uniquely split into unclaimed subsidy versus unclaimed fees, and is never described as burned or destroyed coins.</dd>
+
+  <dt>Current UTXO-set value</dt>
+  <dd>The value currently represented by outputs the explorer tracks in Core-equivalent canonical UTXO state at the indexed tip. It excludes the genesis coinbase output and any output Core itself never treats as spendable (for example OP_RETURN outputs).</dd>
+</dl>
+{{end}}
