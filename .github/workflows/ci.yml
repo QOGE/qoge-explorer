@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Quality gate (gofmt, vet, test, race, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: qoge_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d qoge_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      QOGE_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/qoge_test?sslmode=disable
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      # The postgres service's own health check already blocks the job's
+      # steps from starting until the container reports healthy, but we
+      # additionally prove connectivity here using the exact credentials
+      # and database the Go test harness will use, so a health-check pass
+      # that doesn't actually mean "reachable with these creds" can't hide.
+      - name: Verify PostgreSQL connectivity
+        run: |
+          if ! command -v pg_isready >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y postgresql-client
+          fi
+          for i in $(seq 1 30); do
+            if pg_isready -h localhost -p 5432 -U postgres -d qoge_test >/dev/null 2>&1; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            echo "waiting for postgres... ($i)"
+            sleep 2
+          done
+          pg_isready -h localhost -p 5432 -U postgres -d qoge_test
+          psql "$QOGE_TEST_DATABASE_URL" -c 'SELECT 1;'
+
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+
+      - name: go vet
+        run: go vet ./...
+
+      # internal/store's test harness creates a uniquely-named schema per
+      # DB-backed test (see internal/store/dbtest_test.go) and needs
+      # CREATE/DROP privileges on the qoge_test database to do so. Prove
+      # that here, before any Go test runs, against the same
+      # QOGE_TEST_DATABASE_URL the test suite uses — not just that
+      # PostgreSQL is reachable, but that this account can actually do
+      # what the harness requires.
+      - name: Verify schema create/drop privileges
+        run: |
+          psql "$QOGE_TEST_DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS qoge_ci_privcheck;'
+          psql "$QOGE_TEST_DATABASE_URL" -c 'DROP SCHEMA qoge_ci_privcheck;'
+
+      # go test silently treats a skipped PostgreSQL-backed test as a pass.
+      # Run one specific, stable, existing DB-backed test with -v first and
+      # fail the build if it reports the "QOGE_TEST_DATABASE_URL not set"
+      # skip reason (internal/store/dbtest_test.go's testDatabaseURL
+      # helper) — that would mean PostgreSQL-backed coverage silently did
+      # not run, which the merge gate this workflow reproduces treats as a
+      # failure, not a pass.
+      - name: PostgreSQL-backed preflight test
+        run: |
+          set -o pipefail
+          go test -count=1 ./internal/store -run '^TestMigrations_RichListIndexRoundTrip$' -v | tee preflight.log
+          if grep -q "QOGE_TEST_DATABASE_URL not set" preflight.log; then
+            echo "::error::PostgreSQL-backed preflight test was skipped; QOGE_TEST_DATABASE_URL / PostgreSQL was not genuinely exercised"
+            exit 1
+          fi
+          grep -q -- '--- PASS: TestMigrations_RichListIndexRoundTrip' preflight.log
+
+      - name: go test
+        run: |
+          set -o pipefail
+          go test -count=1 ./... -v | tee gotest.log
+          if grep -q "QOGE_TEST_DATABASE_URL not set" gotest.log; then
+            echo "::error::One or more PostgreSQL-backed tests were skipped even though QOGE_TEST_DATABASE_URL was set"
+            exit 1
+          fi
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
+
+      - name: go build
+        run: go build ./...
