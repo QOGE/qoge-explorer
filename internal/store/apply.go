@@ -161,10 +161,23 @@ func (s *Store) ApplyBlock(ctx context.Context, block chain.Block) error {
 		}
 	}
 
+	// Phase 2H.4a: distribution deltas are accumulated across every touched
+	// address (recomputeAddressTracked captures each one's old->new balance
+	// transition), then published to the eight fixed buckets in at most
+	// eight UPDATEs total — never one write per touched address — and the
+	// distribution anchor is advanced alongside sync_state, inside this
+	// SAME transaction. See internal/store/distribution.go.
+	distDeltas := newDistributionDelta()
 	for addr := range touched {
-		if err := recomputeAddress(ctx, tx, addr); err != nil {
+		if err := recomputeAddressTracked(ctx, tx, addr, distDeltas); err != nil {
 			return fmt.Errorf("store: apply block %s: recompute address %s: %w", block.Hash, addr, err)
 		}
+	}
+	if err := applyDistributionDeltas(ctx, tx, distDeltas); err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
+	}
+	if err := setDistributionAnchor(ctx, tx, &block.Hash); err != nil {
+		return fmt.Errorf("store: apply block %s: %w", block.Hash, err)
 	}
 
 	// Phase 2H.1: block_accounting is written only now — after the
@@ -798,7 +811,12 @@ func applyOutput(ctx context.Context, tx pgx.Tx, blockHash, txid string, out cha
 // (e.g. every output that ever named it was rolled back by RollbackTo),
 // its addresses row is deleted rather than left as a phantom all-zero
 // entry.
-func recomputeAddress(ctx context.Context, tx pgx.Tx, address string) error {
+//
+// Returns the resulting balance_satoshis (0 if the row was deleted) —
+// consumed by recomputeAddressTracked (distribution.go, Phase 2H.4a) to
+// derive that address's distribution-bucket delta without a second,
+// independent balance read.
+func recomputeAddress(ctx context.Context, tx pgx.Tx, address string) (int64, error) {
 	var totalReceived, totalSent, balance, txCount int64
 	var firstSeen, lastSeen *int64
 
@@ -825,14 +843,14 @@ func recomputeAddress(ctx context.Context, tx pgx.Tx, address string) error {
 			(SELECT MAX(GREATEST(creation_block_height, COALESCE(spending_block_height, creation_block_height))) FROM addr_utxos)
 	`, address).Scan(&totalReceived, &totalSent, &balance, &txCount, &firstSeen, &lastSeen)
 	if err != nil {
-		return fmt.Errorf("store: recompute address %s: %w", address, err)
+		return 0, fmt.Errorf("store: recompute address %s: %w", address, err)
 	}
 
 	if txCount == 0 {
 		if _, err := tx.Exec(ctx, `DELETE FROM addresses WHERE address = $1`, address); err != nil {
-			return fmt.Errorf("store: remove empty address cache %s: %w", address, err)
+			return 0, fmt.Errorf("store: remove empty address cache %s: %w", address, err)
 		}
-		return nil
+		return 0, nil
 	}
 
 	if _, err := tx.Exec(ctx, `
@@ -847,7 +865,7 @@ func recomputeAddress(ctx context.Context, tx pgx.Tx, address string) error {
 			last_seen_height = EXCLUDED.last_seen_height,
 			updated_at = now()
 	`, address, totalReceived, totalSent, balance, txCount, firstSeen, lastSeen); err != nil {
-		return fmt.Errorf("store: upsert address cache %s: %w", address, err)
+		return 0, fmt.Errorf("store: upsert address cache %s: %w", address, err)
 	}
-	return nil
+	return balance, nil
 }
